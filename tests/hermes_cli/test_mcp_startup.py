@@ -1365,6 +1365,40 @@ class TestRawArgvPreflightClassifier:
             ["-p", "alpha", "-z", "prompt", "-t", "none"]
         )
 
+    def test_sudo_user_profile_fallback_preserves_original_case(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "root-hermes"
+        root.mkdir()
+        sudo_home = tmp_path / "sudo-user"
+        exact_profile = sudo_home / ".hermes" / "profiles" / "Alpha"
+        exact_profile.mkdir(parents=True)
+        lowercase_profile = sudo_home / ".hermes" / "profiles" / "alpha"
+        original_is_dir = Path.is_dir
+
+        def case_sensitive_is_dir(path):
+            if path == exact_profile:
+                return True
+            if path == lowercase_profile:
+                return False
+            return original_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", case_sensitive_is_dir)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setenv("SUDO_USER", "alice")
+        monkeypatch.setattr(main_mod.os, "geteuid", lambda: 0)
+        monkeypatch.setitem(
+            sys.modules,
+            "pwd",
+            types.SimpleNamespace(
+                getpwnam=lambda _name: types.SimpleNamespace(pw_dir=str(sudo_home))
+            ),
+        )
+
+        assert main_mod._raw_oneshot_no_tools_preflight(
+            ["--profile=Alpha", "-z", "prompt", "-t", "none"]
+        )
+
     def test_invalid_sticky_active_profile_refuses_guard(self, tmp_path, monkeypatch):
         for name in (
             "HERMES_SUPERVISED_CHILD",

@@ -44,9 +44,9 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
 
     required_flags, optional_flags = top_level_value_flag_sets()
 
-    def _sudo_profile_resolves(canonical: str) -> bool:
+    def _sudo_profile_resolves(profile_name: str) -> bool:
         if (
-            canonical == "default"
+            profile_name == "default"
             or not hasattr(os, "geteuid")
             or os.geteuid() != 0
         ):
@@ -61,7 +61,7 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
                 _Path(pwd.getpwnam(sudo_user).pw_dir)
                 / ".hermes"
                 / "profiles"
-                / canonical
+                / profile_name
             )
             return candidate.is_dir()
         except Exception:
@@ -84,7 +84,7 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
         tombstone = profile_root / "profiles" / ".deleted" / canonical
         if profile_dir.is_dir() and not tombstone.exists():
             return True
-        return allow_sudo and _sudo_profile_resolves(canonical)
+        return allow_sudo and _sudo_profile_resolves(name.strip())
 
     cleaned = list(argv)
     explicit_profile = False
