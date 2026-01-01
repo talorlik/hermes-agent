@@ -97,7 +97,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-LIFECYCLE: durable Kanban lifecycle contracts and CAS guards
-- Commits: dcacabd74f2677ba7bcef2384a8ad5b70a87a523, 062f119e2907f40142f6ef5f549e1ebea8b1fe2d, 6c4985b8283306ed75cbfe7ee8e25a2d603ccdd1, 67e926c3b1972609f89acb3455645f287b2a5f34, 9a2fb822aa4032947675c27bd9a0fa9b55d8ab27, 973611b856b02fb0f1b2c5901d4d883e8629af12, 22f76698544c5260b3f9087df55da81b5ad1bd8e, 1d7b3834d9bb58a13d20d7f724a01e6c7b4d3bfc, a3589d26cb6ab71cecd8168a3e34963611b62c09, 70f70d6313b8b01b94c88b481ddf8ddb87504cf8
+- Commits: dcacabd74f2677ba7bcef2384a8ad5b70a87a523, 062f119e2907f40142f6ef5f549e1ebea8b1fe2d, 6c4985b8283306ed75cbfe7ee8e25a2d603ccdd1, 67e926c3b1972609f89acb3455645f287b2a5f34, 9a2fb822aa4032947675c27bd9a0fa9b55d8ab27, 973611b856b02fb0f1b2c5901d4d883e8629af12, 22f76698544c5260b3f9087df55da81b5ad1bd8e, 1d7b3834d9bb58a13d20d7f724a01e6c7b4d3bfc, a3589d26cb6ab71cecd8168a3e34963611b62c09, 70f70d6313b8b01b94c88b481ddf8ddb87504cf8, 3051b46850fa33ef5f837cdeef92a47fc2c08434
 - Owned-Files:
   - hermes_cli/kanban.py
   - hermes_cli/kanban_db.py
@@ -133,7 +133,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: a4915b3e095ce7eac3236dad84c844fa8bcb210f, ed1289aefd1f2f86ea904d4a5facc1b606306893, 6ad540c3bb9586064c4afdce2893a1423f380a86
+- Commits: a4915b3e095ce7eac3236dad84c844fa8bcb210f, ed1289aefd1f2f86ea904d4a5facc1b606306893, 6ad540c3bb9586064c4afdce2893a1423f380a86, 0f8f1120af7548bb52339dcefa5582636fd83d78
 - Owned-Files:
   - agent/agent_init.py
   - hermes_cli/main.py
@@ -246,7 +246,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 2
+- Ledger-Revision: 3
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
@@ -260,15 +260,11 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## Sync-merge residue
 
-Upstream sync merges (exempt merge commits) can leave small fork-side
-resolution deltas that belong to no work commit. Current known residue at
-merge-base 9dd6634c56: trailing-newline-only diffs in the three paths owned
-by G-SYNC-RESIDUE, and fleet-restart monkeypatch additions in
-`tests/hermes_cli/test_update_fleet_restart_pending.py` (owned by
-G-UPDATE-FORKSYNC). The two deleted quoted mutex-junk paths are owned by
-G-DESKTOP-TEST-ISOLATION. A current path listed by no entry is
-`unknown_fork_change` and fails this checker; the conflict resolver still
-blocks rather than guessing.
+The reconstruction reset to upstream merge-base
+`3b45681c25a880477a2a806cdebe91d2f1bfe9ce`; no sync-merge residue remains in
+the current delta. G-SYNC-RESIDUE records the retired historical newline-only
+paths. Future sync-resolution deltas must have explicit ownership; a current
+path listed by no entry is `unknown_fork_change` and blocks the resolver.
 
 ## Path-Precedence
 
@@ -287,7 +283,7 @@ is reported in `invalid_precedence`. The winner is the token after the last
 
 `hermes_cli/main.py` stays listed by G-CRON-DURABLE and G-ONESHOT-ISOLATION.
 G-ONESHOT-ISOLATION wins because zero-tool isolation is the fail-closed
-`tool-surface invariant on that file. `package.json` and `package-lock.json`
+tool-surface invariant on that file. `package.json` and `package-lock.json`
 stay listed by G-ELECTRON-PATCH and the absorbed G-NPM-NANOID history.
 G-ELECTRON-PATCH now wins because every current delta on those files belongs
 to the Electron 41.10.3 dependency graph; nanoid 3.3.18 matches upstream.
