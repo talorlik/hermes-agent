@@ -1220,6 +1220,48 @@ class TestTransactionOutcomeContract:
             monkeypatch.setattr(connection_type, "execute", original_execute)
             conn.close()
 
+    def test_silent_commit_with_open_transaction_never_publishes_receipt(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from hermes_cli import kanban_db as kb
+
+        conn = self._connect(tmp_path, monkeypatch, "silent-commit.db")
+        original_boundary = kbc._execute_boundary_with_retry
+
+        def swallow_commit(target, sql):
+            if sql == "COMMIT":
+                return None
+            return original_boundary(target, sql)
+
+        try:
+            tid = kb.create_task(conn, title="silent commit")
+            capture = kbc.LifecycleReceiptCapture()
+            monkeypatch.setattr(kbc, "_execute_boundary_with_retry", swallow_commit)
+
+            with pytest.raises(kbc.TransactionOutcomeUnknownError):
+                kb.add_comment(
+                    conn,
+                    tid,
+                    "reviewer",
+                    "must not publish",
+                    receipt_capture=capture,
+                )
+
+            assert capture.receipt is None
+            assert capture._active_connection_id is None
+            assert id(conn) not in kbc._RECEIPT_TXNS
+            assert not conn.in_transaction
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)
+            ).fetchone()[0] == 0
+        finally:
+            monkeypatch.setattr(
+                kbc, "_execute_boundary_with_retry", original_boundary
+            )
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            conn.close()
+
     def _swallowing_rollback_patch(self, conn, connection_type):
         """One-shot ROLLBACK swallow: execute returns, txn stays OPEN.
 

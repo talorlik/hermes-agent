@@ -1586,6 +1586,19 @@ def write_txn(conn: Any, *, allow_nested: bool = False):
                 "-- the commit may have executed durably; perform an "
                 "authoritative readback on a fresh connection"
             ) from exc
+        commit_state, telemetry_failure = _probe_in_transaction(conn)
+        if commit_state is not False:
+            try:
+                cleanup_failure = _close_transaction_for_failure(conn)
+            finally:
+                _finish_receipt_transaction(conn, committed=False)
+            detail = cleanup_failure or telemetry_failure
+            raise TransactionOutcomeUnknownError(
+                "COMMIT returned without proving transaction closure"
+                + (f" (cleanup: {detail!r})" if detail is not None else "")
+                + "; no lifecycle receipt was published -- perform an "
+                "authoritative readback on a fresh connection"
+            )
         try:
             _check_file_length_invariant(conn)
         except BaseException as exc:
