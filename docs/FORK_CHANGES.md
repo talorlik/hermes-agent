@@ -133,7 +133,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: a4915b3e095ce7eac3236dad84c844fa8bcb210f, ed1289aefd1f2f86ea904d4a5facc1b606306893, 6ad540c3bb9586064c4afdce2893a1423f380a86, 0f8f1120af7548bb52339dcefa5582636fd83d78
+- Commits: a4915b3e095ce7eac3236dad84c844fa8bcb210f, ed1289aefd1f2f86ea904d4a5facc1b606306893, 6ad540c3bb9586064c4afdce2893a1423f380a86, 0f8f1120af7548bb52339dcefa5582636fd83d78, 6277c0e77aaf0eb9636c046e004fffcb0e4e5d9e
 - Owned-Files:
   - agent/agent_init.py
   - hermes_cli/main.py
@@ -246,7 +246,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 3
+- Ledger-Revision: 4
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
