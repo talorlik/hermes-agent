@@ -121,7 +121,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-DEEPLINKS: browser task deep links in the Kanban dashboard
-- Commits: 71c5d069176de74357ad6d181a134be645a73d2d
+- Commits: 71c5d069176de74357ad6d181a134be645a73d2d, 94ce0f54c853810416de945b1b898f5295135300
 - Owned-Files:
   - plugins/kanban/dashboard/dist/index.js
   - apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
@@ -246,12 +246,13 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
+- Ledger-Revision: 2
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for any future commit that touches the ledger and only files owned by G-FORK-LEDGER, not a singular delivery-commit special case.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped.
 - Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
