@@ -1343,6 +1343,28 @@ class TestRawArgvPreflightClassifier:
             ["--profile=missing", *base]
         )
 
+    def test_sudo_user_profile_fallback_establishes_import_guard(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "root-hermes"
+        root.mkdir()
+        sudo_home = tmp_path / "sudo-user"
+        (sudo_home / ".hermes" / "profiles" / "alpha").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setenv("SUDO_USER", "alice")
+        monkeypatch.setattr(main_mod.os, "geteuid", lambda: 0)
+        monkeypatch.setitem(
+            sys.modules,
+            "pwd",
+            types.SimpleNamespace(
+                getpwnam=lambda _name: types.SimpleNamespace(pw_dir=str(sudo_home))
+            ),
+        )
+
+        assert main_mod._raw_oneshot_no_tools_preflight(
+            ["-p", "alpha", "-z", "prompt", "-t", "none"]
+        )
+
     def test_invalid_sticky_active_profile_refuses_guard(self, tmp_path, monkeypatch):
         for name in (
             "HERMES_SUPERVISED_CHILD",

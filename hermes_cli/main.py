@@ -44,7 +44,30 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
 
     required_flags, optional_flags = top_level_value_flag_sets()
 
-    def _profile_resolves(name: str) -> bool:
+    def _sudo_profile_resolves(canonical: str) -> bool:
+        if (
+            canonical == "default"
+            or not hasattr(os, "geteuid")
+            or os.geteuid() != 0
+        ):
+            return False
+        sudo_user = os.environ.get("SUDO_USER", "").strip()
+        if not sudo_user or sudo_user == "root":
+            return False
+        try:
+            import pwd
+
+            candidate = (
+                _Path(pwd.getpwnam(sudo_user).pw_dir)
+                / ".hermes"
+                / "profiles"
+                / canonical
+            )
+            return candidate.is_dir()
+        except Exception:
+            return False
+
+    def _profile_resolves(name: str, *, allow_sudo: bool = False) -> bool:
         canonical = name.strip().lower()
         if not canonical or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", canonical):
             return False
@@ -59,7 +82,9 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
             return True
         profile_dir = profile_root / "profiles" / canonical
         tombstone = profile_root / "profiles" / ".deleted" / canonical
-        return profile_dir.is_dir() and not tombstone.exists()
+        if profile_dir.is_dir() and not tombstone.exists():
+            return True
+        return allow_sudo and _sudo_profile_resolves(canonical)
 
     cleaned = list(argv)
     explicit_profile = False
@@ -74,14 +99,14 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
             profile_name = cleaned[index + 1]
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_name):
                 return False
-            if not _profile_resolves(profile_name):
+            if not _profile_resolves(profile_name, allow_sudo=True):
                 return False
             del cleaned[index : index + 2]
             explicit_profile = True
             break
         if token.startswith("--profile="):
             profile_name = token.partition("=")[2]
-            if not _profile_resolves(profile_name):
+            if not _profile_resolves(profile_name, allow_sudo=True):
                 return False
             del cleaned[index]
             explicit_profile = True
