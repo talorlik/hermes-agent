@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -465,6 +466,41 @@ class TestSendTelegramMediaDelivery:
         assert "error" in result
         assert "No deliverable text or media remained" in result["error"]
         bot.send_message.assert_not_awaited()
+
+
+class TestSendTelegramChunkIndicatorEscaping:
+    def test_multi_chunk_indicators_are_mdv2_escaped(self, monkeypatch):
+        # A long markdown message splits into multiple chunks and
+        # truncate_message appends raw " (N/M)" suffixes. Bare parentheses
+        # are reserved in MarkdownV2, so unescaped indicators make Telegram
+        # reject every chunk and the whole report falls back to plain text
+        # (the Dream-report delivery bug). The send path must escape them.
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(message_id=1)
+        )
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        # Well over one 4096-unit chunk of markdown-ish text.
+        message = "*Executive summary*\n" + ("Some findings line\\.\n" * 400)
+
+        result = asyncio.run(_send_telegram("token", "12345", message))
+
+        assert result["success"] is True
+        assert bot.send_message.await_count > 1
+        for call in bot.send_message.await_args_list:
+            text = call.kwargs["text"]
+            m = re.search(r"\((\d+)/(\d+)\)$", text)
+            if m:
+                # The indicator's parentheses must arrive escaped.
+                assert text.endswith(f"\\({m.group(1)}/{m.group(2)}\\)"), (
+                    f"unescaped chunk indicator in: ...{text[-40:]!r}"
+                )
 
 
 # ---------------------------------------------------------------------------
