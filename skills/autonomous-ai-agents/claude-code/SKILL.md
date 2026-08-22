@@ -160,7 +160,7 @@ Returns a JSON object with:
   "stop_reason": "end_turn",
   "terminal_reason": "completed",
   "usage": { "input_tokens": 5, "output_tokens": 603, ... },
-  "modelUsage": { "claude-sonnet-4-6": { "costUSD": 0.078, "contextWindow": 200000 } }
+  "modelUsage": { "claude-fable-5": { "costUSD": 0.078, "contextWindow": 1000000 } }
 }
 ```
 
@@ -264,7 +264,7 @@ Automatically falls back to the specified model when the default is overloaded (
 ### Model & Performance
 | Flag | Effect |
 |------|--------|
-| `--model <alias>` | Model selection: `sonnet`, `opus`, `haiku`, or full name like `claude-sonnet-4-6` |
+| `--model <alias>` | Model selection: `fable`, `sonnet`, `opus`, `haiku`, or a full name such as `claude-fable-5`, `claude-sonnet-5`, or `claude-opus-4-8` |
 | `--effort <level>` | Reasoning depth: `low`, `medium`, `high`, `xhigh`, `max` |
 | `--max-turns <n>` | Limit agentic loops (print mode only; prevents runaway) |
 | `--max-budget-usd <n>` | Cap API spend in dollars (print mode only) |
