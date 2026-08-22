@@ -2400,10 +2400,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             f"{upstream_ahead} commit(s) behind upstream"
         )
         print("→ Merging upstream/main (updates.fork_sync_strategy: merge)...")
-        # Best-effort safety tag; recovery anchor if anything goes wrong.
+        # Recovery anchors if anything goes wrong: the pre-merge SHA drives
+        # the automatic rollback below; the tag is a human-visible fallback.
+        pre_merge_sha = _capture_head_sha(git_cmd, cwd)
+        sync_tag = f"pre-upstream-sync-{_time.strftime('%Y%m%d-%H%M%S')}"
         subprocess.run(
-            git_cmd
-            + ["tag", f"pre-upstream-sync-{_time.strftime('%Y%m%d-%H%M%S')}"],
+            git_cmd + ["tag", sync_tag],
             cwd=cwd,
             capture_output=True,
             check=False,
@@ -2427,6 +2429,38 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             )
             print(f"  Resolve manually: cd {cwd} && git merge upstream/main")
             print("  Then push your fork: git push origin main")
+            return
+
+        # Post-merge syntax guard — mirrors the post-pull guard: the merged
+        # tree must still parse every critical startup file. The pull path's
+        # guard already ran BEFORE this sync, so upstream code merged here
+        # would otherwise reach origin (and the running install) unchecked.
+        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
+        if not syntax_ok:
+            rollback_ref = pre_merge_sha or sync_tag
+            print()
+            print("  ✗ Merged code has a syntax error in a critical file:")
+            print(f"    {failing_path}")
+            if syntax_error:
+                for line in str(syntax_error).splitlines()[:6]:
+                    print(f"      {line}")
+            rollback_result = subprocess.run(
+                git_cmd + ["reset", "--hard", rollback_ref],
+                cwd=cwd,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if rollback_result.returncode == 0:
+                print(
+                    f"  ✓ Rolled back to {rollback_ref[:10]} — nothing was "
+                    "pushed to your fork."
+                )
+                print("  Try the sync again once a fix lands upstream.")
+            else:
+                print("  ✗ Rollback failed. Recover manually with:")
+                print(f"    cd {cwd} && git reset --hard {rollback_ref}")
+                if rollback_result.stderr.strip():
+                    print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
             return
 
         print("  ✓ Merged upstream/main (your commits preserved)")

@@ -1270,6 +1270,10 @@ class TestForkSyncStrategy:
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout="git@github.com:example/hermes-agent.git\n", stderr=""
                 )
+            if "rev-parse HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="feedbead1234567890\n", stderr=""
+                )
             if "rev-list" in joined and "upstream/main..origin/main" in joined:
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout=f"{origin_ahead}\n", stderr=""
@@ -1284,7 +1288,15 @@ class TestForkSyncStrategy:
 
         return side_effect
 
-    def _run_sync(self, *, strategy, origin_ahead, upstream_ahead, merge_rc=0):
+    def _run_sync(
+        self,
+        *,
+        strategy,
+        origin_ahead,
+        upstream_ahead,
+        merge_rc=0,
+        syntax=(True, None, None),
+    ):
         from pathlib import Path
 
         from hermes_cli import update_cmd
@@ -1296,7 +1308,10 @@ class TestForkSyncStrategy:
             side_effect=self._make_sync_side_effect(
                 origin_ahead, upstream_ahead, merge_rc=merge_rc, calls=calls
             ),
-        ), patch("hermes_cli.config.load_config", return_value=config):
+        ), patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.update_cmd._validate_critical_files_syntax",
+            return_value=syntax,
+        ):
             update_cmd._sync_with_upstream_if_needed(["git"], Path("/repo"))
         return calls
 
@@ -1324,6 +1339,24 @@ class TestForkSyncStrategy:
         assert not any("push" in c for c in calls)
         out = capsys.readouterr().out
         assert "sync stopped, nothing was changed" in out
+
+    def test_merge_strategy_syntax_failure_rolls_back_and_never_pushes(self, capsys):
+        """The post-merge syntax guard resets to the pre-merge SHA instead of
+        pushing a merged tree whose critical files no longer parse."""
+        calls = self._run_sync(
+            strategy="merge",
+            origin_ahead=2,
+            upstream_ahead=5,
+            syntax=(False, "/repo/cli.py", "SyntaxError: invalid syntax"),
+        )
+
+        assert any("merge --no-edit upstream/main" in c for c in calls)
+        assert any("reset --hard feedbead1234567890" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        out = capsys.readouterr().out
+        assert "syntax error in a critical file" in out
+        assert "Rolled back to feedbead12" in out
+        assert "nothing was pushed" in out
 
     def test_default_ff_only_preserves_skip_notice(self, capsys):
         calls = self._run_sync(strategy=None, origin_ahead=2, upstream_ahead=5)
