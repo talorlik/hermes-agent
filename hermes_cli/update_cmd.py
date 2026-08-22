@@ -2275,6 +2275,28 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
+def _fork_sync_strategy() -> str:
+    """Read ``updates.fork_sync_strategy`` from config.yaml.
+
+    "ff_only" (default): only sync the fork when origin/main is strictly
+    behind upstream/main (pure fast-forward, current historical behavior).
+    "merge": when the fork carries its own commits, merge upstream/main
+    into main instead of skipping, then push the result to origin.
+    Unknown values fall back to "ff_only" — a typo must never enable an
+    automatic merge the user did not ask for.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        _cfg = (load_config() or {}).get("updates", {})
+        if isinstance(_cfg, dict):
+            value = str(_cfg.get("fork_sync_strategy", "ff_only")).strip().lower()
+            if value in {"ff_only", "merge"}:
+                return value
+    except Exception as exc:
+        logger.debug("Could not read updates.fork_sync_strategy: %s", exc)
+    return "ff_only"
+
 def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     """Check if fork is behind upstream and sync if safe.
 
@@ -2282,6 +2304,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     - If upstream remote doesn't exist, ask user if they want to add it
     - Compare origin/main with upstream/main
     - If origin/main is strictly behind upstream/main, pull from upstream
+    - If the fork carries its own commits, behavior is governed by
+      ``updates.fork_sync_strategy``: "ff_only" (default) skips with a
+      notice; "merge" merges upstream/main into main — local commits are
+      preserved in a merge commit, a conflict aborts cleanly with nothing
+      changed, and a ``pre-upstream-sync-<stamp>`` tag is left as a
+      recovery anchor.
     - Try to sync fork back to origin if possible
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
@@ -2347,13 +2375,73 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, don't trample — unless the
+    # user opted into automatic merges (updates.fork_sync_strategy: merge).
     if origin_ahead > 0:
+        if _fork_sync_strategy() != "merge":
+            print()
+            print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
+            print("  Skipping upstream sync to preserve your changes.")
+            print("  If you want to merge upstream changes, run:")
+            print("    git pull upstream main")
+            print(
+                "  (set updates.fork_sync_strategy: merge in config.yaml to "
+                "do this automatically)"
+            )
+            return
+
+        if upstream_ahead == 0:
+            print("  ✓ Fork is up to date with upstream")
+            return
+
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        print(
+            f"→ Fork has {origin_ahead} commit(s) of its own and is "
+            f"{upstream_ahead} commit(s) behind upstream"
+        )
+        print("→ Merging upstream/main (updates.fork_sync_strategy: merge)...")
+        # Best-effort safety tag; recovery anchor if anything goes wrong.
+        subprocess.run(
+            git_cmd
+            + ["tag", f"pre-upstream-sync-{_time.strftime('%Y%m%d-%H%M%S')}"],
+            cwd=cwd,
+            capture_output=True,
+            check=False,
+        )
+        merge_result = subprocess.run(
+            git_cmd + ["merge", "--no-edit", "upstream/main"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if merge_result.returncode != 0:
+            subprocess.run(
+                git_cmd + ["merge", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
+            print(
+                "  ✗ Could not merge upstream/main (conflict or dirty tree) — "
+                "sync stopped, nothing was changed."
+            )
+            print(f"  Resolve manually: cd {cwd} && git merge upstream/main")
+            print("  Then push your fork: git push origin main")
+            return
+
+        print("  ✓ Merged upstream/main (your commits preserved)")
+        print("→ Syncing fork...")
+        if _sync_fork_with_upstream(git_cmd, cwd):
+            print("  ✓ Fork synced with upstream")
+        else:
+            print(
+                "  ℹ Merged upstream locally but couldn't push to fork "
+                "(no write access?)"
+            )
+            print(
+                "    Your local repo is updated, but your fork on GitHub may "
+                "be behind."
+            )
         return
 
     # If upstream is not ahead, fork is up to date

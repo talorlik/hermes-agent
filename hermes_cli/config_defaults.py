@@ -3284,6 +3284,18 @@ DEFAULT_CONFIG = {
         #                         run (e.g. a deep feature branch that must
         #                         not accumulate update merge commits).
         "parked_branch_strategy": "switch",
+        # How the fork upstream sync (runs on forks when updating `main`)
+        # handles a fork that carries its own commits on top of upstream:
+        #   "ff_only" (default) — only sync when origin/main is strictly
+        #       behind upstream/main (pure fast-forward). A fork with its
+        #       own commits is skipped with a notice, so nothing is ever
+        #       merged without consent.
+        #   "merge"   — merge upstream/main into main (a merge commit keeps
+        #       your commits intact), then push the result to origin so the
+        #       fork on GitHub stays current. A conflict aborts the merge
+        #       and stops the sync cleanly with nothing changed; a
+        #       pre-upstream-sync-<stamp> tag is left as a recovery anchor.
+        "fork_sync_strategy": "ff_only",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

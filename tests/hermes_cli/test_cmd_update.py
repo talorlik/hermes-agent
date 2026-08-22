@@ -1249,3 +1249,110 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestForkSyncStrategy:
+    """``updates.fork_sync_strategy`` governs the fork upstream sync when the
+    fork carries its own commits on top of upstream.
+
+    "ff_only" (default) preserves the historical skip-with-notice behavior;
+    "merge" merges upstream/main into main (local commits preserved, conflict
+    aborts cleanly with nothing changed) and pushes the result to origin.
+    """
+
+    @staticmethod
+    def _make_sync_side_effect(origin_ahead, upstream_ahead, merge_rc=0, calls=None):
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if calls is not None:
+                calls.append(joined)
+            if "remote" in joined and "get-url" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="git@github.com:example/hermes-agent.git\n", stderr=""
+                )
+            if "rev-list" in joined and "upstream/main..origin/main" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{origin_ahead}\n", stderr=""
+                )
+            if "rev-list" in joined and "origin/main..upstream/main" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{upstream_ahead}\n", stderr=""
+                )
+            if "merge" in joined and "--no-edit" in joined:
+                return subprocess.CompletedProcess(cmd, merge_rc, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        return side_effect
+
+    def _run_sync(self, *, strategy, origin_ahead, upstream_ahead, merge_rc=0):
+        from pathlib import Path
+
+        from hermes_cli import update_cmd
+
+        calls = []
+        config = {"updates": {"fork_sync_strategy": strategy}} if strategy else {}
+        with patch(
+            "subprocess.run",
+            side_effect=self._make_sync_side_effect(
+                origin_ahead, upstream_ahead, merge_rc=merge_rc, calls=calls
+            ),
+        ), patch("hermes_cli.config.load_config", return_value=config):
+            update_cmd._sync_with_upstream_if_needed(["git"], Path("/repo"))
+        return calls
+
+    def test_merge_strategy_merges_and_pushes_fork(self, capsys):
+        calls = self._run_sync(strategy="merge", origin_ahead=2, upstream_ahead=5)
+
+        assert any("merge --no-edit upstream/main" in c for c in calls)
+        assert any("push origin main --force-with-lease" in c for c in calls)
+        # Recovery anchor tag is laid down before the merge.
+        tag_idx = next(i for i, c in enumerate(calls) if "tag pre-upstream-sync-" in c)
+        merge_idx = next(
+            i for i, c in enumerate(calls) if "merge --no-edit upstream/main" in c
+        )
+        assert tag_idx < merge_idx
+        out = capsys.readouterr().out
+        assert "Merged upstream/main" in out
+        assert "Fork synced with upstream" in out
+
+    def test_merge_strategy_conflict_aborts_and_never_pushes(self, capsys):
+        calls = self._run_sync(
+            strategy="merge", origin_ahead=2, upstream_ahead=5, merge_rc=1
+        )
+
+        assert any("merge --abort" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        out = capsys.readouterr().out
+        assert "sync stopped, nothing was changed" in out
+
+    def test_default_ff_only_preserves_skip_notice(self, capsys):
+        calls = self._run_sync(strategy=None, origin_ahead=2, upstream_ahead=5)
+
+        assert not any("merge --no-edit" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        out = capsys.readouterr().out
+        assert "Skipping upstream sync to preserve your changes" in out
+        assert "fork_sync_strategy: merge" in out
+
+    def test_unknown_strategy_falls_back_to_ff_only(self, capsys):
+        calls = self._run_sync(strategy="yolo", origin_ahead=1, upstream_ahead=3)
+
+        assert not any("merge --no-edit" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        assert "Skipping upstream sync" in capsys.readouterr().out
+
+    def test_merge_strategy_noop_when_upstream_not_ahead(self, capsys):
+        calls = self._run_sync(strategy="merge", origin_ahead=2, upstream_ahead=0)
+
+        assert not any("merge --no-edit" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        assert "Fork is up to date with upstream" in capsys.readouterr().out
+
+    def test_ff_only_fast_forward_path_unchanged(self, capsys):
+        """Strictly-behind forks still fast-forward and push, regardless of
+        strategy (invariant: the merge option must not regress the ff path)."""
+        calls = self._run_sync(strategy=None, origin_ahead=0, upstream_ahead=4)
+
+        assert any("pull --ff-only upstream main" in c for c in calls)
+        assert any("push origin main --force-with-lease" in c for c in calls)
+        assert "Fork synced with upstream" in capsys.readouterr().out
