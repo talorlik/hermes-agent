@@ -1261,7 +1261,14 @@ class TestForkSyncStrategy:
     """
 
     @staticmethod
-    def _make_sync_side_effect(origin_ahead, upstream_ahead, merge_rc=0, calls=None):
+    def _make_sync_side_effect(
+        origin_ahead,
+        upstream_ahead,
+        merge_rc=0,
+        test_rc=0,
+        head_sha: str | None = "feedbead1234567890",
+        calls=None,
+    ):
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
             if calls is not None:
@@ -1271,8 +1278,12 @@ class TestForkSyncStrategy:
                     cmd, 0, stdout="git@github.com:example/hermes-agent.git\n", stderr=""
                 )
             if "rev-parse HEAD" in joined:
+                if head_sha is None:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, stdout="", stderr="cannot resolve HEAD"
+                    )
                 return subprocess.CompletedProcess(
-                    cmd, 0, stdout="feedbead1234567890\n", stderr=""
+                    cmd, 0, stdout=f"{head_sha}\n", stderr=""
                 )
             if "rev-list" in joined and "upstream/main..origin/main" in joined:
                 return subprocess.CompletedProcess(
@@ -1284,6 +1295,15 @@ class TestForkSyncStrategy:
                 )
             if "merge" in joined and "--no-edit" in joined:
                 return subprocess.CompletedProcess(cmd, merge_rc, stdout="", stderr="")
+            if "-c import pytest, pytest_asyncio" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if " -m pytest " in f" {joined} ":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    test_rc,
+                    stdout="targeted updater tests\n",
+                    stderr="test failure\n" if test_rc else "",
+                )
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         return side_effect
@@ -1295,6 +1315,8 @@ class TestForkSyncStrategy:
         origin_ahead,
         upstream_ahead,
         merge_rc=0,
+        test_rc=0,
+        head_sha: str | None = "feedbead1234567890",
         syntax=(True, None, None),
     ):
         from pathlib import Path
@@ -1306,7 +1328,12 @@ class TestForkSyncStrategy:
         with patch(
             "subprocess.run",
             side_effect=self._make_sync_side_effect(
-                origin_ahead, upstream_ahead, merge_rc=merge_rc, calls=calls
+                origin_ahead,
+                upstream_ahead,
+                merge_rc=merge_rc,
+                test_rc=test_rc,
+                head_sha=head_sha,
+                calls=calls,
             ),
         ), patch("hermes_cli.config.load_config", return_value=config), patch(
             "hermes_cli.update_cmd._validate_critical_files_syntax",
@@ -1325,7 +1352,13 @@ class TestForkSyncStrategy:
         merge_idx = next(
             i for i, c in enumerate(calls) if "merge --no-edit upstream/main" in c
         )
+        test_idx = next(i for i, c in enumerate(calls) if " -m pytest " in f" {c} ")
+        push_idx = next(i for i, c in enumerate(calls) if "push origin main" in c)
         assert tag_idx < merge_idx
+        assert merge_idx < test_idx < push_idx
+        test_command = calls[test_idx]
+        assert "tests/hermes_cli/test_cmd_update.py" in test_command
+        assert "tests/hermes_cli/test_update_post_pull_syntax_guard.py" in test_command
         out = capsys.readouterr().out
         assert "Merged upstream/main" in out
         assert "Fork synced with upstream" in out
@@ -1358,6 +1391,33 @@ class TestForkSyncStrategy:
         assert "Rolled back to feedbead12" in out
         assert "nothing was pushed" in out
 
+    def test_merge_strategy_test_failure_rolls_back_and_never_pushes(self, capsys):
+        calls = self._run_sync(
+            strategy="merge",
+            origin_ahead=2,
+            upstream_ahead=5,
+            test_rc=1,
+        )
+
+        assert any(" -m pytest " in f" {c} " for c in calls)
+        assert any("reset --hard feedbead1234567890" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        out = capsys.readouterr().out
+        assert "targeted updater tests failed" in out
+        assert "nothing was pushed" in out
+
+    def test_merge_strategy_missing_pre_sync_head_never_merges_or_pushes(self, capsys):
+        calls = self._run_sync(
+            strategy="merge",
+            origin_ahead=2,
+            upstream_ahead=5,
+            head_sha=None,
+        )
+
+        assert not any("merge --no-edit" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        assert "Could not capture the pre-sync HEAD" in capsys.readouterr().out
+
     def test_default_ff_only_preserves_skip_notice(self, capsys):
         calls = self._run_sync(strategy=None, origin_ahead=2, upstream_ahead=5)
 
@@ -1388,4 +1448,88 @@ class TestForkSyncStrategy:
 
         assert any("pull --ff-only upstream main" in c for c in calls)
         assert any("push origin main --force-with-lease" in c for c in calls)
+        test_idx = next(i for i, c in enumerate(calls) if " -m pytest " in f" {c} ")
+        push_idx = next(i for i, c in enumerate(calls) if "push origin main" in c)
+        assert test_idx < push_idx
+        test_command = calls[test_idx]
+        assert "tests/hermes_cli/test_cmd_update.py" in test_command
+        assert "tests/hermes_cli/test_update_post_pull_syntax_guard.py" in test_command
         assert "Fork synced with upstream" in capsys.readouterr().out
+
+    def test_ff_only_test_failure_rolls_back_and_never_pushes(self, capsys):
+        calls = self._run_sync(
+            strategy=None,
+            origin_ahead=0,
+            upstream_ahead=4,
+            test_rc=1,
+        )
+
+        assert any("pull --ff-only upstream main" in c for c in calls)
+        assert any(" -m pytest " in f" {c} " for c in calls)
+        assert any("reset --hard feedbead1234567890" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        out = capsys.readouterr().out
+        assert "targeted updater tests failed" in out
+        assert "nothing was pushed" in out
+
+    def test_test_runner_bootstraps_pytest_with_uv_when_missing(self):
+        import sys
+        from pathlib import Path
+
+        from hermes_cli import update_cmd
+
+        calls = []
+
+        def side_effect(cmd, **kwargs):
+            calls.append([str(part) for part in cmd])
+            joined = " ".join(str(part) for part in cmd)
+            if "-c import pytest, pytest_asyncio" in joined:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="missing")
+            return subprocess.CompletedProcess(cmd, 0, stdout="passed\n", stderr="")
+
+        with patch("subprocess.run", side_effect=side_effect), patch(
+            "shutil.which", return_value="/portable/uv"
+        ):
+            passed, detail = update_cmd._run_fork_sync_tests(Path("/repo"))
+
+        assert passed is True
+        assert detail == ""
+        assert [
+            "/portable/uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "pytest==9.1.1",
+            "pytest-asyncio==1.3.0",
+        ] in calls
+        pytest_call = next(call for call in calls if call[1:3] == ["-m", "pytest"])
+        assert pytest_call[0] == sys.executable
+        assert "tests/hermes_cli/test_cmd_update.py" in pytest_call
+        assert "tests/hermes_cli/test_update_post_pull_syntax_guard.py" in pytest_call
+
+    def test_test_runner_dependency_bootstrap_failure_stops_before_tests(self):
+        from pathlib import Path
+
+        from hermes_cli import update_cmd
+
+        calls = []
+
+        def side_effect(cmd, **kwargs):
+            calls.append([str(part) for part in cmd])
+            joined = " ".join(str(part) for part in cmd)
+            if "-c import pytest, pytest_asyncio" in joined:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="missing")
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="install stdout\n", stderr="install stderr\n"
+            )
+
+        with patch("subprocess.run", side_effect=side_effect), patch(
+            "shutil.which", return_value="/portable/uv"
+        ):
+            passed, detail = update_cmd._run_fork_sync_tests(Path("/repo"))
+
+        assert passed is False
+        assert "install stdout" in detail
+        assert "install stderr" in detail
+        assert not any(call[1:3] == ["-m", "pytest"] for call in calls)

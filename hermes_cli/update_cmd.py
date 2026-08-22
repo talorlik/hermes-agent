@@ -2275,6 +2275,128 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
+
+_FORK_SYNC_TEST_PATHS = (
+    "tests/hermes_cli/test_cmd_update.py",
+    "tests/hermes_cli/test_update_post_pull_syntax_guard.py",
+)
+
+
+def _subprocess_detail(result: subprocess.CompletedProcess[str]) -> str:
+    """Return the last eight lines across stdout and stderr."""
+    streams = [stream.strip() for stream in (result.stdout, result.stderr) if stream.strip()]
+    return "\n".join("\n".join(streams).splitlines()[-8:])
+
+
+def _run_fork_sync_tests(cwd: Path) -> tuple[bool, str]:
+    """Bootstrap and run credential-free updater tests before a fork push."""
+    python = sys.executable
+    try:
+        probe = subprocess.run(
+            [python, "-c", "import pytest, pytest_asyncio"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        if probe.returncode != 0:
+            from hermes_cli.managed_uv import ensure_uv
+
+            uv_bin = ensure_uv()
+            if not uv_bin:
+                return False, "uv is unavailable; cannot install updater test dependencies"
+            install = subprocess.run(
+                [
+                    str(uv_bin),
+                    "pip",
+                    "install",
+                    "--python",
+                    python,
+                    "pytest==9.1.1",
+                    "pytest-asyncio==1.3.0",
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5 * 60,
+            )
+            if install.returncode != 0:
+                return False, _subprocess_detail(install)
+
+        result = subprocess.run(
+            [python, "-m", "pytest", *_FORK_SYNC_TEST_PATHS, "-q"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15 * 60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, ""
+    detail = _subprocess_detail(result)
+    return False, "\n".join(detail.splitlines()[-8:])
+
+
+def _rollback_fork_sync_candidate(
+    git_cmd: list[str], cwd: Path, rollback_ref: str
+) -> bool:
+    """Reset a failed upstream candidate and report whether rollback succeeded."""
+    rollback_result = subprocess.run(
+        git_cmd + ["reset", "--hard", rollback_ref],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if rollback_result.returncode == 0:
+        print(
+            f"  ✓ Rolled back to {rollback_ref[:10]} - nothing was pushed "
+            "to your fork."
+        )
+        return True
+    print("  ✗ Rollback failed. Recover manually with:")
+    print(f"    cd {cwd} && git reset --hard {rollback_ref}")
+    if rollback_result.stderr.strip():
+        print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+    return False
+
+
+def _validate_fork_sync_candidate(
+    git_cmd: list[str], cwd: Path, rollback_ref: str
+) -> bool:
+    """Validate merged upstream code and roll it back on any failure."""
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
+    if not syntax_ok:
+        print()
+        print("  ✗ Merged code has a syntax error in a critical file:")
+        print(f"    {failing_path}")
+        if syntax_error:
+            for line in str(syntax_error).splitlines()[:6]:
+                print(f"      {line}")
+        _rollback_fork_sync_candidate(git_cmd, cwd, rollback_ref)
+        return False
+
+    print("→ Running targeted updater tests before syncing the fork...")
+    tests_ok, test_detail = _run_fork_sync_tests(cwd)
+    if not tests_ok:
+        print("  ✗ Fork sync targeted updater tests failed:")
+        if test_detail:
+            for line in test_detail.splitlines():
+                print(f"    {line}")
+        _rollback_fork_sync_candidate(git_cmd, cwd, rollback_ref)
+        return False
+    print("  ✓ Targeted updater tests passed")
+    return True
+
+
 def _fork_sync_strategy() -> str:
     """Read ``updates.fork_sync_strategy`` from config.yaml.
 
@@ -2403,6 +2525,9 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         # Recovery anchors if anything goes wrong: the pre-merge SHA drives
         # the automatic rollback below; the tag is a human-visible fallback.
         pre_merge_sha = _capture_head_sha(git_cmd, cwd)
+        if not pre_merge_sha:
+            print("  ✗ Could not capture the pre-sync HEAD. Skipping upstream sync.")
+            return
         sync_tag = f"pre-upstream-sync-{_time.strftime('%Y%m%d-%H%M%S')}"
         subprocess.run(
             git_cmd + ["tag", sync_tag],
@@ -2431,36 +2556,9 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             print("  Then push your fork: git push origin main")
             return
 
-        # Post-merge syntax guard — mirrors the post-pull guard: the merged
-        # tree must still parse every critical startup file. The pull path's
-        # guard already ran BEFORE this sync, so upstream code merged here
-        # would otherwise reach origin (and the running install) unchecked.
-        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
-        if not syntax_ok:
-            rollback_ref = pre_merge_sha or sync_tag
-            print()
-            print("  ✗ Merged code has a syntax error in a critical file:")
-            print(f"    {failing_path}")
-            if syntax_error:
-                for line in str(syntax_error).splitlines()[:6]:
-                    print(f"      {line}")
-            rollback_result = subprocess.run(
-                git_cmd + ["reset", "--hard", rollback_ref],
-                cwd=cwd,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            )
-            if rollback_result.returncode == 0:
-                print(
-                    f"  ✓ Rolled back to {rollback_ref[:10]} — nothing was "
-                    "pushed to your fork."
-                )
-                print("  Try the sync again once a fix lands upstream.")
-            else:
-                print("  ✗ Rollback failed. Recover manually with:")
-                print(f"    cd {cwd} && git reset --hard {rollback_ref}")
-                if rollback_result.stderr.strip():
-                    print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+        rollback_ref = pre_merge_sha
+        if not _validate_fork_sync_candidate(git_cmd, cwd, rollback_ref):
+            print("  Try the sync again once the candidate passes validation.")
             return
 
         print("  ✓ Merged upstream/main (your commits preserved)")
@@ -2488,6 +2586,11 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
     print("→ Pulling from upstream...")
 
+    pre_sync_sha = _capture_head_sha(git_cmd, cwd)
+    if not pre_sync_sha:
+        print("  ✗ Could not capture the pre-sync HEAD. Skipping upstream sync.")
+        return
+
     try:
         subprocess.run(
             git_cmd + ["pull", "--ff-only", "upstream", "main"],
@@ -2501,6 +2604,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         return
 
     print("  ✓ Updated from upstream")
+
+    if not _validate_fork_sync_candidate(git_cmd, cwd, pre_sync_sha):
+        print("  Try the sync again once the candidate passes validation.")
+        return
 
     # Try to sync fork back to origin
     print("→ Syncing fork...")
