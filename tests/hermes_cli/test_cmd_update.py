@@ -1472,6 +1472,18 @@ class TestForkSyncStrategy:
         assert "targeted updater tests failed" in out
         assert "nothing was pushed" in out
 
+    def test_ff_only_missing_pre_sync_head_never_pulls_or_pushes(self, capsys):
+        calls = self._run_sync(
+            strategy=None,
+            origin_ahead=0,
+            upstream_ahead=4,
+            head_sha=None,
+        )
+
+        assert not any("pull --ff-only" in c for c in calls)
+        assert not any("push" in c for c in calls)
+        assert "Could not capture the pre-sync HEAD" in capsys.readouterr().out
+
     def test_test_runner_bootstraps_pytest_with_uv_when_missing(self):
         import sys
         from pathlib import Path
@@ -1533,3 +1545,29 @@ class TestForkSyncStrategy:
         assert "install stdout" in detail
         assert "install stderr" in detail
         assert not any(call[1:3] == ["-m", "pytest"] for call in calls)
+
+    def test_failed_pytest_detail_preserves_bounded_stdout_and_stderr(self):
+        from pathlib import Path
+
+        from hermes_cli import update_cmd
+
+        stderr = "\n".join(f"stderr-{index}" for index in range(10))
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(part) for part in cmd)
+            if "-c import pytest, pytest_asyncio" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="stdout-marker\n",
+                stderr=stderr,
+            )
+
+        with patch("subprocess.run", side_effect=side_effect):
+            passed, detail = update_cmd._run_fork_sync_tests(Path("/repo"))
+
+        assert passed is False
+        assert "stdout-marker" in detail
+        assert "stderr-9" in detail
+        assert "stderr-0" not in detail
