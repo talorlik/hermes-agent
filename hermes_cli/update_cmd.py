@@ -2277,7 +2277,7 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
 
 
 _FORK_SYNC_TEST_PATHS = (
-    "tests/hermes_cli/test_cmd_update.py",
+    "tests/hermes_cli/test_fork_sync_strategy.py",
     "tests/hermes_cli/test_update_post_pull_syntax_guard.py",
 )
 
