@@ -6536,11 +6536,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # commit_count == 0 branch, which returns immediately after: an update
         # that pulled hundreds of upstream commits printed "Already up to
         # date!" and verified nothing).
+        upstream_sync_moved_head = False
         if commit_count == 0 and is_fork and branch == "main":
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
             post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+                upstream_sync_moved_head = True
                 synced_count = _count_commits_between(
                     git_cmd,
                     _m().PROJECT_ROOT,
@@ -6890,9 +6892,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # reinstalled deps + rebuilt the desktop app against the stale tree —
         # no error, no warning, ``hermes doctor`` healthy. Compare pre-pull
         # and post-pull HEAD; if they match, surface the no-op instead of
-        # claiming success.
+        # claiming success. A fork upstream sync can legitimately move HEAD
+        # and push that commit to origin before this pull, making the pull a
+        # no-op even though the overall update did move the checkout.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if (
+            pre_pull_sha
+            and post_pull_sha == pre_pull_sha
+            and not upstream_sync_moved_head
+        ):
             print()
             print("✗ Code did not move — update was a no-op.")
             print(

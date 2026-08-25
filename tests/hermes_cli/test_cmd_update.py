@@ -318,12 +318,11 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb:
-        # the sync moved HEAD). The NEXT two bracket the pull inside the
-        # normal update path (bbbbbbb -> ccccccc) — the head-moved no-op
-        # guard added after this PR exits 1 when that pair is equal, so the
-        # mock must show the pull advancing HEAD too.
-        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "ccccccc"])
+        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb),
+        # which moves HEAD and pushes the synchronized commit to origin. The
+        # next two bracket the normal origin pull. That pull is correctly a
+        # no-op because the sync already made HEAD and origin/main identical.
+        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "bbbbbbb"])
 
         with patch.object(
             hm,
