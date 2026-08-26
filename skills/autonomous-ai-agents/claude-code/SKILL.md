@@ -729,7 +729,8 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 9. **Background tmux sessions persist** — always clean up with `tmux kill-session -t <name>` when done.
 10. **Slash commands (like `/commit`) only work in interactive mode** — in `-p` mode, describe the task in natural language instead.
 11. **`--bare` skips OAuth** — requires `ANTHROPIC_API_KEY` env var or an `apiKeyHelper` in settings.
-12. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
+12. **`claude auth status` can be stale after token revocation** — it may report a valid Claude Max login while the first real API call fails with `401 OAuth access token has been revoked`. Before a long delegated build, run a one-turn probe such as `claude -p 'Respond with OK only.' --max-turns 1`. On 401, record that no implementation turn ran, use `claude auth login` to restore the CLI session when user interaction is available, or fall back once to the independently configured Hermes Anthropic provider/current model per adaptive routing policy.
+13. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
 
 ## Rules for Hermes Agents
 
