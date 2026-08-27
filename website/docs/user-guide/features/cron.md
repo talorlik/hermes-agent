@@ -910,6 +910,42 @@ print(json.dumps({"wakeAgent": True, "context": {"new_issues": latest - prev}}))
 
 When `wakeAgent` is omitted, the default is `true` (wake the agent as usual).
 
+#### Failing closed when the pre-check breaks
+
+Agent-backed scripts default to `script_failure_policy="continue"` for backward
+compatibility. If the script is missing, unreadable, cannot launch, times out, or
+exits non-zero, Hermes injects the script error into the agent prompt and lets
+the agent report it.
+
+Set `script_failure_policy="fail_closed"` when the script is a safety gate whose
+failure must prevent the agent from running. In this mode, any pre-run script
+failure records a failed cron run and returns before prompt construction, model
+resolution, or agent startup. Failure details are redacted and bounded. A
+successful script behaves normally, including a successful
+`{"wakeAgent": false}` result remaining a silent successful skip.
+
+```bash
+hermes cron create "every 30m" \
+  "Process the feed only after the gate succeeds." \
+  --script feed-safety-gate.py \
+  --script-failure-policy fail_closed
+```
+
+```python
+cronjob(action="create", name="guarded-feed",
+        schedule="every 30m",
+        script="feed-safety-gate.py",
+        script_failure_policy="fail_closed",
+        prompt="Process the feed only after the gate succeeds.")
+```
+
+`fail_closed` requires a nonblank `script`. To remove the script from a guarded
+job, reset the policy in the same update:
+
+```bash
+hermes cron edit <job_id> --script "" --script-failure-policy continue
+```
+
 #### Recipes: cheap pre-run gates
 
 The `wakeAgent` gate gives you a $0 way to decide whether a scheduled job should spend any LLM tokens at all. Three patterns cover most use cases.

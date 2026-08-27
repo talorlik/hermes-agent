@@ -779,6 +779,9 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+        result["script_failure_policy"] = job.get(
+            "script_failure_policy", "continue"
+        )
     if job.get("reasoning_effort"):
         result["reasoning_effort"] = job["reasoning_effort"]
     if job.get("monitor_script"):
@@ -1362,6 +1365,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    script_failure_policy: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     continuity: Optional[bool] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -1474,6 +1478,7 @@ def cronjob(
                     provider=_normalize_optional_job_value(provider),
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
+                    script_failure_policy=script_failure_policy,
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
                     workdir=_normalize_optional_job_value(workdir),
@@ -1723,6 +1728,8 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if script_failure_policy is not None:
+                updates["script_failure_policy"] = script_failure_policy
             if monitor_script is not None:
                 # Pass empty string to clear an existing monitor_script
                 if monitor_script:
@@ -1876,6 +1883,12 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": f"Optional script run each tick; stdout is injected into the agent's prompt as context (with no_agent=True the script IS the job). Relative paths resolve under {display_hermes_home()}/scripts/; .sh/.bash via bash, else Python. On update, '' clears."
             },
+            "script_failure_policy": {
+                "type": "string",
+                "enum": ["continue", "fail_closed"],
+                "default": "continue",
+                "description": "Agent-backed pre-run script failure behavior. continue preserves legacy behavior by injecting the error into the prompt; fail_closed fails the run before the agent starts and requires a nonblank script."
+            },
             "monitor": {
                 "type": "string",
                 "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
@@ -1967,6 +1980,7 @@ def _cronjob_handler(args, **kw):
         # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),
+        script_failure_policy=args.get("script_failure_policy"),
         context_from=args.get("context_from"),
         continuity=args.get("continuity"),
         enabled_toolsets=args.get("enabled_toolsets"),

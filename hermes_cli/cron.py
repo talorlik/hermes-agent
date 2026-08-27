@@ -177,6 +177,10 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+            print(
+                "    Script failure policy: "
+                f"{job.get('script_failure_policy', 'continue')}"
+            )
         monitor_source = job.get("monitor_script") or job.get("monitor_url")
         if monitor_source:
             print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
@@ -502,6 +506,7 @@ def cron_create(args):
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        script_failure_policy=getattr(args, "script_failure_policy", "continue"),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -522,6 +527,10 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+        print(
+            "  Script failure policy: "
+            f"{job_data.get('script_failure_policy', 'continue')}"
+        )
     if job_data.get("monitor_script"):
         print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
     if job_data.get("monitor_url"):
@@ -577,6 +586,7 @@ def cron_edit(args):
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        script_failure_policy=getattr(args, "script_failure_policy", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -600,6 +610,10 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+        print(
+            "  Script failure policy: "
+            f"{updated.get('script_failure_policy', 'continue')}"
+        )
     if updated.get("monitor_script"):
         print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
     if updated.get("monitor_url"):

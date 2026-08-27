@@ -60,6 +60,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--script-failure-policy",
+        choices=["continue", "fail_closed"],
+        default="continue",
+        help=(
+            "Behavior when an agent pre-run script fails: continue injects the "
+            "error into the prompt (legacy default); fail_closed fails the run "
+            "before the agent starts and requires --script."
+        ),
+    )
+    cron_create.add_argument(
         "--no-agent",
         dest="no_agent",
         action="store_true",
@@ -172,6 +182,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Path to a script under ~/.hermes/scripts/. Pass empty string to clear. "
             "With --no-agent the script IS the job; otherwise its stdout is "
             "injected into the agent's prompt each run."
+        ),
+    )
+    cron_edit.add_argument(
+        "--script-failure-policy",
+        choices=["continue", "fail_closed"],
+        default=None,
+        help=(
+            "Set agent pre-run script failure behavior. fail_closed requires an "
+            "effective script; use continue in the same edit when clearing one."
         ),
     )
     cron_edit.add_argument(

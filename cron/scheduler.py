@@ -4169,6 +4169,27 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+_CRON_SCRIPT_REDACTION_FAILURE = "[REDACTED - cron script result unavailable]"
+
+
+def _redact_job_script_result(success: bool, output: object) -> tuple[bool, str]:
+    """Force-redact one script runner result, failing safe if scrubbing breaks."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            str(output),
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        # Do not log through the redacting formatter here. If the redactor is
+        # unavailable, that would recursively invoke the same failing boundary
+        # and could expose the exception instead of returning the safe constant.
+        redacted = _CRON_SCRIPT_REDACTION_FAILURE
+    return success, redacted
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4210,9 +4231,14 @@ def _run_job_script(
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    scripts_dir = _get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-    scripts_dir_resolved = scripts_dir.resolve()
+    try:
+        scripts_dir = _get_hermes_home() / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        scripts_dir_resolved = scripts_dir.resolve()
+    except (ValueError, RuntimeError, OSError):
+        return _redact_job_script_result(
+            False, "Blocked: Hermes scripts directory is unavailable"
+        )
 
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
     # a NUL-bearing value can never name a real script, and on Windows the
@@ -4224,10 +4250,16 @@ def _run_job_script(
     # guard must be crash-proof even though every current call site
     # passes a plain str (#86832 review).
     if "\x00" in str(script_path):
-        return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
+        return _redact_job_script_result(
+            False, f"Blocked: script path contains a NUL byte: {script_path!r}"
+        )
 
     try:
         raw = Path(script_path).expanduser()
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (scripts_dir / raw).resolve()
     except (ValueError, RuntimeError, OSError):
         # Same ingestion contract as cron.lifecycle_guard: a NUL-bearing
         # value (ValueError) or an unexpandable ``~`` (RuntimeError with no
@@ -4235,26 +4267,36 @@ def _run_job_script(
         # guard tolerates such values as "nothing to scan", so they can
         # reach fire time — fail the run with a report instead of crashing
         # the scheduler with an unhandled exception.
-        return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    if raw.is_absolute():
-        path = raw.resolve()
-    else:
-        path = (scripts_dir / raw).resolve()
+        return _redact_job_script_result(
+            False,
+            f"Blocked: script path is not a valid filesystem path: {script_path!r}",
+        )
 
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST reside within HERMES_HOME/scripts/.
     try:
         path.relative_to(scripts_dir_resolved)
     except ValueError:
-        return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
+        return _redact_job_script_result(
+            False,
+            (
+                f"Blocked: script path resolves outside the scripts directory "
+                f"({scripts_dir_resolved}): {script_path!r}"
+            ),
         )
 
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
+    try:
+        if not path.exists():
+            return _redact_job_script_result(False, f"Script not found: {path}")
+        if not path.is_file():
+            return _redact_job_script_result(
+                False, f"Script path is not a file: {path}"
+            )
+    except OSError:
+        return _redact_job_script_result(
+            False,
+            f"Blocked: script path is not a valid filesystem path: {script_path!r}",
+        )
 
     script_timeout = _get_script_timeout()
 
@@ -4273,11 +4315,14 @@ def _run_job_script(
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
-            return False, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
-                "On Windows, install Git for Windows (which ships Git Bash) "
-                "or rewrite the script as Python (.py)."
-        )
+            return _redact_job_script_result(
+                False,
+                (
+                    f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
+                    "On Windows, install Git for Windows (which ships Git Bash) "
+                    "or rewrite the script as Python (.py)."
+                ),
+            )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
@@ -4322,12 +4367,17 @@ def _run_job_script(
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_process(proc)
                 _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
+                return _redact_job_script_result(
+                    False,
+                    "Script cancelled because cron fire ownership was lost",
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_process(proc)
                 _drain_script_pipes(proc)
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return _redact_job_script_result(
+                    False, f"Script timed out after {script_timeout}s: {path}"
+                )
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
@@ -4337,28 +4387,20 @@ def _run_job_script(
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
 
-        # Redact secrets from both stdout and stderr before any return path.
-        try:
-            from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
-        except Exception as e:
-            logger.warning("Failed to redact sensitive text from output: %s", e)
-            stdout = "[REDACTED - redaction failed]"
-            stderr = "[REDACTED - redaction failed]"
-
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
+            return _redact_job_script_result(False, "\n".join(parts))
 
-        return True, stdout
+        return _redact_job_script_result(True, stdout)
 
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        return _redact_job_script_result(
+            False, f"Script execution failed: {exc}"
+        )
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -4453,6 +4495,43 @@ def _parse_wake_gate(script_output: str) -> bool:
     if not isinstance(gate, dict):
         return True
     return gate.get("wakeAgent", True) is not False
+
+
+class _CronScriptFailure(str):
+    """Scheduler-owned typed marker for a fail-closed pre-script failure."""
+
+
+FAIL_CLOSED_SCRIPT_FAILURE = _CronScriptFailure(
+    "Pre-run script failed before agent start; agent and model were not invoked."
+)
+
+
+def _fail_closed_script_result(
+    job_id: str,
+    job_name: str,
+    script_output: str,
+) -> tuple[bool, str, str, _CronScriptFailure]:
+    """Build a bounded failure document without promoting script text to control data."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        script_error = redact_sensitive_text(
+            str(script_output or "Script failed"),
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        script_error = "[REDACTED - script failure details unavailable]"
+    if len(script_error) > 2000:
+        script_error = script_error[:1997].rstrip() + "..."
+    failure_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "**Status:** script failed before agent start\n\n"
+        f"{script_error}\n"
+    )
+    return False, failure_doc, "", FAIL_CLOSED_SCRIPT_FAILURE
 
 
 def _build_job_prompt(
@@ -5337,6 +5416,16 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Stored policy is an execution control. Only an absent key receives the
+    # legacy default; malformed explicit values fail before any script or agent
+    # side effect can run.
+    from cron.jobs import get_job_script_failure_policy
+
+    try:
+        script_failure_policy = get_job_script_failure_policy(job)
+    except ValueError as exc:
+        return _block_and_pause_job(job_id, job_name, str(exc))
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -5537,6 +5626,40 @@ def run_job(
             )
 
     # ---------------------------------------------------------------
+    # Agent-backed pre-script and wake gate. Run before importing or creating
+    # any agent/provider/session machinery. A failed legacy ``continue`` result
+    # is retained and injected into the prompt after those early returns.
+    # ---------------------------------------------------------------
+    prerun_script = None
+    script_path = job.get("script")
+    if script_path:
+        prerun_script = _run_job_script_with_claim_heartbeat(
+            job, script_path, cancel_event=cancel_event,
+        )
+        _ran_ok, _script_output = prerun_script
+        if not _ran_ok and script_failure_policy == "fail_closed":
+            result = _fail_closed_script_result(job_id, job_name, _script_output)
+            logger.error(
+                "Job '%s' (ID: %s): pre-run script failed closed; agent not started: %s",
+                job_name,
+                job_id,
+                result[3],
+            )
+            return result
+        if _ran_ok and not _parse_wake_gate(_script_output):
+            logger.info(
+                "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
+                job_name, job_id,
+            )
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Script gate returned `wakeAgent=false` — agent skipped.\n"
+            )
+            return True, silent_doc, SILENT_MARKER, None
+
+    # ---------------------------------------------------------------
     # Default (LLM) path — import and construct the agent machinery now
     # that we know we actually need it. Doing these imports here instead of
     # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
@@ -5619,30 +5742,6 @@ def run_job(
         )
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
-
-    # Wake-gate: if this job has a pre-check script, run it BEFORE building
-    # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
-    # the whole agent run. We pass the result into _build_job_prompt so
-    # the script is only executed once.
-    prerun_script = None
-    script_path = job.get("script")
-    if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, cancel_event=cancel_event,
-        )
-        _ran_ok, _script_output = prerun_script
-        if _ran_ok and not _parse_wake_gate(_script_output):
-            logger.info(
-                "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
-                job_name, job_id,
-            )
-            silent_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                "Script gate returned `wakeAgent=false` — agent skipped.\n"
-            )
-            return True, silent_doc, SILENT_MARKER, None
 
     try:
         prompt = _build_job_prompt(
@@ -7164,22 +7263,47 @@ def _run_one_job_body(
             # operator was already told on a previous tick, so re-delivering
             # the same alert every tick would be spam (#73506 alert-once
             # shape).
+            script_failure = isinstance(error, _CronScriptFailure)
             blocked_config_silent = (
-                bool(error) and BLOCKED_CONFIG_SILENT_MARKER in str(error)
+                not script_failure
+                and bool(error)
+                and BLOCKED_CONFIG_SILENT_MARKER in str(error)
             )
             blocked_config = blocked_config_silent or (
-                bool(error) and BLOCKED_CONFIG_MARKER in str(error)
+                not script_failure
+                and bool(error)
+                and BLOCKED_CONFIG_MARKER in str(error)
             )
             # Drift-guard skip (#44585): same alert-once contract as
             # blocked_config — the silent marker means the operator already
             # got the alert on a previous tick.
             drift_skip_silent = (
-                bool(error) and DRIFT_SKIP_SILENT_MARKER in str(error)
+                not script_failure
+                and bool(error)
+                and DRIFT_SKIP_SILENT_MARKER in str(error)
             )
             drift_skip = drift_skip_silent or (
-                bool(error) and DRIFT_SKIP_MARKER in str(error)
+                not script_failure
+                and bool(error)
+                and DRIFT_SKIP_MARKER in str(error)
             )
-            if blocked_config and not success:
+            if script_failure and not success:
+                # Script stderr/stdout is untrusted data saved only in the output
+                # document. The scheduler-owned type selects this branch before
+                # any string markers or provider heuristics can inspect it.
+                incident_acked, failure_incident_id = _upsert_incident_for_failure(
+                    job, error, output_file=output_file
+                )
+                if incident_acked:
+                    deliver_content = ""
+                else:
+                    deliver_content = (
+                        f"⚠️ Cron '{job.get('name') or job['id']}' fail-closed "
+                        "pre-run script failed. The agent and model were not "
+                        "invoked. Full details saved in cron output."
+                        + _failure_streak_nudge(job)
+                    )
+            elif blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
                 # provider runtime failure) — say plainly that config

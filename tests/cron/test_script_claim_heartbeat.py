@@ -536,7 +536,10 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
 
     assert scheduler.run_one_job(job) is True
-    assert calls >= 3
+    # Cancellation is governed by elapsed grace time, not a minimum retry count.
+    # A slow scheduler can consume the 30 ms test grace before the first failed
+    # renewal returns, so require initial validation plus one renewal attempt.
+    assert calls >= 2
 
 
 def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):

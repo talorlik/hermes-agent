@@ -128,6 +128,72 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
 
+    def test_create_parses_and_persists_fail_closed_script_policy(
+        self, tmp_cron_dir, capsys
+    ):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Analyze only if the gate succeeds",
+                "--script",
+                "gate.py",
+                "--script-failure-policy",
+                "fail_closed",
+            ]
+        )
+
+        assert cron_command(args) == 0
+        job = list_jobs()[0]
+        assert job["script_failure_policy"] == "fail_closed"
+        assert "Script failure policy: fail_closed" in capsys.readouterr().out
+
+    def test_edit_resets_policy_when_removing_script_atomically(
+        self, tmp_cron_dir, capsys
+    ):
+        job = create_job(
+            prompt="Analyze only if gate succeeds",
+            schedule="every 1h",
+            script="gate.py",
+            script_failure_policy="fail_closed",
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        args = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--script",
+                "",
+                "--script-failure-policy",
+                "continue",
+            ]
+        )
+
+        assert cron_command(args) == 0
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["script"] is None
+        assert updated["script_failure_policy"] == "continue"
+        assert "Updated job" in capsys.readouterr().out
+
+    def test_list_displays_script_failure_policy(self, tmp_cron_dir, capsys):
+        create_job(
+            prompt="Analyze only if gate succeeds",
+            schedule="every 1h",
+            script="gate.py",
+            script_failure_policy="fail_closed",
+        )
+
+        cron_cli.cron_list()
+
+        assert "Script failure policy: fail_closed" in capsys.readouterr().out
 
 
 class TestGatewayNotRunningWarning:
