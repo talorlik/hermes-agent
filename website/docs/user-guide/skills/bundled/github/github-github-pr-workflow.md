@@ -16,7 +16,7 @@ GitHub PR lifecycle: branch, commit, open, CI, merge.
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/github/github-pr-workflow` |
-| Version | `1.1.0` |
+| Version | `1.1.1` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -303,6 +303,26 @@ gh pr merge --squash --delete-branch
 # Enable auto-merge (merges when all checks pass)
 gh pr merge --auto --squash --delete-branch
 ```
+
+### Worktree Cleanup Errors After A Successful Merge
+
+`gh pr merge --squash --delete-branch` can merge the pull request remotely and
+then exit nonzero because the feature branch is still checked out in a local
+worktree. Treat that exit as an ambiguous merge result, not proof that the
+merge failed.
+
+Before retrying, use `terminal` to read the remote state:
+
+```bash
+gh pr view <number> --json state,mergedAt,mergeCommit,headRefName
+```
+
+If GitHub reports `MERGED`, do not retry the merge. Synchronize the canonical
+checkout with the merged remote branch, remove the feature worktree, and then
+delete any remaining local or remote feature branch. Report the merge as
+successful and the nonzero exit as a cleanup failure. Retry the merge only
+when the read-back confirms that the pull request is still open and otherwise
+eligible to merge.
 
 **With git + curl:**
 
