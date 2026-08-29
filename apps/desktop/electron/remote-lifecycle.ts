@@ -913,7 +913,10 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
+  // `mutexPath` is produced by expandRemotePath() and is already a validated,
+  // shell-quoted fragment. Quoting it again would pass literal quote characters
+  // to Python and create a relative directory named `'` for absolute paths.
+  return `python3 -c ${shq(script)} ${mutexPath} ${shq(command)}`
 }
 
 /**

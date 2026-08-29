@@ -284,17 +284,34 @@ test('POSIX managed launcher executes the updater command and atomically publish
   const home = await mkdtemp(path.join(os.tmpdir(), 'hermes-managed-launch-'))
 
   try {
+    // The generated launcher must run unmodified on every POSIX host, so the
+    // temp home carries the two host-dependent pieces: a setsid shim that
+    // execs its arguments (macOS ships no setsid(1), and without one the
+    // launcher's primary branch is never exercised) and a fake updater
+    // (macOS has no /bin/true). Both live under the temp home so the
+    // existing cleanup removes them.
+    const shimDir = path.join(home, 'bin')
+    const fakeHermes = path.join(shimDir, 'hermes')
+
+    await mkdir(shimDir, { recursive: true })
+    await writeFile(path.join(shimDir, 'setsid'), '#!/bin/sh\nexec "$@"\n', { mode: 0o755 })
+    await writeFile(fakeHermes, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+
     const command = buildPosixManagedUpdateLaunch(
       {
         ssh: { exec: async () => '' },
         platform: 'Linux',
-        hermesPath: '/bin/true',
+        hermesPath: fakeHermes,
         hermesHome: home
       },
       CORRELATION
     )
 
-    const { stdout } = await exec(command, { shell: '/bin/sh' })
+    const { stdout } = await exec(command, {
+      env: { ...process.env, PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}` },
+      shell: '/bin/sh'
+    })
+
     const statusPath = path.join(home, `.update_exit_code.${CORRELATION}`)
     let status = ''
 

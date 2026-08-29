@@ -21,6 +21,9 @@ function makeRepo() {
 
   tempDirs.push(dir)
   execFileSync('git', ['init', '-q'], { cwd: dir })
+  // An empty local core.hooksPath overrides any global hooks dir whose
+  // commit-msg hook would reject the short fixture messages below.
+  execFileSync('git', ['config', 'core.hooksPath', ''], { cwd: dir })
   execFileSync('git', ['config', 'user.email', 'hermes-test@example.com'], { cwd: dir })
   execFileSync('git', ['config', 'user.name', 'Hermes Test'], { cwd: dir })
   fs.writeFileSync(path.join(dir, 'tracked.txt'), 'tracked\n')
