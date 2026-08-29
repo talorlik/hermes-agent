@@ -160,6 +160,26 @@ All dashboard API endpoints accept `?board=<slug>` for board scoping. The
 events WebSocket is pinned to a board at connection time; switching in
 the UI opens a fresh WS against the new board.
 
+### Deep links
+
+The browser dashboard's Kanban tab understands URL query parameters, so you can
+share a link straight to a board or a single task. These `/kanban?...` forms
+refer to the browser dashboard route. The native Desktop app uses hash routing;
+this section does not claim a native `#/kanban?...` deep-link contract:
+
+- `/kanban?board=<slug>` — opens the dashboard on that board. The URL wins
+  over the browser's saved board selection for that page load, but does
+  not overwrite it: opening a shared link never re-pins the recipient's
+  own board choice.
+- `/kanban?board=<slug>&task=<id>` — additionally opens that task's detail
+  drawer on first paint.
+
+Blank parameters (`?board=&task=`) are ignored and fall back to the saved
+board selection. Slugs and ids with special characters must be
+percent-encoded (`?board=sp%20ace`). If the task id does not exist on the
+board, the drawer opens with the backend's "not found" error inside it —
+close it and the board remains usable.
+
 
 ## File attachments
 
