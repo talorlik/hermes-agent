@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import React from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import React from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 type RegisteredPage = React.ComponentType
 
@@ -11,6 +12,7 @@ const bundlePath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../../../../../plugins/kanban/dashboard/dist/index.js',
 )
+
 const bundle = fs.readFileSync(bundlePath, 'utf8')
 
 function primitive(tag: string) {
@@ -20,12 +22,14 @@ function primitive(tag: string) {
         ['className', 'disabled', 'id', 'onChange', 'onClick', 'onKeyDown', 'placeholder', 'title', 'type', 'value'].includes(key),
       ),
     )
+
     return React.createElement(tag, allowed, children as React.ReactNode)
   }
 }
 
 function loadDashboard(fetchJSON: ReturnType<typeof vi.fn>): RegisteredPage {
   let registered: RegisteredPage | null = null
+
   const sdk = {
     React,
     components: {
@@ -54,6 +58,7 @@ function loadDashboard(fetchJSON: ReturnType<typeof vi.fn>): RegisteredPage {
     authedFetch: vi.fn(),
     buildWsUrl: vi.fn().mockResolvedValue('ws://example.invalid/events'),
   }
+
   Object.assign(window, {
     __HERMES_PLUGIN_SDK__: sdk,
     __HERMES_PLUGINS__: {
@@ -66,13 +71,16 @@ function loadDashboard(fetchJSON: ReturnType<typeof vi.fn>): RegisteredPage {
     },
   })
   window.eval(bundle)
-  if (registered === null) throw new Error('Kanban dashboard did not register')
+
+  if (registered === null) {throw new Error('Kanban dashboard did not register')}
+
   return registered
 }
 
 function createFetch(options: { unknownTask?: boolean } = {}) {
   return vi.fn(async (url: string) => {
-    if (url.includes('/config')) return { render_markdown: true }
+    if (url.includes('/config')) {return { render_markdown: true }}
+
     if (url.includes('/boards')) {
       return {
         current: 'default',
@@ -83,11 +91,15 @@ function createFetch(options: { unknownTask?: boolean } = {}) {
         ],
       }
     }
-    if (url.includes('/home-channels')) return { home_channels: [] }
+
+    if (url.includes('/home-channels')) {return { home_channels: [] }}
+
     if (url.includes('/tasks/')) {
-      if (options.unknownTask) throw new Error('404: {"detail":"task not found"}')
+      if (options.unknownTask) {throw new Error('404: {"detail":"task not found"}')}
+
       return new Promise(() => undefined)
     }
+
     if (url.includes('/board')) {
       return {
         latest_event_id: 0,
@@ -109,6 +121,7 @@ function createFetch(options: { unknownTask?: boolean } = {}) {
         ],
       }
     }
+
     return {}
   })
 }
