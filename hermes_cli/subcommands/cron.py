@@ -309,7 +309,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_incidents.add_argument(
         "--state",
-        choices=["detected", "alerted", "closed"],
+        choices=["detected", "alerted", "recovered", "closed"],
         help="Filter incidents by lifecycle state",
     )
     cron_incidents.add_argument(
@@ -321,6 +321,28 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_incidents.add_argument(
         "incident_id", nargs="?", help="Incident ID to acknowledge (ack)"
+    )
+
+    # cron finalize-detached — worker-facing terminal report for a detached
+    # run (RUN_STARTED protocol). Stable contract: detached workers call
+    # this by correlation id after their work succeeds or fails.
+    cron_finalize = cron_subparsers.add_parser(
+        "finalize-detached",
+        help="Finalize a detached cron run by correlation id",
+    )
+    cron_finalize.add_argument(
+        "run_id", help="Correlation id from the RUN_STARTED directive"
+    )
+    finalize_result = cron_finalize.add_mutually_exclusive_group(required=True)
+    finalize_result.add_argument(
+        "--success", action="store_true", help="Report the run succeeded"
+    )
+    finalize_result.add_argument(
+        "--failed", action="store_true", help="Report the run failed"
+    )
+    cron_finalize.add_argument(
+        "--error",
+        help="Failure evidence (stored redacted; used with --failed)",
     )
 
     # cron notepad — per-job durable KV scratchpad (injected into the job

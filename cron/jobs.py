@@ -2719,6 +2719,77 @@ def mark_job_run(
         )
 
 
+def mark_job_deferred(
+    job_id: str,
+    retry_at: str,
+    *,
+    reason: str = "",
+    occurrence_key: str = "",
+    attempts: int = 0,
+    expected_fire_owner: Optional[str] = None,
+) -> bool:
+    """Record a TRANSIENT_DEFER without consuming the logical occurrence.
+
+    The inverse contract of ``_mark_job_run_locked``: ``last_run_at``, the
+    failure streak, repeat counters, and alert-dedup markers are all left
+    untouched — contention is not an outcome. Only the retry fire time and
+    the ``deferred`` status stamp change; the claims are released so the
+    retry fire can claim again. The durable obligation itself lives in
+    ``cron.deferrals`` — this is the job-record projection of it.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for i, job in enumerate(jobs):
+                if job["id"] != job_id:
+                    continue
+                if expected_fire_owner is not None:
+                    claim = job.get("fire_claim")
+                    if (
+                        not isinstance(claim, dict)
+                        or claim.get("by") != expected_fire_owner
+                    ):
+                        logger.warning(
+                            "mark_job_deferred: job_id %s fire claim owner "
+                            "changed; discarding stale defer",
+                            job_id,
+                        )
+                        return False
+                retry_at = str(retry_at)
+                job["last_status"] = "deferred"
+                job["last_error"] = None
+                job["last_defer"] = {
+                    "at": _hermes_now().isoformat(),
+                    "reason": str(reason or "")[:500],
+                    "occurrence_key": str(occurrence_key or ""),
+                    "retry_at": retry_at,
+                    "attempts": int(attempts),
+                }
+                job["fire_claim"] = None
+                if job.get("run_claim") is not None:
+                    job["run_claim"] = None
+                # Finite one-shots pre-claim their dispatch via
+                # claim_dispatch() BEFORE the side effect runs; hand the
+                # consumed dispatch back so the retry fire is claimable.
+                schedule = job.get("schedule") or {}
+                if schedule.get("kind") == "once":
+                    repeat = job.get("repeat") or {}
+                    if int(repeat.get("completed") or 0) > 0:
+                        repeat["completed"] = int(repeat["completed"]) - 1
+                        job["repeat"] = repeat
+                    schedule["run_at"] = retry_at
+                    job["schedule"] = schedule
+                job["next_run_at"] = retry_at
+                if job.get("state") != "paused":
+                    job["state"] = "scheduled"
+                jobs[i] = job
+                save_jobs(jobs)
+                return True
+    return False
+
+
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
     """Set/clear a persisted alert-dedup marker; return the PRIOR value.
 
@@ -2847,6 +2918,10 @@ def _mark_job_run_locked(
                 job.pop("manual_run_prompt", None)
                 job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
+                # A terminal run resolves any deferred occurrence either way
+                # (the durable obligation row in cron.deferrals keeps the
+                # history); the job-record projection must not outlive it.
+                job.pop("last_defer", None)
                 # A healthy run means the configuration validates again — drop
                 # the preflight alert-dedup marker so a FUTURE config break
                 # re-alerts instead of being silently swallowed. Same contract

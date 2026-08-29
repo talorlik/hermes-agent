@@ -69,7 +69,13 @@ def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     assert executions.latest_execution("immutable")["status"] == "completed"
 
 
-def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
+def test_retention_is_per_job_and_preserves_inflight(monkeypatch, tmp_path):
+    """Retention partitions by job (durable-outcomes contract): one job's
+    volume can never evict another job's evidence, and rows inside the
+    30-day floor are never pruned. Formerly this asserted a GLOBAL cap —
+    the exact behavior that let a per-minute job evict weekly evidence.
+    Aged per-job overflow pruning is covered in
+    ``test_execution_schema_migration.py``."""
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
     inflight = executions.create_execution("live", source="builtin")
@@ -79,7 +85,7 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
         executions.finish_execution(row["id"], success=True)
 
     records = executions.list_executions(limit=100)
-    assert len([row for row in records if row["status"] == "completed"]) == 3
+    assert len([row for row in records if row["status"] == "completed"]) == 8
     assert executions.latest_execution("live")["status"] == "running"
 
 

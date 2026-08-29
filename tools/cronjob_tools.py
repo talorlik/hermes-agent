@@ -749,6 +749,58 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+# Public durable-execution surface of the cronjob tool: the exact fields
+# the serializer exposes from the executions ledger. Internal process
+# ownership columns (pid, process_id, process_started_at) stay private.
+_EXECUTION_PUBLIC_FIELDS = (
+    "id", "status", "outcome", "source",
+    "claimed_at", "started_at", "finished_at", "error",
+    "occurrence_key", "retry_at",
+    "delivery_target", "delivery_status", "delivery_attempts",
+    "delivery_error",
+    "detached_run_id", "detached_status", "detached_worker",
+    "lease_expires_at",
+)
+
+
+def _redact_execution_error(text: Any) -> Any:
+    """Force-redact error evidence before it crosses the tool surface."""
+    if text is None:
+        return None
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            str(text), force=True, redact_url_credentials=True
+        )
+    except Exception:
+        # Fail safe: never expose a string the redactor could not scrub.
+        return "[REDACTED - error unavailable]"
+
+
+def _format_latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
+    """The job's newest durable execution, projected to the public schema.
+
+    Best-effort: a broken/missing ledger yields None rather than breaking
+    the job listing. Error fields are redacted at this boundary — the
+    ledger keeps them raw for local forensics.
+    """
+    try:
+        from cron.executions import latest_execution
+
+        record = latest_execution(job_id)
+    except Exception:
+        return None
+    if not record:
+        return None
+    projected = {key: record.get(key) for key in _EXECUTION_PUBLIC_FIELDS}
+    projected["error"] = _redact_execution_error(projected.get("error"))
+    projected["delivery_error"] = _redact_execution_error(
+        projected.get("delivery_error")
+    )
+    return projected
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -769,6 +821,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
+        "last_defer": job.get("last_defer"),
+        "latest_execution": _format_latest_execution(job_id),
         "last_delivery_error": job.get("last_delivery_error"),
         "last_fire_error": job.get("last_fire_error"),
         "enabled": job.get("enabled", True),

@@ -214,6 +214,13 @@ def cron_list(show_all: bool = False):
             last_run = job.get("last_run_at", "?")
             if last_status == "ok":
                 status_display = color("ok", Colors.GREEN)
+            elif last_status == "deferred":
+                # A defer is contention, not failure — no red, no streak.
+                defer = job.get("last_defer") or {}
+                retry_at = defer.get("retry_at") or job.get("next_run_at") or "?"
+                status_display = color(
+                    f"deferred (retry at {retry_at})", Colors.YELLOW
+                )
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
                 streak = int(job.get("failure_streak") or 0)
@@ -274,6 +281,30 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
             f"{record.get('claimed_at', '?')}"
         )
+        # Durable-outcome detail lines (all stored values are sanitized at
+        # write time — delivery errors are force-redacted in the ledger).
+        outcome = record.get("outcome")
+        if outcome and outcome != record.get("status"):
+            print(f"    outcome={outcome}")
+        if record.get("occurrence_key"):
+            occurrence = record["occurrence_key"]
+            retry_at = record.get("retry_at")
+            suffix = f"  retry_at={retry_at}" if retry_at else ""
+            print(f"    occurrence={occurrence}{suffix}")
+        if record.get("delivery_target"):
+            print(
+                f"    delivery={record.get('delivery_status', '?')} "
+                f"target={record['delivery_target']} "
+                f"attempts={record.get('delivery_attempts', 0)}"
+            )
+            if record.get("delivery_error"):
+                print(f"      {record['delivery_error']}")
+        if record.get("detached_run_id"):
+            print(
+                f"    detached run={record['detached_run_id']} "
+                f"status={record.get('detached_status', '?')} "
+                f"lease_expires={record.get('lease_expires_at', '?')}"
+            )
         if record.get("error"):
             print(f"    {record['error']}")
 
@@ -374,6 +405,48 @@ def cron_incidents(args) -> int:
         )
     )
     return 0
+
+
+def cron_finalize_detached(args) -> int:
+    """Worker-facing finalize for a detached cron run, by correlation id.
+
+    Exit codes: 0 finalized (or idempotent repeat of the same terminal
+    report), 1 conflicting rewrite refused, 2 unknown correlation id.
+    Failure evidence is force-redacted at the ledger layer before it
+    persists.
+    """
+    from cron.executions import finalize_detached_run, find_detached_run
+
+    run_id = str(getattr(args, "run_id", "") or "")
+    success = bool(getattr(args, "success", False))
+    error = getattr(args, "error", None)
+
+    record = finalize_detached_run(run_id, success=success, error=error)
+    if record is not None:
+        print(
+            f"Finalized detached run {run_id}: "
+            f"{record.get('detached_status')} "
+            f"(job {record.get('job_id')}, execution {record.get('id')})"
+        )
+        return 0
+
+    existing = find_detached_run(run_id)
+    if existing is None:
+        print(f"No detached run found for correlation id {run_id!r}")
+        return 2
+    current = str(existing.get("detached_status") or "")
+    desired = "succeeded" if success else "failed"
+    if current == desired:
+        print(
+            f"Detached run {run_id} already finalized as {current} "
+            "(idempotent no-op)"
+        )
+        return 0
+    print(
+        f"Detached run {run_id} is already {current!r}; refusing to "
+        f"rewrite it as {desired!r}"
+    )
+    return 1
 
 
 def cron_status():
@@ -830,6 +903,9 @@ def cron_command(args):
 
     if subcmd == "incidents":
         return cron_incidents(args)
+
+    if subcmd == "finalize-detached":
+        return cron_finalize_detached(args)
 
     if subcmd == "notepad":
         return cron_notepad(args)
