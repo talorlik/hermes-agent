@@ -10,7 +10,7 @@ type RegisteredPage = React.ComponentType
 
 const bundlePath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  '../../../../../plugins/kanban/dashboard/dist/index.js',
+  '../../../../../plugins/kanban/dashboard/dist/index.js'
 )
 
 const bundle = fs.readFileSync(bundlePath, 'utf8')
@@ -19,8 +19,19 @@ function primitive(tag: string) {
   return function Primitive({ children, ...props }: Record<string, unknown>) {
     const allowed = Object.fromEntries(
       Object.entries(props).filter(([key]) =>
-        ['className', 'disabled', 'id', 'onChange', 'onClick', 'onKeyDown', 'placeholder', 'title', 'type', 'value'].includes(key),
-      ),
+        [
+          'className',
+          'disabled',
+          'id',
+          'onChange',
+          'onClick',
+          'onKeyDown',
+          'placeholder',
+          'title',
+          'type',
+          'value'
+        ].includes(key)
+      )
     )
 
     return React.createElement(tag, allowed, children as React.ReactNode)
@@ -41,22 +52,22 @@ function loadDashboard(fetchJSON: ReturnType<typeof vi.fn>): RegisteredPage {
       Input: primitive('input'),
       Label: primitive('label'),
       Select: primitive('select'),
-      SelectOption: primitive('option'),
+      SelectOption: primitive('option')
     },
     hooks: {
       useCallback: React.useCallback,
       useEffect: React.useEffect,
       useMemo: React.useMemo,
       useRef: React.useRef,
-      useState: React.useState,
+      useState: React.useState
     },
     utils: {
       cn: (...values: unknown[]) => values.filter(Boolean).join(' '),
-      timeAgo: () => 'now',
+      timeAgo: () => 'now'
     },
     fetchJSON,
     authedFetch: vi.fn(),
-    buildWsUrl: vi.fn().mockResolvedValue('ws://example.invalid/events'),
+    buildWsUrl: vi.fn().mockResolvedValue('ws://example.invalid/events')
   }
 
   Object.assign(window, {
@@ -64,22 +75,26 @@ function loadDashboard(fetchJSON: ReturnType<typeof vi.fn>): RegisteredPage {
     __HERMES_PLUGINS__: {
       register: (_slug: string, component: RegisteredPage) => {
         registered = component
-      },
+      }
     },
     WebSocket: class {
       close() {}
-    },
+    }
   })
   window.eval(bundle)
 
-  if (registered === null) {throw new Error('Kanban dashboard did not register')}
+  if (registered === null) {
+    throw new Error('Kanban dashboard did not register')
+  }
 
   return registered
 }
 
 function createFetch(options: { unknownTask?: boolean } = {}) {
   return vi.fn(async (url: string) => {
-    if (url.includes('/config')) {return { render_markdown: true }}
+    if (url.includes('/config')) {
+      return { render_markdown: true }
+    }
 
     if (url.includes('/boards')) {
       return {
@@ -87,15 +102,19 @@ function createFetch(options: { unknownTask?: boolean } = {}) {
         boards: [
           { slug: 'default', name: 'Default', counts: {} },
           { slug: 'ops board', name: 'Ops Board', counts: {} },
-          { slug: 'saved-board', name: 'Saved Board', counts: {} },
-        ],
+          { slug: 'saved-board', name: 'Saved Board', counts: {} }
+        ]
       }
     }
 
-    if (url.includes('/home-channels')) {return { home_channels: [] }}
+    if (url.includes('/home-channels')) {
+      return { home_channels: [] }
+    }
 
     if (url.includes('/tasks/')) {
-      if (options.unknownTask) {throw new Error('404: {"detail":"task not found"}')}
+      if (options.unknownTask) {
+        throw new Error('404: {"detail":"task not found"}')
+      }
 
       return new Promise(() => undefined)
     }
@@ -114,11 +133,11 @@ function createFetch(options: { unknownTask?: boolean } = {}) {
                 title: 'Board remains usable',
                 status: 'todo',
                 priority: 1,
-                created_at: 1,
-              },
-            ],
-          },
-        ],
+                created_at: 1
+              }
+            ]
+          }
+        ]
       }
     }
 
@@ -127,7 +146,7 @@ function createFetch(options: { unknownTask?: boolean } = {}) {
 }
 
 function requested(fetchJSON: ReturnType<typeof vi.fn>, fragment: string) {
-  return fetchJSON.mock.calls.map(([url]) => String(url)).filter((url) => url.includes(fragment))
+  return fetchJSON.mock.calls.map(([url]) => String(url)).filter(url => url.includes(fragment))
 }
 
 describe('shipped Kanban dashboard deep links', () => {
@@ -152,8 +171,8 @@ describe('shipped Kanban dashboard deep links', () => {
     await screen.findByText('t_abc/123')
     expect(screen.getByTitle('Close (Esc)')).toBeTruthy()
     await waitFor(() => {
-      expect(requested(fetchJSON, '/board').some((url) => url.includes('board=ops%20board'))).toBe(true)
-      expect(requested(fetchJSON, '/tasks/t_abc%2F123').some((url) => url.includes('board=ops%20board'))).toBe(true)
+      expect(requested(fetchJSON, '/board').some(url => url.includes('board=ops%20board'))).toBe(true)
+      expect(requested(fetchJSON, '/tasks/t_abc%2F123').some(url => url.includes('board=ops%20board'))).toBe(true)
     })
     expect(window.localStorage.getItem('hermes.kanban.selectedBoard')).toBe('saved-board')
   })
@@ -168,7 +187,7 @@ describe('shipped Kanban dashboard deep links', () => {
     await screen.findByText('Board remains usable')
     expect(screen.queryByTitle('Close (Esc)')).toBeNull()
     expect(requested(fetchJSON, '/tasks/')).toHaveLength(0)
-    expect(requested(fetchJSON, '/board').some((url) => url.includes('board=ops%20board'))).toBe(true)
+    expect(requested(fetchJSON, '/board').some(url => url.includes('board=ops%20board'))).toBe(true)
   })
 
   it('preserves the saved board when URL parameters are absent', async () => {
@@ -181,7 +200,7 @@ describe('shipped Kanban dashboard deep links', () => {
 
     await screen.findByText('Board remains usable')
     expect(screen.queryByTitle('Close (Esc)')).toBeNull()
-    expect(requested(fetchJSON, '/board').some((url) => url.includes('board=saved-board'))).toBe(true)
+    expect(requested(fetchJSON, '/board').some(url => url.includes('board=saved-board'))).toBe(true)
   })
 
   it('preserves the saved board when URL parameters are blank', async () => {
@@ -194,7 +213,7 @@ describe('shipped Kanban dashboard deep links', () => {
 
     await screen.findByText('Board remains usable')
     expect(screen.queryByTitle('Close (Esc)')).toBeNull()
-    expect(requested(fetchJSON, '/board').some((url) => url.includes('board=saved-board'))).toBe(true)
+    expect(requested(fetchJSON, '/board').some(url => url.includes('board=saved-board'))).toBe(true)
   })
 
   it('contains an unknown-task error in a closable drawer and keeps the board usable', async () => {
