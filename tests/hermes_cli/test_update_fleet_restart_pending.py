@@ -115,6 +115,16 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(
+        update_cmd,
+        "_restart_launchd_gateway_after_update",
+        lambda **_kwargs: (["ai.hermes.gateway"], []),
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_fleet_probe_expected_runtimes",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
     monkeypatch.setattr(
