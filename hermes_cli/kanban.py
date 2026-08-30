@@ -638,6 +638,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument("--expected-status", default=None,
+                            choices=sorted(kb.VALID_STATUSES),
+                            help="Only complete if the task still has this exact "
+                                 "status (compare-and-swap guard against racing "
+                                 "status changes). Applies to every listed task id.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -2352,6 +2357,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    expected_status = getattr(args, "expected_status", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
@@ -2398,9 +2404,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                expected_status=expected_status,
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                if expected_status is not None:
+                    current = kb.get_task(conn, tid)
+                    actual = current.status if current else "unknown id"
+                    print(
+                        f"refusing to complete {tid}: expected status "
+                        f"{expected_status!r}, task is {actual!r}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1

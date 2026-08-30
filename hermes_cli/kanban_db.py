@@ -5369,9 +5369,20 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_status: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+
+    ``expected_status`` is a compare-and-swap guard for callers that read
+    the status and then decide to complete (TOCTOU window — e.g. a caller
+    that observed ``running`` while the task has since moved to
+    ``blocked``). When supplied, the completion only fires if the status
+    still equals it inside the write transaction; on a mismatch the
+    function returns False with no side effects. The guard is evaluated
+    before the created-card audit, so a stale caller cannot leave a
+    ``completion_blocked_hallucination`` event behind. Combined with
+    ``expected_run_id`` the guards are conjunctive: both must match.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -5404,22 +5415,53 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # An unknown guard value would never match any row and read as a
+    # mismatch; a typo'd caller must fail loudly instead.
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(
+            f"expected_status must be one of {sorted(VALID_STATUSES)}"
+        )
+    normalized_expected_run_id = (
+        int(expected_run_id) if expected_run_id is not None else None
+    )
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
 
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
-    # completion still needs an auditable event, so we emit it in a
-    # tiny dedicated txn, then raise. The caller is responsible for
-    # surfacing HallucinatedCardsError to the worker; this function
-    # never mutates task state on a phantom-card rejection.
-    if created_cards:
-        verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
-        )
-        if phantom_cards:
-            with write_txn(conn):
+    verified_cards: list[str] = []
+    phantom_cards: list[str] = []
+    with write_txn(conn):
+        # CAS guard first: a stale ``expected_status`` must refuse before
+        # ANY side effect, including the phantom-card audit event below.
+        prior = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        prior_status = prior["status"] if prior else None
+        if expected_status is not None and prior_status != expected_status:
+            return False
+        prior_run_id = prior["current_run_id"] if prior else None
+        if (
+            normalized_expected_run_id is not None
+            and prior_run_id != normalized_expected_run_id
+        ):
+            return False
+        # Parent completion is a hard invariant even for direct human review
+        # approval. A parent may have been reopened after this task entered
+        # ``review`` or ``running``.
+        if not _parents_satisfied(conn, task_id):
+            return False
+        # Verify created_cards under the same write lock. A rejected
+        # completion still needs an auditable event, so it is recorded
+        # here and committed with the rest of this transaction; the
+        # HallucinatedCardsError is raised only AFTER the with-block so
+        # write_txn's rollback-on-exception cannot erase the audit trail.
+        if created_cards:
+            verified_cards, phantom_cards = _verify_created_cards(
+                conn, task_id, created_cards
+            )
+            if phantom_cards:
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -5432,134 +5474,127 @@ def complete_task(
                         ),
                     },
                 )
-            raise HallucinatedCardsError(phantom_cards, task_id)
-    else:
-        verified_cards = []
-
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
-    with write_txn(conn):
-        # Parent completion is a hard invariant even for direct human review
-        # approval. A parent may have been reopened after this task entered
-        # ``review`` or ``running``.
-        if not _parents_satisfied(conn, task_id):
-            return False
-        prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = prior["status"] if prior else None
-        if expected_run_id is None:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                """,
-                (result, now, task_id),
+        if not phantom_cards:
+            metadata = _merge_completion_prose_artifacts(
+                conn, task_id, metadata, summary=summary, result=result,
             )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                   AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
-            )
-        if cur.rowcount != 1:
-            return False
-        if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_completion_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
+            if normalized_expected_run_id is None:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = 'done',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked', 'review')
+                       AND (? IS NULL OR status = ?)
+                    """,
+                    (result, now, task_id, expected_status, expected_status),
                 )
-        run_id = _end_run(
-            conn, task_id,
-            outcome="completed", status="done",
-            summary=summary if summary is not None else result,
-            metadata=metadata,
-        )
-        # If complete_task was called on a never-claimed task (ready or
-        # blocked → done with no run in flight), synthesize a
-        # zero-duration run so the handoff fields are persisted in
-        # attempt history instead of silently lost.
-        if run_id is None and (
-            summary or metadata or result or prior_status == "review"
-        ):
-            synth_summary = summary if summary is not None else result
-            synth_metadata = metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = "Review approved without additional evidence."
-                synth_metadata = {
-                    "source_status": "review",
-                    "approval": "manual",
-                }
-            run_id = _synthesize_ended_run(
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status       = 'done',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked', 'review')
+                       AND current_run_id = ?
+                       AND (? IS NULL OR status = ?)
+                    """,
+                    (result, now, task_id, normalized_expected_run_id,
+                     expected_status, expected_status),
+                )
+            if cur.rowcount != 1:
+                return False
+            if isinstance(metadata, dict):
+                _persist_scratch_completion_artifacts(conn, task_id, metadata)
+                for stored_path in metadata.pop("_staged_artifacts", []):
+                    path = Path(stored_path)
+                    _insert_completion_attachment(
+                        conn,
+                        task_id,
+                        filename=path.name,
+                        stored_path=str(path),
+                        size=path.stat().st_size,
+                        created_at=now,
+                    )
+            run_id = _end_run(
                 conn, task_id,
-                outcome="completed",
-                summary=synth_summary,
-                metadata=synth_metadata,
+                outcome="completed", status="done",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
             )
-        # Carry the handoff summary in the event payload so gateway
-        # notifiers and dashboard WS consumers can render it without a
-        # second SQL round-trip. First line only, 400 char cap — the
-        # full summary stays on the run row.
-        event_summary = summary if summary is not None else result
-        if prior_status == "review" and not event_summary:
-            event_summary = "Review approved without additional evidence."
-        _ev_lines = (event_summary or "").strip().splitlines()
-        ev_summary = _ev_lines[0][:400] if _ev_lines else ""
-        completed_payload: dict = {
-            "result_len": len(result) if result else 0,
-            "summary": ev_summary or None,
-        }
-        if verified_cards:
-            completed_payload["verified_cards"] = verified_cards
-        # Carry artifact paths in the event payload so the gateway
-        # notifier can upload them as native attachments alongside the
-        # completion message. Workers pass these via
-        # ``kanban_complete(artifacts=[...])`` which stashes the list in
-        # ``metadata["artifacts"]`` — we promote it onto the event so
-        # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
-            conn, task_id, "completed",
-            completed_payload,
-            run_id=run_id,
-        )
+            # If complete_task was called on a never-claimed task (ready or
+            # blocked → done with no run in flight), synthesize a
+            # zero-duration run so the handoff fields are persisted in
+            # attempt history instead of silently lost.
+            if run_id is None and (
+                summary or metadata or result or prior_status == "review"
+            ):
+                synth_summary = summary if summary is not None else result
+                synth_metadata = metadata
+                if prior_status == "review" and not synth_summary and not synth_metadata:
+                    synth_summary = "Review approved without additional evidence."
+                    synth_metadata = {
+                        "source_status": "review",
+                        "approval": "manual",
+                    }
+                run_id = _synthesize_ended_run(
+                    conn, task_id,
+                    outcome="completed",
+                    summary=synth_summary,
+                    metadata=synth_metadata,
+                )
+            # Carry the handoff summary in the event payload so gateway
+            # notifiers and dashboard WS consumers can render it without a
+            # second SQL round-trip. First line only, 400 char cap — the
+            # full summary stays on the run row.
+            event_summary = summary if summary is not None else result
+            if prior_status == "review" and not event_summary:
+                event_summary = "Review approved without additional evidence."
+            _ev_lines = (event_summary or "").strip().splitlines()
+            ev_summary = _ev_lines[0][:400] if _ev_lines else ""
+            completed_payload: dict = {
+                "result_len": len(result) if result else 0,
+                "summary": ev_summary or None,
+            }
+            if verified_cards:
+                completed_payload["verified_cards"] = verified_cards
+            # Carry artifact paths in the event payload so the gateway
+            # notifier can upload them as native attachments alongside the
+            # completion message. Workers pass these via
+            # ``kanban_complete(artifacts=[...])`` which stashes the list in
+            # ``metadata["artifacts"]`` — we promote it onto the event so
+            # consumers don't have to fetch the run row to find it.
+            if isinstance(metadata, dict):
+                md_artifacts = metadata.get("artifacts")
+                if isinstance(md_artifacts, (list, tuple)):
+                    cleaned_artifacts = [
+                        str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
+                    ]
+                    if cleaned_artifacts:
+                        completed_payload["artifacts"] = cleaned_artifacts
+            _append_event(
+                conn, task_id, "completed",
+                completed_payload,
+                run_id=run_id,
+            )
+    if phantom_cards:
+        # The audit event above is durable (the transaction committed on
+        # clean exit); reject the completion only now.
+        raise HallucinatedCardsError(phantom_cards, task_id)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the

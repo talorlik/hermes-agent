@@ -1647,3 +1647,160 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# complete_task(expected_status=...): compare-and-swap completion guard
+# A Dream caller that observed ``running`` and then calls complete has a
+# TOCTOU window in which the task may have moved to ``blocked``. The guard
+# re-checks the status inside the write transaction so a stale observation
+# cannot complete the task.
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_expected_status_mismatch_blocked_has_no_side_effects(
+    kanban_home, monkeypatch,
+):
+    """blocked != expected 'running' must refuse with zero side effects."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting on input")
+        before = kb.get_task(conn, tid)
+        assert before.status == "blocked"
+        runs_before = [(r.id, r.status, r.outcome) for r in kb.list_runs(conn, tid)]
+        events_before = [(e.id, e.kind) for e in kb.list_events(conn, tid)]
+        hook_calls.clear()
+
+        assert kb.complete_task(
+            conn, tid, result="stale complete", expected_status="running",
+        ) is False
+
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.result is None
+        assert after.completed_at is None
+        assert [(r.id, r.status, r.outcome) for r in kb.list_runs(conn, tid)] == runs_before
+        assert [(e.id, e.kind) for e in kb.list_events(conn, tid)] == events_before
+        assert hook_calls == []
+
+
+def test_complete_task_expected_status_mismatch_precedes_created_card_audit(
+    kanban_home,
+):
+    """A stale CAS guard must refuse before phantom-card audit side effects."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cas audit ordering", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting on input")
+        events_before = [(event.id, event.kind) for event in kb.list_events(conn, tid)]
+        runs_before = [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ]
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            expected_status="running",
+            created_cards=["t_deadbeef"],
+        ) is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.result is None
+        assert [(event.id, event.kind) for event in kb.list_events(conn, tid)] == events_before
+        assert [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ] == runs_before
+
+
+def test_complete_task_expected_run_id_mismatch_precedes_created_card_audit(
+    kanban_home,
+):
+    """A stale run guard must refuse before phantom-card audit side effects."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="run cas audit ordering", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        events_before = [(event.id, event.kind) for event in kb.list_events(conn, tid)]
+        runs_before = [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ]
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            expected_status="running",
+            expected_run_id=claimed.current_run_id + 1,
+            created_cards=["t_deadbeef"],
+        ) is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.result is None
+        assert [(event.id, event.kind) for event in kb.list_events(conn, tid)] == events_before
+        assert [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ] == runs_before
+
+
+def test_complete_task_invalid_expected_status_raises(kanban_home):
+    """A typo'd guard value must fail loudly, not read as a mismatch."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard typo", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.complete_task(conn, tid, expected_status="runing")
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_complete_task_expected_status_running_match_succeeds(kanban_home):
+    """A matching guard must not change the normal completion path."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard match", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(
+            conn, tid,
+            result="built it",
+            summary="handoff summary",
+            metadata={"tests_run": 3},
+            expected_status="running",
+        ) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.result == "built it"
+        run = kb.list_runs(conn, tid)[-1]
+        assert run.outcome == "completed"
+        assert run.summary == "handoff summary"
+
+
+def test_complete_task_expected_status_and_run_id_are_conjunctive(kanban_home):
+    """Both guards must match; either mismatch alone refuses completion."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard conj", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        # Status matches, run id does not.
+        assert kb.complete_task(
+            conn, tid, expected_status="running", expected_run_id=run_id + 999,
+        ) is False
+        # Run id matches, status does not.
+        assert kb.complete_task(
+            conn, tid, expected_status="blocked", expected_run_id=run_id,
+        ) is False
+        assert kb.get_task(conn, tid).status == "running"
+        # Both match.
+        assert kb.complete_task(
+            conn, tid, expected_status="running", expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
