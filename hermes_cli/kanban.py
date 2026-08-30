@@ -735,7 +735,13 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(
+            conn,
+            args.task_id,
+            author,
+            body,
+            expected_status=getattr(args, "expected_status", None),
+        )
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -924,9 +930,11 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
+    expected_status = getattr(args, "expected_status", None)
     author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -938,9 +946,29 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        if expected_status is None:
+            op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+            return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+
+        def guarded_op(tid):
+            ok, refusal = kb.block_task(
+                conn,
+                tid,
+                reason=reason,
+                kind=kind,
+                expected_run_id=_worker_run_id_for(tid),
+                expected_status=expected_status,
+                reason_comment_author=author if reason else None,
+                with_reason=True,
+            )
+            fail_msg[tid] = (
+                f"refusing to block {tid}: "
+                f"{refusal or 'transactional guard refused'}"
+            )
+            return ok
+
+        return _bulk_apply(ids, guarded_op, ok_msg, fail_msg.__getitem__)
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -962,11 +990,37 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         return rc
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
+    expected_kind = getattr(args, "expected_block_kind", None)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
-        return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+        if expected_kind is None:
+            op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+            return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
+                               lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+        def guarded_op(tid):
+            return kb.unblock_task(
+                conn,
+                tid,
+                expected_block_kind=expected_kind,
+                reason=reason,
+                reason_comment_author=author,
+            )
+
+        def fail_msg(tid):
+            current = kb.get_task(conn, tid)
+            actual = (
+                f"status={current.status!r} kind={current.block_kind!r}"
+                if current else "unknown id"
+            )
+            return (
+                f"refusing to unblock {tid}: expected a blocked task with "
+                f"kind {expected_kind!r}, task is {actual}"
+            )
+
+        return _bulk_apply(
+            ids, guarded_op, lambda tid: f"Unblocked {tid}{suffix}", fail_msg,
+        )
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -984,7 +1038,9 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_worker_run_id_for(tid),
+            expected_status=getattr(args, "expected_status", None),
+            force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)

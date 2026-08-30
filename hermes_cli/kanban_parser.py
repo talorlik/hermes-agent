@@ -266,6 +266,8 @@ _SPECS = [
         _arg("text", nargs="+", help="Comment body"),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
+             help="Only comment if the task still has this exact status."),
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,
@@ -305,6 +307,8 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
+             help="Only block if the task still has this exact status."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -313,6 +317,8 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--expected-block-kind", choices=sorted(kb.VALID_UNBLOCK_EXPECTED_KINDS),
+             help="Only unblock a blocked task with this exact typed block kind."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
@@ -323,6 +329,8 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
+        _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
+             help="Only request review if the task still has this exact status."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),

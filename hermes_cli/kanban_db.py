@@ -92,6 +92,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Dependency waits are routed to ``todo``, so they can never satisfy a guarded
+# unblock of a task in ``blocked``.
+VALID_UNBLOCK_EXPECTED_KINDS = VALID_BLOCK_KINDS - {"dependency"}
+
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
@@ -1671,16 +1675,33 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+def add_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    expected_status: Optional[str] = None,
+) -> int:
+    """Append a comment when the optional status CAS guard still matches."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        _require_task(conn, task_id)
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        if expected_status is not None and row["status"] != expected_status:
+            raise ValueError(
+                f"refusing to comment on {task_id}: expected status "
+                f"{expected_status!r}, task is {row['status']!r}"
+            )
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
@@ -2937,20 +2958,59 @@ def edit_completed_task_result(
 
 
 def block_task(
-    conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    kind: Optional[str] = None, expected_run_id: Optional[int] = None,
-) -> bool:
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``transient`` still counts toward the loop breaker
-    so a forever-flaky task escalates. True on any transition."""
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_status: Optional[str] = None,
+    reason_comment_author: Optional[str] = None,
+    with_reason: bool = False,
+):
+    """Block a task when every optional lifecycle CAS guard still matches.
+
+    A guarded reason comment is part of the same SQLite transaction. Stale
+    guards therefore leave no run, event, comment, status, or hook side effect.
+    """
+
+    def _ret(ok: bool, why: Optional[str] = None):
+        return (ok, why) if with_reason else ok
+
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if cur_row is None:
-            return False
+            return _ret(False, "task not found")
+        if expected_status is not None and cur_row["status"] != expected_status:
+            return _ret(
+                False,
+                f"expected status {expected_status!r}, task is {cur_row['status']!r}",
+            )
+        if (
+            expected_run_id is not None
+            and cur_row["current_run_id"] != int(expected_run_id)
+        ):
+            return _ret(
+                False,
+                f"expected run id {int(expected_run_id)}, task's current run is "
+                f"{cur_row['current_run_id']!r}",
+            )
+        if cur_row["status"] not in ("running", "ready"):
+            return _ret(
+                False,
+                "task is not in a blockable state (running/ready); task is "
+                f"{cur_row['status']!r}",
+            )
+
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
@@ -2970,19 +3030,24 @@ def block_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params = (*params, expected_status)
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return _ret(False, "task changed concurrently")
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        if reason and reason_comment_author:
+            add_comment(conn, task_id, reason_comment_author, f"BLOCKED: {reason}")
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+            return _ret(True)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    return True
+    return _ret(True)
 
 
 def _route_block(
@@ -3030,7 +3095,8 @@ def redact_review_value(value: Any) -> Any:
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
-    expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    expected_run_id: Optional[int] = None, expected_status: Optional[str] = None,
+    force: bool = False, with_reason: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3044,6 +3110,9 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
@@ -3055,6 +3124,11 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        if expected_status is not None and trow["status"] != expected_status:
+            return _ret(
+                False,
+                f"expected status {expected_status!r}, task is {trow['status']!r}",
+            )
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -3288,14 +3362,43 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_block_kind: Optional[str] = None,
+    reason: Optional[str] = None,
+    reason_comment_author: Optional[str] = None,
+) -> bool:
+    """Resume a blocked task when its optional typed-block CAS guard matches.
+
+    Guarded reason comments and durable event evidence share the status-change
+    transaction, so stale observations and comment failures leave no trace.
+    """
+    if (
+        expected_block_kind is not None
+        and expected_block_kind not in VALID_UNBLOCK_EXPECTED_KINDS
+    ):
+        raise ValueError(
+            "expected_block_kind must be one of "
+            f"{sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
+        )
+
     now = int(time.time())
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if expected_block_kind is not None and (
+            current is None
+            or current["status"] != "blocked"
+            or current["block_kind"] != expected_block_kind
+        ):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if current and current["status"] == "blocked"
             else "ready"
         )
         _reclaim_dangling_run(
@@ -3321,14 +3424,17 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        if reason and reason_comment_author:
+            add_comment(conn, task_id, reason_comment_author, f"UNBLOCK: {reason}")
+        payload: Optional[dict] = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
         )
+        if reason:
+            payload = dict(payload or {})
+            payload["reason"] = reason
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
