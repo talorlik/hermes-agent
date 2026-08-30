@@ -260,6 +260,7 @@ _SPECS = [
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
+        _arg("--claimer", help="Explicit claim identity; matching retries are idempotent"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [
         _TASK_ID,
@@ -311,6 +312,7 @@ _SPECS = [
                   "triage to break unblock loops. Omit for a generic block."),
         _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
              help="Only block if the task still has this exact status."),
+        _arg("--author", help="Explicit author for the transactional BLOCKED reason comment."),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -321,6 +323,7 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _arg("--expected-block-kind", choices=sorted(kb.VALID_UNBLOCK_EXPECTED_KINDS),
              help="Only unblock a blocked task with this exact typed block kind."),
+        _arg("--author", help="Explicit author for the transactional UNBLOCK reason comment."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [

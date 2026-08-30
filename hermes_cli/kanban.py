@@ -14,7 +14,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -712,7 +712,14 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        claimer = getattr(args, "claimer", None)
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            claimer=claimer,
+            idempotent_replay=claimer is not None,
+        )
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
@@ -934,7 +941,16 @@ def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
     expected_status = getattr(args, "expected_status", None)
-    author = _profile_author()
+    explicit_author = getattr(args, "author", None)
+    if explicit_author is not None:
+        author = explicit_author.strip()
+        if not author or not reason:
+            return _err(
+                "kanban block: --author requires a non-empty reason and author",
+                2,
+            )
+    else:
+        author = _profile_author()
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     fail_msg: dict[str, str] = {}
@@ -949,13 +965,13 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        if expected_status is None:
+        if expected_status is None and explicit_author is None:
             op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
             return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
-        def guarded_op(tid):
-            ok, refusal = kb.block_task(
+        def transactional_op(tid):
+            block_result = kb.block_task(
                 conn,
                 tid,
                 reason=reason,
@@ -963,15 +979,20 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
                 expected_status=expected_status,
                 reason_comment_author=author if reason else None,
-                with_reason=True,
+                with_reason=expected_status is not None,
             )
-            fail_msg[tid] = (
-                f"refusing to block {tid}: "
-                f"{refusal or 'transactional guard refused'}"
-            )
+            if expected_status is not None:
+                ok, refusal = cast(tuple[bool, Optional[str]], block_result)
+                fail_msg[tid] = (
+                    f"refusing to block {tid}: "
+                    f"{refusal or 'transactional guard refused'}"
+                )
+            else:
+                ok = bool(block_result)
+                fail_msg[tid] = f"cannot block {tid}"
             return ok
 
-        return _bulk_apply(ids, guarded_op, ok_msg, fail_msg.__getitem__)
+        return _bulk_apply(ids, transactional_op, ok_msg, fail_msg.__getitem__)
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -992,11 +1013,20 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if rc:
         return rc
     reason = _stripped_or_none(getattr(args, "reason", None))
-    author = _profile_author() if reason else None
+    explicit_author = getattr(args, "author", None)
+    if explicit_author is not None:
+        author = explicit_author.strip()
+        if not author or reason is None:
+            return _err(
+                "kanban unblock: --author requires a non-empty reason and author",
+                2,
+            )
+    else:
+        author = _profile_author() if reason else None
     expected_kind = getattr(args, "expected_block_kind", None)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        if expected_kind is None:
+        if expected_kind is None and explicit_author is None:
             op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
             return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                                lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")

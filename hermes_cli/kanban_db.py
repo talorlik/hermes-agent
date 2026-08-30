@@ -2161,16 +2161,57 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    idempotent_replay: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). Idempotent replay accepts
+    only the same explicit claimer on an intact, unexpired current run.
     """
+    if idempotent_replay and (
+        not isinstance(claimer, str) or not claimer.strip()
+    ):
+        raise ValueError("idempotent claim replay requires an explicit claimer")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if idempotent_replay:
+            current = conn.execute(
+                """
+                SELECT t.status,
+                       t.claim_lock,
+                       t.claim_expires,
+                       t.current_run_id,
+                       r.task_id AS run_task_id,
+                       r.status AS run_status,
+                       r.claim_lock AS run_claim_lock,
+                       r.claim_expires AS run_claim_expires,
+                       r.ended_at AS run_ended_at
+                  FROM tasks t
+             LEFT JOIN task_runs r ON r.id = t.current_run_id
+                 WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if current is not None and current["status"] == "running":
+                claim_expires = current["claim_expires"]
+                run_claim_expires = current["run_claim_expires"]
+                if (
+                    current["claim_lock"] == lock
+                    and claim_expires is not None
+                    and int(claim_expires) >= now
+                    and current["current_run_id"] is not None
+                    and current["run_task_id"] == task_id
+                    and current["run_status"] == "running"
+                    and current["run_claim_lock"] == lock
+                    and run_claim_expires is not None
+                    and int(run_claim_expires) == int(claim_expires)
+                    and current["run_ended_at"] is None
+                ):
+                    return get_task(conn, task_id)
+                return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
