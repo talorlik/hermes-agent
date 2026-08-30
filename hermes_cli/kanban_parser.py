@@ -284,6 +284,11 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg(
+            "--expected-status",
+            choices=sorted(kb.VALID_STATUSES),
+            help="Only complete if the task still has this exact status.",
+        ),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,

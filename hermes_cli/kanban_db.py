@@ -2530,6 +2530,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+    expected_status: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
@@ -2543,8 +2544,25 @@ def complete_task(
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
     now = int(time.time())
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+    normalized_expected_run_id = (
+        int(expected_run_id) if expected_run_id is not None else None
+    )
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
+        return False
+    observed = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if observed is None:
+        return False
+    if expected_status is not None and observed["status"] != expected_status:
+        return False
+    if (
+        normalized_expected_run_id is not None
+        and observed["current_run_id"] != normalized_expected_run_id
+    ):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
@@ -2560,9 +2578,21 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        observed = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if observed is None:
+            return False
+        prior_status = observed["status"]
+        if expected_status is not None and prior_status != expected_status:
+            return False
+        if (
+            normalized_expected_run_id is not None
+            and observed["current_run_id"] != normalized_expected_run_id
+        ):
+            return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
@@ -2577,9 +2607,12 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
+        if normalized_expected_run_id is not None:
             sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
+            params = (*params, normalized_expected_run_id)
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params = (*params, expected_status)
         if conn.execute(sql, params).rowcount != 1:
             return False
         if isinstance(metadata, dict):
