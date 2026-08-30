@@ -600,6 +600,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
+    p_claim.add_argument(
+        "--claimer",
+        default=None,
+        help="Explicit claim identity; matching retries are idempotent",
+    )
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
@@ -697,6 +702,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "Applied independently to every listed task id; a mismatch "
              "refuses that id before its reason comment is written.",
     )
+    p_block.add_argument(
+        "--author",
+        default=None,
+        help="Explicit author for the transactional BLOCKED reason comment.",
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -720,6 +730,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "block kind (compare-and-swap guard). Applied independently to "
              "every listed task id; a mismatch refuses that id before its "
              "reason comment is written.",
+    )
+    p_unblock.add_argument(
+        "--author",
+        default=None,
+        help="Explicit author for the transactional UNBLOCK reason comment.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
@@ -2221,7 +2236,14 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        claimer = getattr(args, "claimer", None)
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            claimer=claimer,
+            idempotent_replay=claimer is not None,
+        )
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -2498,16 +2520,28 @@ def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
     expected_status = getattr(args, "expected_status", None)
-    author = _profile_author()
+    explicit_author = getattr(args, "author", None)
+    if explicit_author is not None:
+        author = explicit_author.strip()
+        if not author or not reason:
+            print(
+                "kanban block: --author requires a non-empty reason and author",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Guarded blocks defer the reason comment until the CAS block
-            # commits: a stale guard must leave zero traces, including the
-            # "BLOCKED:" comment that normally precedes the transition.
-            # Unguarded calls keep the historical comment-first ordering.
-            if reason and expected_status is None:
+            # Guards and explicit attribution bind the reason comment to the
+            # lifecycle transaction. Only legacy unguarded calls without an
+            # explicit author retain the historical comment-first ordering.
+            transactional_reason = bool(reason) and (
+                expected_status is not None or explicit_author is not None
+            )
+            if reason and expected_status is None and explicit_author is None:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             block_result = kb.block_task(
                 conn,
@@ -2516,9 +2550,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
                 expected_status=expected_status,
-                reason_comment_author=(
-                    author if reason and expected_status is not None else None
-                ),
+                reason_comment_author=author if transactional_reason else None,
                 with_reason=expected_status is not None,
             )
             if expected_status is not None:
@@ -2583,24 +2615,35 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
-    author = _profile_author() if reason else None
+    explicit_author = getattr(args, "author", None)
+    if explicit_author is not None:
+        author = explicit_author.strip()
+        if not author or reason is None:
+            print(
+                "kanban unblock: --author requires a non-empty reason and author",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        author = _profile_author() if reason else None
     expected_kind = getattr(args, "expected_block_kind", None)
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Guarded unblocks defer the reason comment until the CAS
-            # unblock commits (mirrors _cmd_block): a stale kind guard must
-            # leave zero traces. Unguarded calls keep comment-first ordering.
-            if reason and expected_kind is None:
+            # Guards and explicit attribution bind the reason comment to the
+            # lifecycle transaction. Only legacy unguarded calls without an
+            # explicit author retain the historical comment-first ordering.
+            transactional_reason = bool(reason) and (
+                expected_kind is not None or explicit_author is not None
+            )
+            if reason and expected_kind is None and explicit_author is None:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(
                 conn,
                 tid,
                 expected_block_kind=expected_kind,
-                reason=reason if expected_kind is not None else None,
-                reason_comment_author=(
-                    author if reason and expected_kind is not None else None
-                ),
+                reason=reason if transactional_reason else None,
+                reason_comment_author=author if transactional_reason else None,
             ):
                 failed.append(tid)
                 if expected_kind is not None:

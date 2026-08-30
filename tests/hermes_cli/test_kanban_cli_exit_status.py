@@ -69,6 +69,228 @@ def _show_task(home: Path, task_id: str) -> dict:
     return json.loads(shown.stdout)["task"]
 
 
+def test_claim_claimer_replay_is_idempotent_and_foreign_safe(tmp_path):
+    """The CLI must recover a lost acknowledgement without accepting another actor."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    created = _run_hermes(home, "kanban", "create", "claim replay", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+
+    first = _run_hermes(
+        home,
+        "kanban",
+        "claim",
+        task_id,
+        "--claimer",
+        "dream:daily-audit:2026-08-30",
+    )
+    assert first.returncode == 0, first.stderr
+    replay = _run_hermes(
+        home,
+        "kanban",
+        "claim",
+        task_id,
+        "--claimer",
+        "dream:daily-audit:2026-08-30",
+    )
+    assert replay.returncode == 0, replay.stderr
+
+    foreign = _run_hermes(
+        home,
+        "kanban",
+        "claim",
+        task_id,
+        "--claimer",
+        "foreign:worker",
+    )
+    assert foreign.returncode != 0
+
+    shown = _run_hermes(home, "kanban", "show", task_id, "--json")
+    assert shown.returncode == 0, shown.stderr
+    payload = json.loads(shown.stdout)
+    assert payload["task"]["status"] == "running"
+    assert len(payload["runs"]) == 1
+    assert sum(event["kind"] == "claimed" for event in payload["events"]) == 1
+
+
+def test_guarded_block_and_unblock_forward_explicit_reason_author(tmp_path):
+    """Dream must bind transactional lifecycle evidence to its own identity."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    created = _run_hermes(home, "kanban", "create", "author lifecycle", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+    claimed = _run_hermes(home, "kanban", "claim", task_id)
+    assert claimed.returncode == 0, claimed.stderr
+
+    blocked = _run_hermes(
+        home,
+        "kanban",
+        "block",
+        task_id,
+        "dream failure",
+        "--kind",
+        "transient",
+        "--expected-status",
+        "running",
+        "--author",
+        "dream-cron",
+    )
+    assert blocked.returncode == 0, blocked.stderr
+    payload = _show_full(home, task_id)
+    assert any(
+        comment["author"] == "dream-cron"
+        and comment["body"] == "BLOCKED: dream failure"
+        for comment in payload["comments"]
+    )
+
+    unblocked = _run_hermes(
+        home,
+        "kanban",
+        "unblock",
+        task_id,
+        "--reason",
+        "dream retry",
+        "--expected-block-kind",
+        "transient",
+        "--author",
+        "dream-cron",
+    )
+    assert unblocked.returncode == 0, unblocked.stderr
+    payload = _show_full(home, task_id)
+    assert any(
+        comment["author"] == "dream-cron"
+        and comment["body"] == "UNBLOCK: dream retry"
+        for comment in payload["comments"]
+    )
+    baseline = _show_full(home, task_id)
+    invalid_commands = (
+        ("block", task_id, "failure", "--author", ""),
+        (
+            "block",
+            task_id,
+            "   ",
+            "--expected-status",
+            "ready",
+            "--author",
+            "dream-cron",
+        ),
+        ("block", task_id, "--author", "dream-cron"),
+        ("unblock", task_id, "--reason", "retry", "--author", ""),
+        ("unblock", task_id, "--author", "dream-cron"),
+    )
+    for command in invalid_commands:
+        refused = _run_hermes(home, "kanban", *command)
+        assert refused.returncode == 2
+        current = _show_full(home, task_id)
+        assert current["task"]["status"] == baseline["task"]["status"]
+        assert current["comments"] == baseline["comments"]
+        assert current["events"] == baseline["events"]
+
+
+def test_unguarded_explicit_lifecycle_author_success_is_transactional(tmp_path):
+    """Unguarded explicit attribution persists with its lifecycle mutation."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    created = _run_hermes(home, "kanban", "create", "explicit author", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+
+    blocked = _run_hermes(
+        home,
+        "kanban",
+        "block",
+        task_id,
+        "valid reason",
+        "--kind",
+        "transient",
+        "--author",
+        "dream-cron",
+    )
+    assert blocked.returncode == 0, blocked.stderr
+    payload = _show_full(home, task_id)
+    assert payload["task"]["status"] == "blocked"
+    assert sum(
+        comment["author"] == "dream-cron"
+        and comment["body"] == "BLOCKED: valid reason"
+        for comment in payload["comments"]
+    ) == 1
+    assert sum(event["kind"] == "blocked" for event in payload["events"]) == 1
+
+    unblocked = _run_hermes(
+        home,
+        "kanban",
+        "unblock",
+        task_id,
+        "--reason",
+        "valid retry",
+        "--author",
+        "dream-cron",
+    )
+    assert unblocked.returncode == 0, unblocked.stderr
+    payload = _show_full(home, task_id)
+    assert payload["task"]["status"] == "ready"
+    assert sum(
+        comment["author"] == "dream-cron"
+        and comment["body"] == "UNBLOCK: valid retry"
+        for comment in payload["comments"]
+    ) == 1
+    assert sum(event["kind"] == "unblocked" for event in payload["events"]) == 1
+
+
+def test_unguarded_explicit_lifecycle_author_refusals_are_atomic(tmp_path):
+    """Explicit lifecycle attribution must never escape a failed transition."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+
+    created = _run_hermes(home, "kanban", "create", "completed target", "--json")
+    assert created.returncode == 0, created.stderr
+    completed_id = json.loads(created.stdout)["id"]
+    claimed = _run_hermes(home, "kanban", "claim", completed_id)
+    assert claimed.returncode == 0, claimed.stderr
+    completed = _run_hermes(
+        home,
+        "kanban",
+        "complete",
+        completed_id,
+        "--result",
+        "done",
+    )
+    assert completed.returncode == 0, completed.stderr
+    block_baseline = _show_full(home, completed_id)
+
+    refused_block = _run_hermes(
+        home,
+        "kanban",
+        "block",
+        completed_id,
+        "valid reason",
+        "--author",
+        "dream-cron",
+    )
+    assert refused_block.returncode == 1
+    assert _show_full(home, completed_id) == block_baseline
+
+    created = _run_hermes(home, "kanban", "create", "ready target", "--json")
+    assert created.returncode == 0, created.stderr
+    ready_id = json.loads(created.stdout)["id"]
+    unblock_baseline = _show_full(home, ready_id)
+
+    refused_unblock = _run_hermes(
+        home,
+        "kanban",
+        "unblock",
+        ready_id,
+        "--reason",
+        "valid reason",
+        "--author",
+        "dream-cron",
+    )
+    assert refused_unblock.returncode == 1
+    assert _show_full(home, ready_id) == unblock_baseline
+
+
 def test_complete_expected_status_mismatch_exits_nonzero_and_preserves_task(tmp_path):
     """A stale --expected-status running must refuse a blocked task."""
     home = tmp_path / "hermes"

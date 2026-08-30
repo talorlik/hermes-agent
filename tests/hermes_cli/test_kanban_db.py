@@ -39,6 +39,263 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def test_claim_idempotent_replay_is_same_claimer_only(
+    kanban_home,
+    monkeypatch,
+) -> None:
+    """A lost claim acknowledgement must replay without accepting a foreign claim."""
+    hooks: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, task_id, **_fields: hooks.append((event, task_id)),
+    )
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim replay", assignee="dream-cron")
+        first = kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:daily-audit:2026-08-30",
+            idempotent_replay=True,
+        )
+        assert first is not None
+        run_id = first.current_run_id
+        claim_expires = first.claim_expires
+        runs_before = [(run.id, run.status, run.outcome) for run in kb.list_runs(conn, task_id)]
+        events_before = [
+            (event.id, event.kind, event.run_id, event.payload)
+            for event in kb.list_events(conn, task_id)
+        ]
+
+        replay = kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:daily-audit:2026-08-30",
+            idempotent_replay=True,
+        )
+
+        assert replay is not None
+        assert replay.status == "running"
+        assert replay.current_run_id == run_id
+        assert replay.claim_expires == claim_expires
+        assert [(run.id, run.status, run.outcome) for run in kb.list_runs(conn, task_id)] == runs_before
+        assert [
+            (event.id, event.kind, event.run_id, event.payload)
+            for event in kb.list_events(conn, task_id)
+        ] == events_before
+
+        foreign = kb.claim_task(
+            conn,
+            task_id,
+            claimer="foreign:worker",
+            idempotent_replay=True,
+        )
+        assert foreign is None
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.current_run_id == run_id
+        assert hooks == [("kanban_task_claimed", task_id)]
+
+
+def test_claim_idempotent_replay_serializes_concurrent_same_claimer(
+    kanban_home,
+) -> None:
+    """Concurrent lost-ack retries converge to one owner run and event."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="concurrent claim replay")
+
+    def claim() -> int:
+        with kb.connect_closing() as conn:
+            task = kb.claim_task(
+                conn,
+                task_id,
+                claimer="dream:concurrent",
+                idempotent_replay=True,
+            )
+            assert task is not None
+            assert task.current_run_id is not None
+            return task.current_run_id
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        run_ids = list(pool.map(lambda _: claim(), range(8)))
+
+    assert len(set(run_ids)) == 1
+    with kb.connect_closing() as conn:
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert sum(
+            event.kind == "claimed" for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_claim_idempotent_replay_serializes_mixed_claimers(kanban_home) -> None:
+    """Exactly one identity wins a mixed race and owns the only run."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="mixed claim replay")
+    claimers = ["dream:mixed"] * 4 + ["foreign:mixed"] * 4
+
+    def claim(claimer: str) -> tuple[str, bool]:
+        with kb.connect_closing() as conn:
+            task = kb.claim_task(
+                conn,
+                task_id,
+                claimer=claimer,
+                idempotent_replay=True,
+            )
+            return claimer, task is not None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(claim, claimers))
+
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None
+        winner = row["claim_lock"]
+        assert winner in {"dream:mixed", "foreign:mixed"}
+        assert all(success == (claimer == winner) for claimer, success in results)
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert sum(
+            event.kind == "claimed" for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_claim_idempotent_replay_requires_explicit_claimer(kanban_home) -> None:
+    """Replay mode must never fall back to a process-generated claim identity."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim replay identity")
+        with pytest.raises(ValueError, match="claimer"):
+            kb.claim_task(conn, task_id, idempotent_replay=True)
+
+
+def test_claim_idempotent_replay_refuses_expired_same_claimer(kanban_home) -> None:
+    """An expired lease is not a valid acknowledgement of the original claim."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="expired claim replay")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:expired",
+            idempotent_replay=True,
+        ) is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (int(time.time()) - 1, task_id),
+            )
+
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:expired",
+            idempotent_replay=True,
+        ) is None
+
+
+def test_claim_idempotent_replay_expiry_boundary(kanban_home, monkeypatch) -> None:
+    """The lease is live at equality and expired immediately afterward."""
+    now = [1_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim expiry boundary")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            ttl_seconds=10,
+            claimer="dream:boundary",
+            idempotent_replay=True,
+        ) is not None
+        now[0] = 1_010
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:boundary",
+            idempotent_replay=True,
+        ) is not None
+        now[0] = 1_011
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:boundary",
+            idempotent_replay=True,
+        ) is None
+
+
+def test_claim_idempotent_replay_refuses_missing_current_run(kanban_home) -> None:
+    """A matching lease without an authoritative run is corruption, not success."""
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim without current run")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:runless",
+            idempotent_replay=True,
+        ) is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+            (task_id,),
+        )
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:runless",
+            idempotent_replay=True,
+        ) is None
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert sum(
+            event.kind == "claimed" for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_claim_idempotent_replay_refuses_invalid_current_run_identity(
+    kanban_home,
+) -> None:
+    """A non-null pointer must identify the exact live claim run."""
+    corruptions = (
+        ("dangling", "UPDATE tasks SET current_run_id = 999999 WHERE id = ?", ()),
+        (
+            "foreign task",
+            "UPDATE task_runs SET task_id = 't_foreign' WHERE id = ?",
+            ("run",),
+        ),
+        (
+            "ended run",
+            "UPDATE task_runs SET status = 'done', ended_at = 1 WHERE id = ?",
+            ("run",),
+        ),
+        (
+            "foreign run claimer",
+            "UPDATE task_runs SET claim_lock = 'foreign' WHERE id = ?",
+            ("run",),
+        ),
+        (
+            "mismatched run expiry",
+            "UPDATE task_runs SET claim_expires = claim_expires + 1 WHERE id = ?",
+            ("run",),
+        ),
+    )
+    for label, sql, target in corruptions:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(conn, title=f"invalid current run {label}")
+            claimed = kb.claim_task(
+                conn,
+                task_id,
+                claimer="dream:invalid-run",
+                idempotent_replay=True,
+            )
+            assert claimed is not None
+            target_id = claimed.current_run_id if target else task_id
+            assert target_id is not None
+            conn.execute(sql, (target_id,))
+            assert kb.claim_task(
+                conn,
+                task_id,
+                claimer="dream:invalid-run",
+                idempotent_replay=True,
+            ) is None
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------

@@ -4688,16 +4688,60 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    idempotent_replay: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). When
+    ``idempotent_replay`` is true, ``claimer`` is required and a matching,
+    unexpired running claim with an authoritative current run returns its
+    existing task without creating another run, event, or lifecycle hook. A
+    foreign, expired, or runless claim still returns ``None``.
     """
+    if idempotent_replay and (
+        not isinstance(claimer, str) or not claimer.strip()
+    ):
+        raise ValueError("idempotent claim replay requires an explicit claimer")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if idempotent_replay:
+            current = conn.execute(
+                """
+                SELECT t.status,
+                       t.claim_lock,
+                       t.claim_expires,
+                       t.current_run_id,
+                       r.task_id AS run_task_id,
+                       r.status AS run_status,
+                       r.claim_lock AS run_claim_lock,
+                       r.claim_expires AS run_claim_expires,
+                       r.ended_at AS run_ended_at
+                  FROM tasks t
+             LEFT JOIN task_runs r ON r.id = t.current_run_id
+                 WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if current is not None and current["status"] == "running":
+                claim_expires = current["claim_expires"]
+                run_claim_expires = current["run_claim_expires"]
+                if (
+                    current["claim_lock"] == lock
+                    and claim_expires is not None
+                    and int(claim_expires) >= now
+                    and current["current_run_id"] is not None
+                    and current["run_task_id"] == task_id
+                    and current["run_status"] == "running"
+                    and current["run_claim_lock"] == lock
+                    and run_claim_expires is not None
+                    and int(run_claim_expires) == int(claim_expires)
+                    and current["run_ended_at"] is None
+                ):
+                    return get_task(conn, task_id)
+                return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
