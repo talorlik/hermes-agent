@@ -1804,3 +1804,473 @@ def test_complete_task_expected_status_and_run_id_are_conjunctive(kanban_home):
             conn, tid, expected_status="running", expected_run_id=run_id,
         ) is True
         assert kb.get_task(conn, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle CAS guards on add_comment / request_review / block_task /
+# unblock_task. Same TOCTOU story as the complete_task guard above: a caller
+# that observed a status and then acts on it must be refused inside the write
+# transaction — before ANY side effect — when the observation went stale.
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle_snapshot(conn, tid):
+    """(runs, events, comments) tuples for zero-side-effect assertions."""
+    return (
+        [(r.id, r.status, r.outcome) for r in kb.list_runs(conn, tid)],
+        [(e.id, e.kind) for e in kb.list_events(conn, tid)],
+        [(c.id, c.author, c.body) for c in kb.list_comments(conn, tid)],
+    )
+
+
+def test_add_comment_expected_status_match_succeeds(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="comment cas match", assignee="worker")
+        assert kb.get_task(conn, tid).status == "ready"
+        cid = kb.add_comment(
+            conn, tid, "worker", "still on it", expected_status="ready",
+        )
+        assert cid > 0
+        assert [c.body for c in kb.list_comments(conn, tid)] == ["still on it"]
+
+
+def test_add_comment_expected_status_mismatch_raises_with_no_side_effects(
+    kanban_home,
+):
+    """A stale 'running' observation must not append a comment or event."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="comment cas stale", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected status"):
+            kb.add_comment(
+                conn, tid, "worker", "stale note", expected_status="running",
+            )
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_invalid_expected_status_raises_before_mutation(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="comment cas typo", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.add_comment(
+                conn, tid, "worker", "typo guard", expected_status="redy",
+            )
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_request_review_expected_status_match_succeeds(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review cas match", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid,
+            summary="implemented and verified",
+            expected_run_id=claimed.current_run_id,
+            expected_status="running",
+        ) is True
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_request_review_expected_status_mismatch_refuses_with_no_side_effects(
+    kanban_home,
+):
+    """Stale 'ready' vs actual running must refuse and keep the live claim."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review cas stale", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        before = _lifecycle_snapshot(conn, tid)
+        ok, reason = kb.request_review(
+            conn, tid,
+            summary="would otherwise synthesize a run",
+            expected_run_id=claimed.current_run_id,
+            expected_status="ready",
+            with_reason=True,
+        )
+        assert ok is False
+        assert "expected status" in reason
+        after = kb.get_task(conn, tid)
+        assert after.status == "running"
+        assert after.claim_lock is not None
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_request_review_expected_status_is_conjunctive_with_claim_rules(
+    kanban_home,
+):
+    """A matching guard must not bypass the running/ready source rule."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review cas conj", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting on input")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="s", expected_status="blocked",
+        ) is False
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_request_review_invalid_expected_status_raises(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review cas typo", assignee="worker")
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.request_review(conn, tid, expected_status="runing")
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_block_task_expected_status_match_succeeds(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block cas match", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(
+            conn, tid,
+            reason="needs credentials",
+            kind="needs_input",
+            expected_status="running",
+        ) is True
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+
+
+def test_block_task_expected_status_mismatch_has_no_side_effects(
+    kanban_home, monkeypatch,
+):
+    """ready != expected 'running' must refuse before runs/events/hooks."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block cas stale", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.block_task(
+            conn, tid,
+            reason="reason that would synthesize a run",
+            kind="needs_input",
+            expected_status="running",
+        ) is False
+        after = kb.get_task(conn, tid)
+        assert after.status == "ready"
+        assert after.block_kind is None
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_expected_status_mismatch_precedes_dependency_routing(
+    kanban_home, monkeypatch,
+):
+    """The guard fires before dependency_wait routing/events too."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block cas dep", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.block_task(
+            conn, tid,
+            reason="waiting on t_other",
+            kind="dependency",
+            expected_status="running",
+        ) is False
+        assert kb.get_task(conn, tid).status == "ready"
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_invalid_expected_status_raises(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block cas typo", assignee="worker")
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.block_task(conn, tid, expected_status="runing")
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_expected_block_kind_match_succeeds(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas match", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="needs_input",
+        ) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        assert [e.kind for e in kb.list_events(conn, tid)][-1] == "unblocked"
+
+
+def test_unblock_task_expected_block_kind_mismatch_has_no_side_effects(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas stale", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="capability",
+        ) is False
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_unblock_task_expected_block_kind_untyped_block_mismatches(kanban_home):
+    """A legacy un-typed block never matches a canonical expected kind."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas untyped", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="untyped")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="needs_input",
+        ) is False
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_unblock_task_expected_block_kind_requires_blocked_status(kanban_home):
+    """The kind guard demands 'blocked'; scheduled tasks are refused, and a
+    plain unguarded unblock still resumes them (compatibility)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas sched", assignee="worker")
+        assert kb.schedule_task(conn, tid, reason="wait for window")
+        assert kb.get_task(conn, tid).status == "scheduled"
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="needs_input",
+        ) is False
+        assert kb.get_task(conn, tid).status == "scheduled"
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_invalid_expected_block_kind_raises(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas typo", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        with pytest.raises(ValueError, match="expected_block_kind"):
+            kb.unblock_task(conn, tid, expected_block_kind="need_input")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Reviewer hardening: guarded transition + reason comment must be ONE SQLite
+# transaction (a failed comment write rolls back the whole transition),
+# block_task must return structured refusal reasons on request, and
+# ``dependency`` is not an acceptable expected unblock kind (dependency
+# blocks live in ``todo``, never ``blocked``, so it could never match).
+# ---------------------------------------------------------------------------
+
+
+def test_block_task_guarded_reason_comment_failure_rolls_back_everything(
+    kanban_home, monkeypatch,
+):
+    """An injected comment failure aborts the block: status, run closure,
+    events, and lifecycle hook must all be rolled back / suppressed."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block atomic", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        before = _lifecycle_snapshot(conn, tid)
+        hook_calls.clear()
+
+        def _boom(*a, **k):
+            raise RuntimeError("injected comment failure")
+
+        monkeypatch.setattr(kb, "add_comment", _boom)
+        with pytest.raises(RuntimeError, match="injected comment failure"):
+            kb.block_task(
+                conn, tid,
+                reason="waiting on operator",
+                kind="needs_input",
+                expected_status="running",
+                reason_comment_author="ops",
+            )
+
+        after = kb.get_task(conn, tid)
+        assert after.status == "running"
+        assert after.claim_lock is not None
+        assert after.block_kind is None
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_guarded_dependency_comment_failure_precedes_hook(
+    kanban_home, monkeypatch,
+):
+    """On the dependency->todo branch the comment write happens before the
+    lifecycle hook, so an injected failure rolls back with no hook fired."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dep atomic", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        before = _lifecycle_snapshot(conn, tid)
+        hook_calls.clear()
+
+        def _boom(*a, **k):
+            raise RuntimeError("injected comment failure")
+
+        monkeypatch.setattr(kb, "add_comment", _boom)
+        with pytest.raises(RuntimeError, match="injected comment failure"):
+            kb.block_task(
+                conn, tid,
+                reason="waiting on t_parent",
+                kind="dependency",
+                expected_status="running",
+                reason_comment_author="ops",
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_guarded_success_writes_comment_in_same_txn(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block atomic ok", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(
+            conn, tid,
+            reason="waiting on operator",
+            kind="needs_input",
+            expected_status="running",
+            reason_comment_author="ops",
+        ) is True
+        assert kb.get_task(conn, tid).status == "blocked"
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("ops", "BLOCKED: waiting on operator"),
+        ]
+
+
+def test_unblock_task_guarded_reason_comment_failure_rolls_back(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock atomic", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        before = _lifecycle_snapshot(conn, tid)
+
+        def _boom(*a, **k):
+            raise RuntimeError("injected comment failure")
+
+        monkeypatch.setattr(kb, "add_comment", _boom)
+        with pytest.raises(RuntimeError, match="injected comment failure"):
+            kb.unblock_task(
+                conn, tid,
+                expected_block_kind="needs_input",
+                reason="input arrived",
+                reason_comment_author="ops",
+            )
+
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_unblock_task_guarded_success_persists_reason_in_event_and_comment(
+    kanban_home,
+):
+    """The guarded unblock's audit evidence — the operator reason — must
+    survive on the ``unblocked`` event, not only in the comment stream."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock audit", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        assert kb.unblock_task(
+            conn, tid,
+            expected_block_kind="needs_input",
+            reason="input arrived",
+            reason_comment_author="ops",
+        ) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        comments = kb.list_comments(conn, tid)
+        assert ("ops", "UNBLOCK: input arrived") in [
+            (c.author, c.body) for c in comments
+        ]
+        unblocked = [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
+        assert len(unblocked) == 1
+        assert unblocked[0].payload is not None
+        assert unblocked[0].payload.get("reason") == "input arrived"
+
+
+def test_block_task_with_reason_stale_run_id_produces_run_id_diagnostic(
+    kanban_home,
+):
+    """Matching status + stale run id must name the run id, not the status."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="block reason runid", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        ok, why = kb.block_task(
+            conn, tid,
+            reason="stale observation",
+            expected_status="running",
+            expected_run_id=run_id + 1,
+            with_reason=True,
+        )
+        assert ok is False
+        assert "run" in why
+        assert str(run_id + 1) in why
+        assert "expected status" not in why
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_block_task_with_reason_distinguishes_refusal_causes(kanban_home):
+    with kb.connect() as conn:
+        # Unknown task.
+        ok, why = kb.block_task(conn, "t_missing", with_reason=True)
+        assert ok is False
+        assert why == "task not found"
+        # Expected-status mismatch.
+        tid = kb.create_task(conn, title="block reason causes", assignee="worker")
+        ok, why = kb.block_task(
+            conn, tid, expected_status="running", with_reason=True,
+        )
+        assert ok is False
+        assert "expected status 'running'" in why
+        assert "'ready'" in why
+        # Invalid source state (terminal task, no guards supplied).
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, result="done")
+        ok, why = kb.block_task(conn, tid, with_reason=True)
+        assert ok is False
+        assert "not in a blockable state" in why
+        assert "'done'" in why
+        # Plain bool return is preserved for existing callers.
+        assert kb.block_task(conn, tid) is False
+
+
+def test_unblock_task_expected_block_kind_dependency_rejected(kanban_home):
+    """dependency waits live in todo, never blocked — an expected kind of
+    'dependency' can never match and must fail loudly before mutation."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unblock dep kind", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected_block_kind"):
+            kb.unblock_task(conn, tid, expected_block_kind="dependency")
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _lifecycle_snapshot(conn, tid) == before

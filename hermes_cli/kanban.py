@@ -609,6 +609,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                            help="Author name (default: $HERMES_PROFILE or 'user')")
     p_comment.add_argument("--max-len", type=int, default=None,
                            help="Trim the stored comment body to this many characters")
+    p_comment.add_argument("--expected-status", default=None,
+                           choices=sorted(kb.VALID_STATUSES),
+                           help="Only comment if the task still has this exact "
+                                "status (compare-and-swap guard against racing "
+                                "status changes).")
 
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
@@ -680,6 +685,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--expected-status", default=None, choices=sorted(kb.VALID_STATUSES),
+        help="Only block if the task still has this exact status "
+             "(compare-and-swap guard against racing status changes). "
+             "Applied independently to every listed task id; a mismatch "
+             "refuses that id before its reason comment is written.",
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -695,6 +707,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--reason",
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
+    )
+    p_unblock.add_argument(
+        "--expected-block-kind", default=None,
+        choices=sorted(kb.VALID_UNBLOCK_EXPECTED_KINDS),
+        help="Only unblock if the task is blocked with exactly this typed "
+             "block kind (compare-and-swap guard). Applied independently to "
+             "every listed task id; a mismatch refuses that id before its "
+             "reason comment is written.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
@@ -721,6 +741,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Override the live-claim guard: move a running, claimed task to "
             "review even without owning its run (clears the worker's claim)."
         ),
+    )
+    p_request_review.add_argument(
+        "--expected-status", default=None, choices=sorted(kb.VALID_STATUSES),
+        help="Only request review if the task still has this exact status "
+             "(compare-and-swap guard against racing status changes). "
+             "Conjunctive with all existing claim/run rules.",
     )
 
     p_request_changes = sub.add_parser(
@@ -2220,8 +2246,14 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
+    # A CAS mismatch raises ValueError inside add_comment's write txn; the
+    # kanban_command dispatcher maps that to stderr + exit 1, so a stale
+    # guard propagates as a real nonzero process exit with zero rows written.
     with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(
+            conn, args.task_id, author, body,
+            expected_status=getattr(args, "expected_status", None),
+        )
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -2453,22 +2485,44 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    expected_status = getattr(args, "expected_status", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
+            # Guarded blocks defer the reason comment until the CAS block
+            # commits: a stale guard must leave zero traces, including the
+            # "BLOCKED:" comment that normally precedes the transition.
+            # Unguarded calls keep the historical comment-first ordering.
+            if reason and expected_status is None:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
+            block_result = kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
-            ):
+                expected_status=expected_status,
+                reason_comment_author=(
+                    author if reason and expected_status is not None else None
+                ),
+                with_reason=expected_status is not None,
+            )
+            if expected_status is not None:
+                ok, refusal_reason = block_result
+            else:
+                ok, refusal_reason = bool(block_result), None
+            if not ok:
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                if expected_status is not None:
+                    print(
+                        f"refusing to block {tid}: "
+                        f"{refusal_reason or 'transactional guard refused'}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"cannot block {tid}", file=sys.stderr)
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
@@ -2518,14 +2572,38 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     if reason is not None:
         reason = reason.strip() or None
     author = _profile_author() if reason else None
+    expected_kind = getattr(args, "expected_block_kind", None)
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
+            # Guarded unblocks defer the reason comment until the CAS
+            # unblock commits (mirrors _cmd_block): a stale kind guard must
+            # leave zero traces. Unguarded calls keep comment-first ordering.
+            if reason and expected_kind is None:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(
+                conn,
+                tid,
+                expected_block_kind=expected_kind,
+                reason=reason if expected_kind is not None else None,
+                reason_comment_author=(
+                    author if reason and expected_kind is not None else None
+                ),
+            ):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                if expected_kind is not None:
+                    current = kb.get_task(conn, tid)
+                    actual = (
+                        f"status={current.status!r} kind={current.block_kind!r}"
+                        if current else "unknown id"
+                    )
+                    print(
+                        f"refusing to unblock {tid}: expected a blocked task "
+                        f"with kind {expected_kind!r}, task is {actual}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
@@ -2566,6 +2644,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             metadata=metadata,
             reviewer=reviewer,
             expected_run_id=_worker_run_id_for(tid),
+            expected_status=getattr(args, "expected_status", None),
             force=bool(getattr(args, "force", False)),
             with_reason=True,
         )

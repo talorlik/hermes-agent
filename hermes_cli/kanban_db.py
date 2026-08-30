@@ -124,6 +124,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Kinds a caller may assert via ``unblock_task(expected_block_kind=...)``.
+# ``dependency`` is excluded: dependency waits are routed to ``todo`` (never
+# ``blocked``), so that guard could never match a blocked task — accepting it
+# would turn a caller's category error into a silent "mismatch" refusal.
+VALID_UNBLOCK_EXPECTED_KINDS = VALID_BLOCK_KINDS - {"dependency"}
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -3991,20 +3997,46 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    expected_status: Optional[str] = None,
 ) -> int:
+    """Append a comment and its ``commented`` event.
+
+    ``expected_status`` is a compare-and-swap guard mirroring
+    :func:`complete_task`: when supplied, the comment is only written if the
+    task still has that exact status inside the write transaction. On a
+    mismatch a :class:`ValueError` is raised (this function's established
+    failure style, cf. the unknown-task check) before the comment row or the
+    ``commented`` event exists, so a stale caller leaves zero traces.
+    """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    # An unknown guard value would never match any row and read as a
+    # mismatch; a typo'd caller must fail loudly instead.
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(
+            f"expected_status must be one of {sorted(VALID_STATUSES)}"
+        )
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
             raise ValueError(f"unknown task {task_id}")
+        if expected_status is not None and row["status"] != expected_status:
+            raise ValueError(
+                f"refusing to comment on {task_id}: expected status "
+                f"{expected_status!r}, task is {row['status']!r}"
+            )
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -6296,8 +6328,36 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
-) -> bool:
+    expected_status: Optional[str] = None,
+    reason_comment_author: Optional[str] = None,
+    with_reason: bool = False,
+):
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``expected_status`` is a compare-and-swap guard mirroring
+    :func:`complete_task`: when supplied, the transition only fires if the
+    status still equals it inside the write transaction. A mismatch returns
+    False before ANY side effect — no run closure, no synthesized run, no
+    event, no lifecycle hook — regardless of routing branch (``blocked``,
+    ``todo`` dependency wait, or ``triage`` loop-breaker). Conjunctive with
+    ``expected_run_id``: both must match.
+
+    ``reason_comment_author`` makes the reason comment part of THIS write
+    transaction: when supplied together with ``reason``, the
+    ``BLOCKED: <reason>`` comment is inserted (via :func:`add_comment`'s
+    nested savepoint) after the transition/event and before the lifecycle
+    hook on every routing branch. A failed comment write therefore rolls
+    back the entire transition and suppresses the hook. This is SQLite
+    atomicity only — it makes no claim about filesystem or external hook
+    side effects. When omitted, no comment is written here (the CLI's
+    unguarded path keeps its historical comment-first ordering outside the
+    transaction).
+
+    ``with_reason=True`` returns ``(ok, reason)`` mirroring
+    :func:`request_review` — ``reason`` is a diagnostic string on refusal
+    (distinguishing unknown task, expected-status mismatch, expected-run-id
+    mismatch, and un-blockable source state), ``None`` on success. The
+    default plain ``bool`` return is unchanged for existing callers.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6324,18 +6384,56 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+
+    def _ret(ok: bool, why: Optional[str] = None):
+        return (ok, why) if with_reason else ok
+
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # An unknown guard value would never match any row and read as a
+    # mismatch; a typo'd caller must fail loudly instead.
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(
+            f"expected_status must be one of {sorted(VALID_STATUSES)}"
+        )
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
-            return False
+            return _ret(False, "task not found")
+        # CAS guards first: a stale ``expected_status``/``expected_run_id``
+        # must refuse before any routing branch runs its UPDATE / run
+        # closure / events / hook. write_txn is BEGIN IMMEDIATE, so these
+        # reads and the UPDATEs below are atomic with respect to concurrent
+        # writers — the refusal reasons are transactional facts, not
+        # post-hoc re-reads.
+        if expected_status is not None and cur_row["status"] != expected_status:
+            return _ret(
+                False,
+                f"expected status {expected_status!r}, task is "
+                f"{cur_row['status']!r}",
+            )
+        if (
+            expected_run_id is not None
+            and cur_row["current_run_id"] != int(expected_run_id)
+        ):
+            return _ret(
+                False,
+                f"expected run id {int(expected_run_id)}, task's current "
+                f"run is {cur_row['current_run_id']!r}",
+            )
+        if cur_row["status"] not in ("running", "ready"):
+            return _ret(
+                False,
+                f"task is not in a blockable state (running/ready); task is "
+                f"{cur_row['status']!r}",
+            )
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6369,7 +6467,7 @@ def block_task(
                 else (kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
-                return False
+                return _ret(False, "task changed concurrently")
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6388,6 +6486,13 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            # Same-transaction reason comment, BEFORE the lifecycle hook: a
+            # failed comment write must abort the transition without the
+            # hook ever having fired (this branch fires it pre-commit).
+            if reason and reason_comment_author:
+                add_comment(
+                    conn, task_id, reason_comment_author, f"BLOCKED: {reason}"
+                )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -6397,7 +6502,7 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
-            return True
+            return _ret(True)
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
@@ -6427,7 +6532,7 @@ def block_task(
                 else (kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
-                return False
+                return _ret(False, "task changed concurrently")
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6481,7 +6586,7 @@ def block_task(
                     (kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
-                return False
+                return _ret(False, "task changed concurrently")
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6505,6 +6610,14 @@ def block_task(
                 },
                 run_id=run_id,
             )
+        # Same-transaction reason comment for the blocked/triage branches.
+        # Inserted before the transaction commits (and therefore before the
+        # post-commit lifecycle hook below): a failed comment write rolls
+        # back the whole transition and the hook never fires.
+        if reason and reason_comment_author:
+            add_comment(
+                conn, task_id, reason_comment_author, f"BLOCKED: {reason}"
+            )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -6514,7 +6627,7 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
-    return True
+    return _ret(True)
 
 
 
@@ -6541,10 +6654,19 @@ def request_review(
     metadata: Optional[dict] = None,
     reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_status: Optional[str] = None,
     force: bool = False,
     with_reason: bool = False,
 ):
     """Transition implementation work into the first-class review phase.
+
+    ``expected_status`` is a compare-and-swap guard mirroring
+    :func:`complete_task`: when supplied, the transition only fires if the
+    status still equals it inside the write transaction, conjunctively with
+    every existing rule (running/ready source, live-claim ownership,
+    ``expected_run_id``, parent gating). A mismatch refuses before the
+    status flip, run closure, and the ``review_requested`` event. When
+    omitted, behavior is unchanged.
 
     Unlike :func:`block_task`, this transition never touches block recurrence
     accounting.  The current implementer and resolved reviewer are recorded on
@@ -6567,6 +6689,12 @@ def request_review(
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    # An unknown guard value would never match any row and read as a
+    # mismatch; a typo'd caller must fail loudly instead.
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(
+            f"expected_status must be one of {sorted(VALID_STATUSES)}"
+        )
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     with write_txn(conn):
@@ -6578,6 +6706,15 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        # CAS guard: refuse a stale status observation before the claim
+        # rules and the UPDATE below. write_txn is BEGIN IMMEDIATE, so this
+        # read is atomic with the transition it gates.
+        if expected_status is not None and trow["status"] != expected_status:
+            return _ret(
+                False,
+                f"expected status {expected_status!r}, task is "
+                f"{trow['status']!r}",
+            )
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -6933,8 +7070,38 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_block_kind: Optional[str] = None,
+    reason: Optional[str] = None,
+    reason_comment_author: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
+
+    ``expected_block_kind`` is a compare-and-swap guard for callers that
+    read the block's typed cause and then decide to unblock. When supplied,
+    the transition requires — inside the same write transaction — that the
+    task is currently ``blocked`` AND that the authoritative stored
+    ``block_kind`` equals it exactly. Only
+    :data:`VALID_UNBLOCK_EXPECTED_KINDS` are accepted: ``dependency`` waits
+    live in ``todo`` (never ``blocked``), so asserting that kind is a
+    category error and raises :class:`ValueError` instead of reading as a
+    mismatch. A legacy un-typed block (``block_kind IS NULL``) never
+    matches, and ``scheduled`` tasks are refused (they carry no block
+    evidence to compare against). A mismatch returns False before the
+    dangling-run reclaim, the status flip, and the ``unblocked`` event.
+    When omitted, behavior is unchanged.
+
+    ``reason`` is persisted on the ``unblocked`` event payload so the audit
+    evidence survives independently of the comment stream. When
+    ``reason_comment_author`` is also supplied, the ``UNBLOCK: <reason>``
+    comment is written inside THIS transaction (via :func:`add_comment`'s
+    nested savepoint), so a failed comment write rolls back the whole
+    unblock. SQLite atomicity only — no filesystem/external claims. The
+    CLI's unguarded path keeps its historical comment-first ordering
+    outside the transaction and does not pass these.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -6943,12 +7110,33 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    # An unknown guard value would never match any row and read as a
+    # mismatch; a typo'd caller must fail loudly instead. ``dependency`` is
+    # rejected here too — see VALID_UNBLOCK_EXPECTED_KINDS.
+    if (
+        expected_block_kind is not None
+        and expected_block_kind not in VALID_UNBLOCK_EXPECTED_KINDS
+    ):
+        raise ValueError(
+            f"expected_block_kind must be one of "
+            f"{sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
+        )
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        # CAS guard first: a stale kind observation must refuse before the
+        # dangling-run reclaim below closes anything. write_txn is BEGIN
+        # IMMEDIATE, so this read is atomic with the UPDATE that follows.
+        if expected_block_kind is not None:
+            if (
+                current is None
+                or current["status"] != "blocked"
+                or current["block_kind"] != expected_block_kind
+            ):
+                return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -6983,14 +7171,23 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+        # Same-transaction reason comment (guarded CLI path): a failed
+        # write here rolls back the status flip and the event below.
+        if reason and reason_comment_author:
+            add_comment(
+                conn, task_id, reason_comment_author, f"UNBLOCK: {reason}"
+            )
+        payload: Optional[dict] = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
         )
+        if reason:
+            # Persist the operator's reason as durable audit evidence on
+            # the event itself, not only in the (deletable) comment stream.
+            payload = dict(payload or {})
+            payload["reason"] = reason
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
