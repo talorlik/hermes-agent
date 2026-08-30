@@ -388,3 +388,101 @@ def test_guarded_unblock_passes_reason_comment_into_db_transaction(monkeypatch):
             "reason_comment_author": "tester",
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# comment --if-absent: guarded idempotent replay. Two identical guarded CLI
+# calls must produce exactly one comment and one commented event; a
+# different body under the same guard appends normally; a stale guard
+# refuses with a nonzero exit before any side effect.
+# ---------------------------------------------------------------------------
+
+
+def test_comment_if_absent_guarded_replay_is_idempotent(tmp_path):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    created = _run_hermes(home, "kanban", "create", "if-absent probe", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+    claimed = _run_hermes(home, "kanban", "claim", task_id)
+    assert claimed.returncode == 0, claimed.stderr
+
+    guarded = (
+        "--author", "dream", "--expected-status", "running", "--if-absent",
+    )
+    first = _run_hermes(
+        home, "kanban", "comment", task_id, "sync checkpoint", *guarded,
+    )
+    assert first.returncode == 0, first.stderr
+    replay = _run_hermes(
+        home, "kanban", "comment", task_id, "sync checkpoint", *guarded,
+    )
+    assert replay.returncode == 0, replay.stderr
+
+    payload = _show_full(home, task_id)
+    assert [(c["author"], c["body"]) for c in payload["comments"]] == [
+        ("dream", "sync checkpoint")
+    ]
+    assert [e["kind"] for e in payload["events"]].count("commented") == 1
+
+    different = _run_hermes(
+        home, "kanban", "comment", task_id, "sync checkpoint v2", *guarded,
+    )
+    assert different.returncode == 0, different.stderr
+    payload = _show_full(home, task_id)
+    assert [c["body"] for c in payload["comments"]] == [
+        "sync checkpoint", "sync checkpoint v2",
+    ]
+    assert [e["kind"] for e in payload["events"]].count("commented") == 2
+
+
+def test_comment_if_absent_stale_guard_exits_nonzero_and_writes_nothing(tmp_path):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    created = _run_hermes(home, "kanban", "create", "if-absent stale", "--json")
+    assert created.returncode == 0, created.stderr
+    task_id = json.loads(created.stdout)["id"]
+    # Task stays 'ready'; the running guard is stale even for a replay of
+    # an existing exact comment.
+    seeded = _run_hermes(
+        home, "kanban", "comment", task_id, "sync checkpoint",
+        "--author", "dream",
+    )
+    assert seeded.returncode == 0, seeded.stderr
+
+    refused = _run_hermes(
+        home, "kanban", "comment", task_id, "sync checkpoint",
+        "--author", "dream", "--expected-status", "running", "--if-absent",
+    )
+
+    assert refused.returncode == 1
+    assert "expected status" in refused.stderr.lower()
+    payload = _show_full(home, task_id)
+    assert [c["body"] for c in payload["comments"]] == ["sync checkpoint"]
+    assert [e["kind"] for e in payload["events"]].count("commented") == 1
+
+
+def test_cmd_comment_forwards_if_absent_flag(monkeypatch):
+    """The CLI must forward --if-absent into add_comment's transaction."""
+    from hermes_cli import kanban as cli
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        cli.kb, "connect_closing", lambda: contextlib.nullcontext(object())
+    )
+    monkeypatch.setattr(
+        cli.kb,
+        "add_comment",
+        lambda _conn, _task_id, _author, _body, **kwargs: calls.append(kwargs) or 1,
+    )
+    args = argparse.Namespace(
+        task_id="t_guarded",
+        text=["sync", "checkpoint"],
+        author="dream",
+        max_len=None,
+        expected_status="running",
+        if_absent=True,
+    )
+
+    assert cli._cmd_comment(args) == 0
+    assert calls == [{"expected_status": "running", "if_absent": True}]

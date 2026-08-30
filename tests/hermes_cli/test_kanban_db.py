@@ -2274,3 +2274,148 @@ def test_unblock_task_expected_block_kind_dependency_rejected(kanban_home):
             kb.unblock_task(conn, tid, expected_block_kind="dependency")
         assert kb.get_task(conn, tid).status == "blocked"
         assert _lifecycle_snapshot(conn, tid) == before
+
+
+# ---------------------------------------------------------------------------
+# add_comment --if-absent idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_add_comment_if_absent_replay_returns_existing_id_without_side_effects(
+    kanban_home,
+):
+    """An exact (author, canonical body) replay must be a no-op success."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="idempotent comment", assignee="worker")
+        first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        before = _lifecycle_snapshot(conn, tid)
+        replay = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint", if_absent=True,
+        )
+        assert replay == first
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_if_absent_dedupes_on_canonical_body(kanban_home):
+    """Bodies canonicalize (strip) on insert; dedup must compare the same
+    canonical form, so a whitespace-padded replay still deduplicates."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="canonical dedup", assignee="worker")
+        first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        before = _lifecycle_snapshot(conn, tid)
+        replay = kb.add_comment(
+            conn, tid, "dream", "  sync checkpoint  ", if_absent=True,
+        )
+        assert replay == first
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_if_absent_different_body_or_author_inserts(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no false dedup", assignee="worker")
+        first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        other_body = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint v2", if_absent=True,
+        )
+        other_author = kb.add_comment(
+            conn, tid, "operator", "sync checkpoint", if_absent=True,
+        )
+        assert len({first, other_body, other_author}) == 3
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("dream", "sync checkpoint"),
+            ("dream", "sync checkpoint v2"),
+            ("operator", "sync checkpoint"),
+        ]
+        commented = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert len(commented) == 3
+
+
+def test_add_comment_if_absent_stale_expected_status_fails_before_dedup(
+    kanban_home,
+):
+    """The CAS guard is validated first: a stale guard must raise even when
+    an exact duplicate exists, and must leave zero traces."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale guard first", assignee="worker")
+        kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected status"):
+            kb.add_comment(
+                conn, tid, "dream", "sync checkpoint",
+                expected_status="running", if_absent=True,
+            )
+        with pytest.raises(ValueError, match="expected status"):
+            kb.add_comment(
+                conn, tid, "dream", "brand new body",
+                expected_status="running", if_absent=True,
+            )
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_if_absent_matching_expected_status_inserts_once(
+    kanban_home,
+):
+    """The Dream call shape: --expected-status running --if-absent replayed
+    twice must produce exactly one comment and one commented event."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dream call shape", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.get_task(conn, tid).status == "running"
+        first = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint",
+            expected_status="running", if_absent=True,
+        )
+        replay = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint",
+            expected_status="running", if_absent=True,
+        )
+        assert replay == first
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("dream", "sync checkpoint")
+        ]
+        commented = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert len(commented) == 1
+
+
+def test_add_comment_if_absent_dedup_serializes_under_begin_immediate(
+    kanban_home,
+):
+    """The dedup read must run inside the guarded write transaction: a
+    second connection's guarded replay must wait for an open BEGIN
+    IMMEDIATE writer, then observe its committed duplicate and dedupe."""
+    import threading
+
+    with kb.connect() as conn1:
+        tid = kb.create_task(conn1, title="two-conn dedup", assignee="worker")
+
+    conn1.execute("BEGIN IMMEDIATE")
+    first = kb.add_comment(conn1, tid, "dream", "sync checkpoint")
+
+    results: dict[str, int] = {}
+
+    def _replay() -> None:
+        with kb.connect() as conn2:
+            results["replay"] = kb.add_comment(
+                conn2, tid, "dream", "sync checkpoint", if_absent=True,
+            )
+
+    worker = threading.Thread(target=_replay)
+    worker.start()
+    # The replay must not complete while the writer holds the lock —
+    # completing here would mean the dedup ran outside BEGIN IMMEDIATE.
+    worker.join(timeout=0.5)
+    assert worker.is_alive(), "guarded replay finished under an open writer"
+    conn1.execute("COMMIT")
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+
+    assert results["replay"] == first
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("dream", "sync checkpoint")
+        ]
+        commented = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert len(commented) == 1

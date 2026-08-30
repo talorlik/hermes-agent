@@ -614,6 +614,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                            help="Only comment if the task still has this exact "
                                 "status (compare-and-swap guard against racing "
                                 "status changes).")
+    p_comment.add_argument("--if-absent", action="store_true",
+                           help="Idempotent write: exit 0 without adding "
+                                "anything if this exact author+body comment "
+                                "already exists on the task (retry-safe for "
+                                "guarded sync loops).")
 
     # --- attach / attachments / attach-rm ---
     p_attach = sub.add_parser("attach", help="Attach a local file to a task")
@@ -2249,12 +2254,19 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     # A CAS mismatch raises ValueError inside add_comment's write txn; the
     # kanban_command dispatcher maps that to stderr + exit 1, so a stale
     # guard propagates as a real nonzero process exit with zero rows written.
+    if_absent = getattr(args, "if_absent", False)
     with kb.connect_closing() as conn:
         kb.add_comment(
             conn, args.task_id, author, body,
             expected_status=getattr(args, "expected_status", None),
+            if_absent=if_absent,
         )
-    print(f"Comment added to {args.task_id}")
+    # An --if-absent replay may not have written anything; "ensured" is
+    # accurate for both the inserted and the deduplicated outcome.
+    if if_absent:
+        print(f"Comment ensured on {args.task_id}")
+    else:
+        print(f"Comment added to {args.task_id}")
     return 0
 
 

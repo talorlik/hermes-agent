@@ -4003,6 +4003,7 @@ def add_comment(
     body: str,
     *,
     expected_status: Optional[str] = None,
+    if_absent: bool = False,
 ) -> int:
     """Append a comment and its ``commented`` event.
 
@@ -4012,6 +4013,18 @@ def add_comment(
     mismatch a :class:`ValueError` is raised (this function's established
     failure style, cf. the unknown-task check) before the comment row or the
     ``commented`` event exists, so a stale caller leaves zero traces.
+
+    ``if_absent`` makes the write idempotent for retrying callers (the
+    Dream sync loop replays ``comment --expected-status running`` after
+    crashes): when an existing comment on this task already has this exact
+    author and byte-identical canonical (stripped) body, the existing
+    comment id is returned and nothing is written — no comment row, no
+    ``commented`` event. The status guard is validated FIRST, so a stale
+    ``expected_status`` fails even for an exact replay: idempotent success
+    must not mask that the guarded precondition no longer holds. The dedup
+    read runs inside the same write transaction as the insert, so a
+    concurrent duplicate writer serializes behind ``BEGIN IMMEDIATE`` and
+    the replay observes its committed row.
     """
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -4037,6 +4050,18 @@ def add_comment(
                 f"refusing to comment on {task_id}: expected status "
                 f"{expected_status!r}, task is {row['status']!r}"
             )
+        if if_absent:
+            # TEXT ``=`` under the default BINARY collation is a byte-exact
+            # match on the canonical (stripped) form written below. Oldest
+            # match wins so replays return a stable id.
+            existing = conn.execute(
+                "SELECT id FROM task_comments "
+                "WHERE task_id = ? AND author = ? AND body = ? "
+                "ORDER BY id ASC LIMIT 1",
+                (task_id, author.strip(), body.strip()),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
