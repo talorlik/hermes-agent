@@ -734,6 +734,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
+    if_absent = bool(getattr(args, "if_absent", False))
     with kbc.connect_closing() as conn:
         kb.add_comment(
             conn,
@@ -741,8 +742,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             author,
             body,
             expected_status=getattr(args, "expected_status", None),
+            if_absent=if_absent,
         )
-    print(f"Comment added to {args.task_id}")
+    verb = "ensured on" if if_absent else "added to"
+    print(f"Comment {verb} {args.task_id}")
     return 0
 
 

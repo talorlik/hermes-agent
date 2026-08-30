@@ -268,6 +268,8 @@ _SPECS = [
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
         _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
              help="Only comment if the task still has this exact status."),
+        _arg("--if-absent", action="store_true",
+             help="Succeed without writing when this exact author and comment body already exist."),
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,

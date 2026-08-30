@@ -1682,8 +1682,9 @@ def add_comment(
     body: str,
     *,
     expected_status: Optional[str] = None,
+    if_absent: bool = False,
 ) -> int:
-    """Append a comment when the optional status CAS guard still matches."""
+    """Append a comment when its guard matches, optionally deduplicating retries."""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -1702,6 +1703,15 @@ def add_comment(
                 f"refusing to comment on {task_id}: expected status "
                 f"{expected_status!r}, task is {row['status']!r}"
             )
+        if if_absent:
+            existing = conn.execute(
+                "SELECT id FROM task_comments "
+                "WHERE task_id = ? AND author = ? AND body = ? "
+                "ORDER BY id ASC LIMIT 1",
+                (task_id, author.strip(), body.strip()),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
