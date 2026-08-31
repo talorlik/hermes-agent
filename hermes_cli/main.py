@@ -74,6 +74,356 @@ suppress_platform_ver_console()
 import os
 import sys
 
+# ── Raw-argv explicit-no-tools preflight ────────────────────────────────
+# The console script imports this module — which loads dotenv, reads raw
+# config, and initializes logging — before main() or run_oneshot executes.
+# For a top-level `-z/--oneshot` launch whose effective `-t/--toolsets`
+# value is decidable from raw argv alone (the exact `none` sentinel, its
+# case/duplicate/blank/mixture validation errors, and all/* mixtures — all
+# resolvable without capability discovery), HERMES_ONESHOT_EXPLICIT_NO_TOOLS
+# must be "1" BEFORE any of that startup work so configuration stays inert
+# data: parsed if needed, never activating plugins, MCP servers, shell
+# hooks, or outbound webhooks. This classifier is stdlib-only and
+# side-effect-free on purpose — it must not import hermes_cli.oneshot (or
+# anything config-dependent) to make this first classification.
+#
+# The guard is held as a LEASE: module import acquires one here and restores
+# the exact prior presence/value at successful import completion (bottom of
+# this file); main() acquires its own from the then-current argv so the
+# fast-chat, Termux, full-dispatch, `python -m`, console-script, and
+# in-process main() launches all share one rule. A real oneshot hard-exits
+# via os._exit with the launch lease still active, keeping cleanup imports
+# guarded until process end.
+
+_EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
+
+# Stdlib-only mirror of the TOP-LEVEL value-taking option surface
+# (hermes_cli._parser; `-p/--profile` is consumed pre-argparse). Needed so
+# the scan below never reads an option's value — in particular the -z
+# prompt — as a flag. Drift fails open: an unlisted value flag makes its
+# value look like the first positional, which stops the scan without
+# establishing the guard, and the existing later guards still apply.
+_PREFLIGHT_VALUE_LONG = frozenset(
+    {
+        "--oneshot",
+        "--model",
+        "--provider",
+        "--reasoning",
+        "--toolsets",
+        "--resume",
+        "--skills",
+        "--usage-file",
+        "--in",
+        "--profile",
+    }
+)
+_PREFLIGHT_VALUE_SHORT = frozenset({"z", "m", "t", "r", "s", "p"})
+_PREFLIGHT_OPTIONAL_VALUE_LONG = frozenset({"--continue"})
+_PREFLIGHT_OPTIONAL_VALUE_SHORT = frozenset({"c"})
+
+# Stdlib-only mirror of the COMPLETE top-level long-option surface (value,
+# optional-value, and boolean, including argparse's automatic --help), used
+# to reproduce argparse allow_abbrev resolution: a unique prefix of exactly
+# one of these is that option.  --profile is absent on purpose — it is
+# consumed pre-argparse, exists only as an exact spelling, and must not
+# shadow prefix matching for --provider.
+_PREFLIGHT_TOP_LEVEL_LONG = frozenset(
+    {
+        "--help",
+        "--version",
+        "--oneshot",
+        "--usage-file",
+        "--model",
+        "--provider",
+        "--reasoning",
+        "--toolsets",
+        "--resume",
+        "--no-restore-cwd",
+        "--in",
+        "--continue",
+        "--worktree",
+        "--accept-hooks",
+        "--skills",
+        "--yolo",
+        "--pass-session-id",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--safe-mode",
+        "--tui",
+        "--cli",
+        "--dev",
+    }
+)
+
+
+_PREFLIGHT_CHAT_VALUE_LONG = frozenset(
+    {
+        "--query",
+        "--query-file",
+        "--image",
+        "--model",
+        "--toolsets",
+        "--reasoning",
+        "--skills",
+        "--provider",
+        "--resume",
+        "--in",
+        "--max-turns",
+        "--run-budget",
+        "--source",
+    }
+)
+_PREFLIGHT_CHAT_OPTIONAL_VALUE_LONG = frozenset({"--continue"})
+_PREFLIGHT_CHAT_BOOLEAN_LONG = frozenset(
+    {
+        "--help",
+        "--oneshot",
+        "--verbose",
+        "--quiet",
+        "--no-restore-cwd",
+        "--create-if-missing",
+        "--worktree",
+        "--accept-hooks",
+        "--checkpoints",
+        "--yolo",
+        "--pass-session-id",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--safe-mode",
+        "--tui",
+        "--cli",
+        "--dev",
+    }
+)
+_PREFLIGHT_CHAT_LONG = (
+    _PREFLIGHT_CHAT_VALUE_LONG
+    | _PREFLIGHT_CHAT_OPTIONAL_VALUE_LONG
+    | _PREFLIGHT_CHAT_BOOLEAN_LONG
+)
+_PREFLIGHT_CHAT_VALUE_SHORT = frozenset({"q", "m", "t", "s", "r"})
+_PREFLIGHT_CHAT_OPTIONAL_VALUE_SHORT = frozenset({"c"})
+
+
+def _resolve_long_from_surface(name: "str", surface: "frozenset[str]") -> "str | None":
+    if name in surface:
+        return name
+    matches = [option for option in surface if option.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _preflight_resolve_chat_long(name: "str") -> "str | None":
+    return _resolve_long_from_surface(name, _PREFLIGHT_CHAT_LONG)
+
+
+def _preflight_resolve_long(name: "str") -> "str | None":
+    """Resolve a long-option spelling the way the top-level argparse parser
+    does under allow_abbrev: an exact spelling wins, then a prefix matching
+    exactly one option in the top-level surface resolves to it.  Unknown
+    and ambiguous prefixes return None — argparse rejects those argvs with
+    a usage error before oneshot can run, so the guard is never needed.
+    Drift is fail-closed for abbreviations: an option added to the parser
+    but not mirrored here can only turn an argparse-ambiguous prefix into a
+    mirror-unique one, establishing the guard for a launch argparse then
+    rejects; it can never hide the exact spellings the contract covers."""
+    if name in _PREFLIGHT_TOP_LEVEL_LONG or name in _PREFLIGHT_VALUE_LONG:
+        return name
+    matches = [opt for opt in _PREFLIGHT_TOP_LEVEL_LONG if opt.startswith(name)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
+    """Return whether authoritative CLI parsing selects no-tools oneshot.
+
+    The parser module is deliberately stdlib-only. Using the real top-level
+    parser and chat subparser here keeps import-time guard classification in
+    exact lockstep with argparse for abbreviations, required and typed values,
+    mutually-exclusive options, subcommand boundaries, short clusters, and
+    rejected argv. The exact pre-argparse profile flag is removed first using
+    the same non-abbreviated surface consumed by ``_apply_profile_override``.
+    """
+    import contextlib
+    import io
+
+    from hermes_cli._parser import (
+        build_top_level_parser,
+        top_level_value_flag_sets,
+    )
+
+    from pathlib import Path as _Path
+
+    required_flags, optional_flags = top_level_value_flag_sets()
+
+    def _profile_resolves(name: str) -> bool:
+        canonical = name.strip().lower()
+        if not canonical or not __import__("re").fullmatch(
+            r"[a-z0-9][a-z0-9_-]{0,63}", canonical
+        ):
+            return False
+        if canonical in {"hermes", "test", "tmp", "root", "sudo"}:
+            return False
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        env_path = _Path(env_home) if env_home else _Path.home() / ".hermes"
+        profile_root = (
+            env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+        )
+        if canonical == "default":
+            return True
+        profile_dir = profile_root / "profiles" / canonical
+        tombstone = profile_root / "profiles" / ".deleted" / canonical
+        return profile_dir.is_dir() and not tombstone.exists()
+
+    cleaned = list(argv)
+    explicit_profile = False
+    index = 0
+    while index < len(cleaned):
+        token = cleaned[index]
+        if token == "--":
+            break
+        if token in ("-p", "--profile"):
+            if index + 1 >= len(cleaned):
+                return False
+            profile_name = cleaned[index + 1]
+            if not __import__("re").fullmatch(
+                r"[a-z0-9][a-z0-9_-]{0,63}", profile_name
+            ):
+                return False
+            if not _profile_resolves(profile_name):
+                return False
+            del cleaned[index : index + 2]
+            explicit_profile = True
+            break
+        if token.startswith("--profile="):
+            profile_name = token.partition("=")[2]
+            if not _profile_resolves(profile_name):
+                return False
+            del cleaned[index]
+            explicit_profile = True
+            break
+        if "=" not in token and token in required_flags and index + 1 < len(cleaned):
+            index += 2
+            continue
+        if (
+            "=" not in token
+            and token in optional_flags
+            and index + 1 < len(cleaned)
+            and not cleaned[index + 1].startswith("-")
+        ):
+            index += 2
+            continue
+        index += 1
+
+    if (
+        not explicit_profile
+        and not os.environ.get("HERMES_S6_SUPERVISED_CHILD")
+        and not (
+            os.environ.get("HERMES_HOME", "").strip()
+            and _Path(os.environ["HERMES_HOME"]).parent.name == "profiles"
+        )
+    ):
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        active_root = _Path(env_home) if env_home else _Path.home() / ".hermes"
+        active_path = active_root / "active_profile"
+        try:
+            active_name = active_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            active_name = ""
+        if active_name and active_name.casefold() != "default":
+            if not _profile_resolves(active_name):
+                return False
+
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        try:
+            args = build_top_level_parser()[0].parse_args(cleaned)
+        except SystemExit:
+            return False
+
+    if getattr(args, "version", False):
+        return False
+    prompt = getattr(args, "oneshot", None)
+    toolsets_value = getattr(args, "toolsets", None)
+    if not prompt or toolsets_value is None:
+        return False
+    raw_tokens = [part.strip() for part in str(toolsets_value).split(",")]
+    normalized = [token for token in raw_tokens if token]
+    if not normalized:
+        return False
+    if any(token.lower() == _TOOLSETS_NONE_SENTINEL_RAW for token in raw_tokens):
+        return True
+    return len(normalized) > 1 and any(
+        token in ("all", "*") for token in normalized
+    )
+
+
+# Raw mirror of hermes_cli.oneshot._TOOLSETS_NONE_SENTINEL; duplicated here
+# because that module must not be imported this early.
+_TOOLSETS_NONE_SENTINEL_RAW = "none"
+
+
+def _acquire_explicit_no_tools_lease(argv: "list[str]") -> "str | None":
+    """Capture the exact prior guard state (None = absent; '' and any other
+    string are distinct values), then establish the guard when the raw argv
+    classification calls for it. Returns the prior state for restoration."""
+    prior = os.environ.get(_EXPLICIT_NO_TOOLS_ENV)
+    if _raw_oneshot_no_tools_preflight(argv):
+        os.environ[_EXPLICIT_NO_TOOLS_ENV] = "1"
+    return prior
+
+
+def _restore_explicit_no_tools_lease(prior: "str | None") -> None:
+    if prior is None:
+        os.environ.pop(_EXPLICIT_NO_TOOLS_ENV, None)
+    else:
+        os.environ[_EXPLICIT_NO_TOOLS_ENV] = prior
+
+
+# Import-time lease: covers module-level dotenv/raw-config/logging startup.
+# A local trace on this module frame restores the lease when the frame exits,
+# including an interrupted import whose BaseException is caught by an
+# in-process caller. Child frames are not traced unless a pre-existing tracer
+# already requested them, and that tracer is restored exactly.
+_IMPORT_PREFLIGHT_LEASE = _acquire_explicit_no_tools_lease(sys.argv[1:])
+_IMPORT_PREFLIGHT_FRAME = sys._getframe()
+_IMPORT_PREFLIGHT_PREVIOUS_TRACE = sys.gettrace()
+_IMPORT_PREFLIGHT_PREVIOUS_LOCAL_TRACE = _IMPORT_PREFLIGHT_FRAME.f_trace
+_IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE = _IMPORT_PREFLIGHT_PREVIOUS_LOCAL_TRACE
+_IMPORT_PREFLIGHT_TRACE_ACTIVE = True
+
+
+def _finish_import_preflight_lease() -> None:
+    global _IMPORT_PREFLIGHT_TRACE_ACTIVE
+    if not _IMPORT_PREFLIGHT_TRACE_ACTIVE:
+        return
+    _IMPORT_PREFLIGHT_TRACE_ACTIVE = False
+    _restore_explicit_no_tools_lease(_IMPORT_PREFLIGHT_LEASE)
+    _IMPORT_PREFLIGHT_FRAME.f_trace = _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    sys.settrace(_IMPORT_PREFLIGHT_PREVIOUS_TRACE)
+
+
+def _import_preflight_local_trace(frame, event, arg):
+    global _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    prior_local = _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    if prior_local is not None:
+        _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE = prior_local(frame, event, arg)
+    if frame is _IMPORT_PREFLIGHT_FRAME and event == "return":
+        _finish_import_preflight_lease()
+        return _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    return _import_preflight_local_trace
+
+
+def _import_preflight_global_trace(frame, event, arg):
+    if frame is _IMPORT_PREFLIGHT_FRAME:
+        return _import_preflight_local_trace
+    if _IMPORT_PREFLIGHT_PREVIOUS_TRACE is not None:
+        return _IMPORT_PREFLIGHT_PREVIOUS_TRACE(frame, event, arg)
+    return None
+
+
+_IMPORT_PREFLIGHT_FRAME.f_trace = _import_preflight_local_trace
+sys.settrace(_import_preflight_global_trace)
+
 # ── Startup fast-path bootstrap ─────────────────────────────────────────
 # Two lines of inline path math so ``python hermes_cli/main.py`` (script
 # mode — sys.path[0] is hermes_cli/, not the repo root) can import the
@@ -12379,41 +12729,66 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 
 
 def _first_positional_argv() -> str | None:
-    """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
+    """Return the first top-level positional token in ``sys.argv[1:]``.
 
-    Used by ``main()`` to decide whether plugin discovery has to run at
-    argparse-setup time. Handles common invocations like
-    ``hermes -m gpt5 --provider openai chat "msg"`` by skipping the
-    values attached to known top-level flags.
-
-    Does NOT fully simulate argparse — unknown ``--foo=bar`` / ``--foo
-    bar`` flags degrade gracefully (``bar`` may be wrongly classified as
-    a positional, which at worst forces a one-time plugin discovery).
+    This scanner mirrors the raw no-tools preflight's argparse abbreviation
+    and value-consumption rules. Unknown or ambiguous long options are returned
+    as the conservative discovery sentinel because authoritative argparse will
+    reject them and the following token cannot safely be treated as a command.
     """
-    from hermes_cli._parser import top_level_value_flag_sets
-
-    required_value_flags, optional_value_flags = top_level_value_flag_sets()
-    value_flags = required_value_flags | optional_value_flags
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
-        tok = argv[i]
-        if tok == "--":
-            # Everything after ``--`` is positional.
-            if i + 1 < len(argv):
-                return argv[i + 1]
-            return None
-        if tok.startswith("-"):
-            # ``--flag=value`` carries its value inline — single token.
-            if "=" in tok:
-                i += 1
-                continue
-            if tok in value_flags and i + 1 < len(argv):
+        token = argv[i]
+        if token == "--":
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if not token.startswith("-") or token == "-":
+            return token
+
+        name, eq, _inline = token.partition("=")
+        if token.startswith("--"):
+            resolved = _preflight_resolve_long(name)
+            if resolved is None:
+                return token
+            if eq:
+                if resolved in _PREFLIGHT_VALUE_LONG:
+                    i += 1
+                    continue
+                if resolved in _PREFLIGHT_OPTIONAL_VALUE_LONG:
+                    i += 1
+                    continue
+                # Boolean options with explicit values are parser errors.
+                return token
+            if resolved in _PREFLIGHT_VALUE_LONG:
                 i += 2
+                continue
+            if resolved in _PREFLIGHT_OPTIONAL_VALUE_LONG:
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    i += 2
+                else:
+                    i += 1
                 continue
             i += 1
             continue
-        return tok
+
+        # Short-option cluster: consume the value attached to or following the
+        # first value-taking short option. Boolean shorts consume no value.
+        body = token[1:]
+        consumed_following = False
+        for index, char in enumerate(body):
+            if char in _PREFLIGHT_VALUE_SHORT:
+                if not body[index + 1 :] and i + 1 < len(argv):
+                    consumed_following = True
+                break
+            if char in _PREFLIGHT_OPTIONAL_VALUE_SHORT:
+                if (
+                    not body[index + 1 :]
+                    and i + 1 < len(argv)
+                    and not argv[i + 1].startswith("-")
+                ):
+                    consumed_following = True
+                break
+        i += 2 if consumed_following else 1
     return None
 
 
@@ -12495,8 +12870,37 @@ def _should_background_mcp_startup(args) -> bool:
     return args.command in {None, "chat", "rl"}
 
 
+def _oneshot_explicit_no_tools_precheck(args) -> bool:
+    """True when a -z run's --toolsets already has a terminal side-effect-free
+    outcome: the explicit-no-tools ``none`` sentinel, or a validation error
+    the precheck can decide without plugin/MCP resolution.  Both outcomes
+    must skip plugin/MCP/hook discovery entirely (fail closed on doubt).
+
+    Fail closed extends to the precheck's own failure: if importing or
+    calling the canonical validator raises, an explicitly provided
+    --toolsets cannot be shown safe to proceed (its terminal outcome may
+    be the sentinel), so discovery is skipped and run_oneshot surfaces
+    the failure.  An omitted --toolsets can never resolve to the
+    sentinel, so it keeps normal startup.  Control-flow BaseExceptions
+    (KeyboardInterrupt, SystemExit) propagate — aborting startup before
+    any activation is itself fail-closed."""
+    if not getattr(args, "oneshot", None):
+        return False
+    toolsets = getattr(args, "toolsets", None)
+    try:
+        from hermes_cli.oneshot import _precheck_explicit_toolsets
+
+        return _precheck_explicit_toolsets(toolsets) is not None
+    except Exception:
+        return toolsets is not None
+
+
 def _prepare_agent_startup(args) -> None:
-    """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    """Discover plugins/MCP/hooks for commands that can run an agent turn.
+
+    Skipped (after the yolo/safe-mode env chokepoints) for -z runs whose
+    --toolsets precheck already resolved to the explicit-no-tools sentinel or
+    a validation error — see ``_oneshot_explicit_no_tools_precheck``."""
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -12507,6 +12911,14 @@ def _prepare_agent_startup(args) -> None:
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
+
+    # hermes -z with the explicit-no-tools sentinel (--toolsets none) or a
+    # toolset list that already fails its side-effect-free validation must
+    # not pay for — or side-effect through — plugin/MCP/hook discovery.  The
+    # yolo/safe-mode env chokepoints above still apply; run_oneshot
+    # re-validates and remains the single emitter of the exit-2 message.
+    if _oneshot_explicit_no_tools_precheck(args):
+        return
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
@@ -13102,6 +13514,22 @@ def _advertise_agent_env() -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    # Launch-scoped preflight lease from the CURRENT argv (which may differ
+    # from import-time argv for in-process callers). Restored on return and
+    # on every exception, BaseException included. The real oneshot dispatch
+    # hard-exits via os._exit inside _main_impl, so the launch lease stays
+    # active through oneshot cleanup until process end — exactly the window
+    # where cleanup imports must not trigger plugin discovery.
+    prior_guard = _acquire_explicit_no_tools_lease(sys.argv[1:])
+    try:
+        return _main_impl()
+    finally:
+        _restore_explicit_no_tools_lease(prior_guard)
+
+
+def _main_impl():
+    """Argument dispatch for main(); split out so the preflight guard lease
+    wraps every launch path uniformly."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
@@ -14706,6 +15134,13 @@ def main():
         cmd_version(args)
         return
 
+    # Top-level one-shot is a chat surface. Combining it with a different
+    # subcommand previously parsed that subcommand and then silently ignored it
+    # because one-shot dispatch had precedence. Reject the contradictory argv
+    # instead; this also keeps import-time guard classification authoritative.
+    if getattr(args, "oneshot", None) and args.command not in (None, "chat"):
+        parser.error("-z/--oneshot cannot be combined with a non-chat subcommand")
+
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
     # imports, and tools.approval freezes _YOLO_MODE_FROZEN at module
@@ -14779,6 +15214,10 @@ def main():
             sys.exit(rc)
     else:
         parser.print_help()
+
+
+# The module-frame return trace releases the import-time lease after forwarding
+# the return event to any pre-existing local tracer.
 
 
 if __name__ == "__main__":

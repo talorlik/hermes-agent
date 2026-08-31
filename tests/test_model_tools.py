@@ -1,6 +1,11 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from unittest.mock import ANY, call, patch
 
 
@@ -12,6 +17,52 @@ from model_tools import (
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+# =========================================================================
+# import-time plugin discovery vs the explicit-no-tools process guard
+# =========================================================================
+
+class TestImportTimePluginDiscoveryGuard:
+    """Importing model_tools runs discover_plugins() once — except under the
+    explicit-no-tools process guard (hermes -z --toolsets none), which must
+    keep the import side-effect free. Each case runs in a clean subprocess so
+    the module-level import actually executes."""
+
+    _PROGRAM = textwrap.dedent(
+        """
+        import hermes_cli.plugins as plugins
+
+        calls = []
+        plugins.discover_plugins = lambda *a, **k: calls.append(1)
+        import model_tools
+
+        print(f"DISCOVER_CALLS={len(calls)}")
+        """
+    )
+
+    def _import_in_subprocess(self, guard_value):
+        env = os.environ.copy()
+        env.pop("HERMES_ONESHOT_EXPLICIT_NO_TOOLS", None)
+        if guard_value is not None:
+            env["HERMES_ONESHOT_EXPLICIT_NO_TOOLS"] = guard_value
+        result = subprocess.run(
+            [sys.executable, "-c", self._PROGRAM],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    def test_guarded_import_skips_plugin_discovery(self):
+        assert "DISCOVER_CALLS=0" in self._import_in_subprocess("1")
+
+    def test_normal_import_still_discovers_plugins(self):
+        assert "DISCOVER_CALLS=1" in self._import_in_subprocess(None)
 
 
 # =========================================================================

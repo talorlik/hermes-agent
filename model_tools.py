@@ -243,11 +243,18 @@ discover_builtin_tools()
 #   - acp_adapter/server.py     -> asyncio.to_thread on session init
 
 # Plugin tool discovery (user/project/pip plugins)
-try:
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+#
+# Skipped under the explicit-no-tools process guard set by hermes -z
+# --toolsets none (see hermes_cli.oneshot._EXPLICIT_NO_TOOLS_ENV): that run
+# builds an agent with enabled_toolsets=[], so no plugin registration could
+# ever be consulted and import-time discovery would be a pure startup side
+# effect.  Any value other than exactly "1" keeps normal behavior.
+if os.environ.get("HERMES_ONESHOT_EXPLICIT_NO_TOOLS") != "1":
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # =============================================================================

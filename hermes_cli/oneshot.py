@@ -4,7 +4,9 @@ Bypasses cli.py entirely.  No banner, no spinner, no session_id line,
 no stderr chatter.  Just the agent's final text to stdout.
 
 Toolsets = explicit --toolsets when provided, otherwise whatever the user has
-configured for "cli" in `hermes tools`.
+configured for "cli" in `hermes tools`.  The reserved token `none`, passed
+alone, selects an explicit empty tool set (no native and no MCP tools);
+combining it with any other entry is a validation error (exit 2).
 Rules / memory / AGENTS.md / preloaded skills = same as a normal chat turn.
 Approvals = auto-bypassed (HERMES_YOLO_MODE=1 is set for the call).
 Working directory = the user's CWD (AGENTS.md etc. resolve from there as usual).
@@ -82,9 +84,110 @@ def _build_preloaded_skills_prompt(skills: object = None) -> str | None:
     return skills_prompt or None
 
 
-def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
+# Reserved oneshot-only sentinel: `--toolsets none` means an explicit empty
+# native/MCP tool set (AIAgent(enabled_toolsets=[])).  Not a real toolset name.
+# Only this exact lowercase spelling, alone, is the sentinel.
+_TOOLSETS_NONE_SENTINEL = "none"
+
+# Explicit-no-tools process guard.  run_oneshot sets this to "1" around the
+# agent build for the validated `none` sentinel, BEFORE run_agent/model_tools
+# are imported, and restores the prior value exactly afterwards.  model_tools
+# consults it at import time to skip its import-time plugin discovery.
+_EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
+
+
+def _raw_toolset_tokens(toolsets: object = None) -> list[str]:
+    """Split --toolsets like ``_normalize_toolsets`` but KEEP blank segments.
+
+    Each token is whitespace-stripped, so exact whitespace around a token
+    normalizes away, but empty segments (``"none,"`` / ``["none", ""]``) are
+    preserved: for the reserved ``none`` sentinel a blank edge is an ambiguous
+    half-typed list that must fail closed, not be silently dropped.
+    """
+    if not toolsets:
+        return []
+    raw_items = [toolsets] if isinstance(toolsets, str) else toolsets
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = [raw_items]
+
+    tokens: list[str] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            tokens.extend(part.strip() for part in item.split(","))
+        else:
+            tokens.append(str(item).strip())
+    return tokens
+
+
+def _precheck_explicit_toolsets(
+    toolsets: object = None,
+) -> tuple[list[str] | None, str | None] | None:
+    """Side-effect-free early validation of explicit --toolsets.
+
+    Decides every outcome that must be known WITHOUT plugin discovery or MCP
+    config reads: the reserved ``none`` sentinel (including its case /
+    duplicate / blank-edge / mixture failure modes) and the all/* mixture
+    rule.  Returns ``None`` when the input was omitted or needs full
+    resolution; otherwise the terminal ``(enabled_toolsets, error)`` outcome.
+
+    hermes_cli.main uses this before ``_prepare_agent_startup`` so the
+    no-tools and error paths never start plugin/MCP/hook discovery;
+    ``run_oneshot`` re-validates and stays the single emitter of the exit-2
+    message.
+    """
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
+        return None
+
+    raw = _raw_toolset_tokens(toolsets)
+    if any(token.lower() == _TOOLSETS_NONE_SENTINEL for token in raw):
+        # Exactly one lowercase `none` token (whitespace already stripped) is
+        # the sentinel.  A case variant, duplicate, blank segment, or any
+        # other entry alongside it is ambiguous and fails closed instead of
+        # being silently ignored.
+        if raw != [_TOOLSETS_NONE_SENTINEL]:
+            return None, (
+                "hermes -z: --toolsets 'none' selects an explicit empty tool "
+                "set and must be the only toolset entry, spelled exactly "
+                f"lowercase; got: {', '.join(raw)}. Pass 'none' alone, or "
+                "remove it.\n"
+            )
+        return [], None
+
+    if any(token in {"all", "*"} for token in normalized) and len(normalized) > 1:
+        return None, (
+            "hermes -z: --toolsets 'all' enables every toolset and must be "
+            f"the only toolset entry; got: {', '.join(normalized)}. Pass "
+            "'all' alone, or list specific toolsets.\n"
+        )
+
+    return None
+
+
+def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
+    """Validate explicit --toolsets into ``(enabled_toolsets, error)``.
+
+    Returns ``(None, None)`` when no explicit toolsets were passed (use the
+    config path) or for ``all``/``*`` alone (every toolset), ``([], None)``
+    for the reserved ``none`` sentinel, the full user-ordered list when every
+    entry is a valid toolset or an enabled MCP server, or ``(None, message)``
+    when the run must abort with exit 2.
+
+    Explicit lists are all-or-nothing: a single unknown or disabled entry
+    rejects the whole list.  Partial enablement would silently narrow what
+    the caller asked for.
+    """
+    normalized = _normalize_toolsets(toolsets)
+    if normalized is None:
+        return None, None
+
+    early = _precheck_explicit_toolsets(toolsets)
+    if early is not None:
+        return early
+
+    # `all` / `*` alone: every toolset.  Returned as None so the agent takes
+    # its default full-catalog path; mixtures were rejected by the precheck.
+    if normalized[0] in {"all", "*"}:
         return None, None
 
     try:
@@ -92,30 +195,16 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     except Exception as exc:
         return None, f"hermes -z: failed to validate --toolsets: {exc}\n"
 
-    built_in = [name for name in normalized if validate_toolset(name)]
-    unresolved = [name for name in normalized if name not in built_in]
+    unresolved = [name for name in normalized if not validate_toolset(name)]
 
     if unresolved:
         try:
             from hermes_cli.plugins import discover_plugins
 
             discover_plugins()
-            plugin_valid = [name for name in unresolved if validate_toolset(name)]
+            unresolved = [name for name in unresolved if not validate_toolset(name)]
         except Exception:
-            plugin_valid = []
-
-        if plugin_valid:
-            built_in.extend(plugin_valid)
-            unresolved = [name for name in unresolved if name not in plugin_valid]
-
-    if any(name in {"all", "*"} for name in built_in):
-        ignored = [name for name in normalized if name not in {"all", "*"}]
-        if ignored:
-            sys.stderr.write(
-                "hermes -z: --toolsets all enables every toolset; "
-                f"ignoring additional entries: {', '.join(ignored)}\n"
-            )
-        return None, None
+            pass
 
     mcp_names: set[str] = set()
     mcp_disabled: set[str] = set()
@@ -137,23 +226,25 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
             mcp_names = set()
             mcp_disabled = set()
 
-    mcp_valid = [name for name in unresolved if name in mcp_names]
     disabled = [name for name in unresolved if name in mcp_disabled]
     unknown = [name for name in unresolved if name not in mcp_names and name not in mcp_disabled]
-    valid = built_in + mcp_valid
 
-    if unknown:
-        sys.stderr.write(f"hermes -z: ignoring unknown --toolsets entries: {', '.join(unknown)}\n")
-    if disabled:
-        sys.stderr.write(
-            "hermes -z: ignoring disabled MCP servers (set enabled: true in config.yaml to use): "
-            f"{', '.join(disabled)}\n"
+    if unknown or disabled:
+        parts = []
+        if unknown:
+            parts.append(f"unknown entries: {', '.join(unknown)}")
+        if disabled:
+            parts.append(
+                "disabled MCP servers (set enabled: true in config.yaml to "
+                f"use): {', '.join(disabled)}"
+            )
+        return None, (
+            "hermes -z: --toolsets is all-or-nothing; "
+            + "; ".join(parts)
+            + ". No tools were enabled; fix or remove the listed entries.\n"
         )
 
-    if not valid:
-        return None, "hermes -z: --toolsets did not contain any valid toolsets.\n"
-
-    return valid, None
+    return list(normalized), None
 
 
 def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] = None) -> None:
@@ -199,6 +290,15 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _restore_env_var(name: str, prior: str | None) -> None:
+    """Restore an env var to its exact prior state; absent (None) and empty
+    string are distinct prior states and must round-trip exactly."""
+    if prior is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = prior
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -216,6 +316,9 @@ def run_oneshot(
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
         toolsets: Optional comma-separated string or iterable of toolsets.
+            The reserved token ``none``, passed alone, runs the agent with an
+            explicit empty tool set (no native and no MCP tools); combining
+            it with any other entry fails validation with exit 2.
         skills: Optional repeated/comma-separated skill identifiers to preload.
         usage_file: Optional path; when set, a JSON usage report (estimated
             cost, token counts, model, api_calls) is written there after the
@@ -223,57 +326,87 @@ def run_oneshot(
             spend per invocation.
 
     Returns the exit code.  The caller owns process termination.
+
+    Global-state contract: one outer transaction snapshots — before the
+    logging disable, validation, and every environment assignment below —
+    the exact prior presence and value of HERMES_YOLO_MODE,
+    HERMES_ACCEPT_HOOKS, and HERMES_ONESHOT_EXPLICIT_NO_TOOLS plus the
+    exact logging-disable integer, and restores all four on every return
+    and every exception path, BaseException included.  That makes the call
+    state-clean for those globals; it does NOT reverse tools.approval's
+    import-time _YOLO_MODE_FROZEN snapshot — an in-process caller that
+    already imported tools.approval keeps that frozen approval state
+    regardless of the environment restore.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
+    prior_yolo = os.environ.get("HERMES_YOLO_MODE")
+    prior_accept_hooks = os.environ.get("HERMES_ACCEPT_HOOKS")
+    prior_guard = os.environ.get(_EXPLICIT_NO_TOOLS_ENV)
+    prior_logging_disable = logging.root.manager.disable
 
-    # --provider without --model is ambiguous: carrying the user's configured
-    # model across to a different provider is usually wrong (that provider may
-    # not host it), and silently picking the provider's catalog default hides
-    # the mismatch.  Require the caller to be explicit.  Validate BEFORE the
-    # stderr redirect so the message actually reaches the terminal.
-    env_model_early = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
-    if provider and not ((model or "").strip() or env_model_early):
-        sys.stderr.write(
-            "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
-            "Pass both explicitly, or neither to use your configured defaults.\n"
-        )
-        return 2
-
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
-        return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
-
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
-    os.environ["HERMES_ACCEPT_HOOKS"] = "1"
-
-    # One-shot prints a single final response and exits: there is no later turn
-    # for a detached subagent's completion to re-enter, and nothing here drains
-    # process_registry.completion_queue (only cli.py's interactive process_loop
-    # and the gateway watchers do). Left unbound, async_delivery_supported()
-    # defaults True, delegate_task is forced background, and every subagent
-    # result is discarded. Declaring the channel stateless routes delegate_task
-    # to its inline/synchronous path. See declare_stateless_channel().
-    declare_stateless_channel()
-
-    # Redirect stderr AND stdout to devnull for the entire call tree.
-    # We'll print the final response to the real stdout at the end.
-    real_stdout = sys.stdout
-    real_stderr = sys.stderr
-    devnull = open(os.devnull, "w", encoding="utf-8")
-
-    response: Optional[str] = None
-    result: dict = {}
-    failure: BaseException | None = None
+    devnull = None
+    body_failed = False
     try:
+        # Silence every stdlib logger for the duration.  AIAgent, tools, and
+        # provider adapters all log to stderr through the root logger; file
+        # handlers added by setup_logging() keep working (they're attached to
+        # the root logger's handler list, not affected by level), but no
+        # bytes reach the terminal.
+        logging.disable(logging.CRITICAL)
+
+        # --provider without --model is ambiguous: carrying the user's configured
+        # model across to a different provider is usually wrong (that provider may
+        # not host it), and silently picking the provider's catalog default hides
+        # the mismatch.  Require the caller to be explicit.  Validate BEFORE the
+        # stderr redirect so the message actually reaches the terminal.
+        env_model_early = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
+        if provider and not ((model or "").strip() or env_model_early):
+            sys.stderr.write(
+                "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
+                "Pass both explicitly, or neither to use your configured defaults.\n"
+            )
+            return 2
+
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
+
+        # Auto-approve any shell / tool approvals.  Non-interactive by
+        # definition — a prompt would hang forever.  Only after side-effect-
+        # free validation succeeded: the exit-2 paths above must not mutate
+        # approval state at all.
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+
+        # One-shot prints a single final response and exits: there is no later turn
+        # for a detached subagent's completion to re-enter, and nothing here drains
+        # process_registry.completion_queue (only cli.py's interactive process_loop
+        # and the gateway watchers do). Left unbound, async_delivery_supported()
+        # defaults True, delegate_task is forced background, and every subagent
+        # result is discarded. Declaring the channel stateless routes delegate_task
+        # to its inline/synchronous path. See declare_stateless_channel().
+        declare_stateless_channel()
+
+        # Redirect stderr AND stdout to devnull for the entire call tree.
+        # We'll print the final response to the real stdout at the end.
+        real_stdout = sys.stdout
+        real_stderr = sys.stderr
+        devnull = open(os.devnull, "w", encoding="utf-8")
+
+        # Explicit-no-tools process guard: _run_agent imports run_agent, which
+        # transitively imports model_tools; that module runs plugin discovery at
+        # import time unless this guard is set.  Set it before the agent build so
+        # a `none` run stays side-effect free.  The outer finally restores the
+        # prior value exactly (guard last) so nested or subsequent runs in this
+        # process see an unchanged environment.
+        explicit_no_tools = explicit_toolsets == []
+        if explicit_no_tools:
+            os.environ[_EXPLICIT_NO_TOOLS_ENV] = "1"
+
+        response: Optional[str] = None
+        result: dict = {}
+        failure: BaseException | None = None
         with redirect_stdout(devnull), redirect_stderr(devnull):
             try:
                 response, result = _run_agent(
@@ -293,49 +426,78 @@ def run_oneshot(
                 # cron / SSH / subprocess context is the worst failure mode.
                 # See #30623.
                 failure = exc
+
+        if failure is not None:
+            # Re-raise control-flow exceptions so the parent handles them as usual
+            # (Ctrl-C / explicit sys.exit() inside the agent).
+            if isinstance(failure, (KeyboardInterrupt, SystemExit)):
+                _write_usage_file(usage_file, result, failure=repr(failure))
+                raise failure
+            _write_usage_file(usage_file, result, failure=str(failure))
+            real_stderr.write(f"hermes -z: agent failed: {failure}\n")
+            real_stderr.flush()
+            return 1
+
+        _write_usage_file(usage_file, result)
+
+        # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
+        # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
+        # exit 1 after the turn already completed — scrub to U+FFFD first.
+        # See #80366.
+        if response:
+            from agent.message_sanitization import _sanitize_surrogates
+
+            response = _sanitize_surrogates(response)
+
+        if response:
+            real_stdout.write(response)
+            if not response.endswith("\n"):
+                real_stdout.write("\n")
+            real_stdout.flush()
+
+        if (result.get("failed") or result.get("partial")) and not (response or "").strip():
+            return 2
+
+        if not (response or "").strip():
+            real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
+            real_stderr.flush()
+            return 1
+
+        return 0
+    except BaseException:
+        # Flag (not handle) an unwinding body failure so the finally below
+        # can rank it above a devnull-close failure without consulting
+        # ambient sys.exc_info(), which an enclosing except block in an
+        # in-process caller could pollute.
+        body_failed = True
+        raise
     finally:
+        # Cleanup order (outer transaction): the stdout/stderr redirects and
+        # the agent/session/process cleanup owned by _run_agent have already
+        # unwound inside the try above; close devnull, then restore the
+        # named globals.  The explicit-no-tools guard is restored LAST so no
+        # cleanup import can trigger plugin discovery while teardown is
+        # still running.  close() is itself a failure boundary: an ordinary
+        # Exception stays swallowed as before, but a BaseException is
+        # captured so the nested finally still restores all four globals,
+        # then re-raised only when no body failure is already unwinding
+        # (the body failure must never be masked by cleanup).
+        close_failure: BaseException | None = None
         try:
-            devnull.close()
-        except Exception:
-            pass
-
-    if failure is not None:
-        # Re-raise control-flow exceptions so the parent handles them as usual
-        # (Ctrl-C / explicit sys.exit() inside the agent).
-        if isinstance(failure, (KeyboardInterrupt, SystemExit)):
-            _write_usage_file(usage_file, result, failure=repr(failure))
-            raise failure
-        _write_usage_file(usage_file, result, failure=str(failure))
-        real_stderr.write(f"hermes -z: agent failed: {failure}\n")
-        real_stderr.flush()
-        return 1
-
-    _write_usage_file(usage_file, result)
-
-    # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
-    # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
-    # exit 1 after the turn already completed — scrub to U+FFFD first.
-    # See #80366.
-    if response:
-        from agent.message_sanitization import _sanitize_surrogates
-
-        response = _sanitize_surrogates(response)
-
-    if response:
-        real_stdout.write(response)
-        if not response.endswith("\n"):
-            real_stdout.write("\n")
-        real_stdout.flush()
-
-    if (result.get("failed") or result.get("partial")) and not (response or "").strip():
-        return 2
-
-    if not (response or "").strip():
-        real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
-        real_stderr.flush()
-        return 1
-
-    return 0
+            if devnull is not None:
+                try:
+                    devnull.close()
+                except Exception:
+                    pass
+                except BaseException as exc:
+                    close_failure = exc
+        finally:
+            _restore_env_var("HERMES_ACCEPT_HOOKS", prior_accept_hooks)
+            _restore_env_var("HERMES_YOLO_MODE", prior_yolo)
+            logging.disable(prior_logging_disable)
+            _restore_env_var(_EXPLICIT_NO_TOOLS_ENV, prior_guard)
+        if close_failure is not None and not body_failed:
+            raise close_failure
 
 
 def _create_session_db_for_oneshot():
@@ -441,7 +603,16 @@ def _run_agent(
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
+    #
+    # An explicit empty list is the validated `none` sentinel and must be kept
+    # as exactly [] — _normalize_toolsets collapses empty input to None, which
+    # downstream means "use config/default toolsets" and would silently
+    # re-enable tools the caller asked to disable.
+    explicit_empty = isinstance(toolsets, (list, tuple)) and len(toolsets) == 0
+    if explicit_empty:
+        toolsets_list: list[str] | None = []
+    else:
+        toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
@@ -452,12 +623,17 @@ def _run_agent(
     # registered yet.  This helper starts discovery if needed (idempotent) and
     # bounded-waits with the larger single-query bound (default 15s) because
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    #
+    # Skipped entirely on the explicit-empty (`none` sentinel) path: with zero
+    # enabled toolsets no MCP server can contribute a tool, so spawning
+    # discovery would be a pure startup side effect.
+    if not explicit_empty:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
-    )
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
 

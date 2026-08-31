@@ -1587,15 +1587,27 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
-    # A multiplexed gateway may enter a different HERMES_HOME after
-    # ``model_tools`` was first imported. Ensure that profile's keyed plugin
-    # manager has discovered its registrations before taking the tool snapshot.
-    try:
-        from hermes_cli.plugins import discover_plugins
+    # An explicit empty toolset list (hermes -z --toolsets none) is a
+    # no-tools contract, distinct from None (default/config toolsets): no
+    # plugin registration could ever be consulted, so plugin discovery is
+    # skipped, the tool snapshot is pinned to [] without consulting the
+    # registry (a dispatcher-context kanban append must not resurrect tools),
+    # and the between-turns MCP refresh is opted out so a late MCP
+    # registration cannot re-introduce tools mid-session.
+    _explicit_no_tools = enabled_toolsets is not None and len(enabled_toolsets) == 0
+    if _explicit_no_tools:
+        agent._skip_mcp_refresh = True
+    else:
+        # A multiplexed gateway may enter a different HERMES_HOME after
+        # ``model_tools`` was first imported. Ensure that profile's keyed
+        # plugin manager has discovered its registrations before taking the
+        # tool snapshot.
+        try:
+            from hermes_cli.plugins import discover_plugins
 
-        discover_plugins()
-    except Exception:
-        logger.warning("Plugin discovery failed during agent setup", exc_info=True)
+            discover_plugins()
+        except Exception:
+            logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
@@ -1605,11 +1617,14 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    if _explicit_no_tools:
+        agent.tools = []
+    else:
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
