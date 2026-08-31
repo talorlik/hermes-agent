@@ -220,6 +220,31 @@ def test_task_detail_includes_links_and_events(client):
     assert len(data["events"]) >= 1
 
 
+def test_task_detail_uses_versioned_snapshot_and_preserves_dashboard_envelope(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "snapshot detail"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, task["id"])
+        assert claimed is not None
+        comment_id = kb.add_comment(conn, task["id"], "worker", "detail note")
+
+    response = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == kb.TASK_SNAPSHOT_SCHEMA_VERSION
+    assert payload["task"]["block_kind"] is None
+    assert payload["task"]["block_recurrences"] == 0
+    assert payload["task"]["current_run_id"] == claimed.current_run_id
+    assert [item["id"] for item in payload["comments"]] == [comment_id]
+    assert all(isinstance(item["id"], int) for item in payload["events"])
+    assert set(payload) >= {
+        "task", "comments", "events", "attachments", "links",
+        "child_results", "runs", "schema_version",
+    }
+
+
 # ---------------------------------------------------------------------------
 # PATCH /tasks/:id — status transitions
 # ---------------------------------------------------------------------------

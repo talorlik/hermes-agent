@@ -541,53 +541,56 @@ def get_task(
                 status_code=400,
                 detail="run_state_type must be 'status' or 'outcome'",
             )
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        # Drawer/detail view returns the FULL summary (no truncation) so
-        # operators can read the complete worker handoff without making
-        # a second round-trip. Cards on /board carry a 200-char preview.
-        full_summary = kanban_db.latest_summary(conn, task_id)
-        task_d = _task_dict(task, latest_summary=full_summary)
-        links = _links_for(conn, task_id)
-        child_ids = links["children"]
-        child_summaries = kanban_db.latest_summaries(conn, child_ids)
-        child_results = []
-        for child_id in child_ids:
-            child = kanban_db.get_task(conn, child_id)
-            if child is None:
-                continue
-            child_results.append({
-                "id": child.id,
-                "title": child.title,
-                "status": child.status,
-                "latest_summary": child_summaries.get(child.id),
-                "result": child.result,
-            })
-        # Attach diagnostics so the drawer's Diagnostics section can
-        # render recovery actions without a second round-trip.
-        diags = _compute_task_diagnostics(conn, task_ids=[task_id])
-        diag_list = diags.get(task_id) or []
-        if diag_list:
-            task_d["diagnostics"] = diag_list
-            task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
-        return {
-            "task": task_d,
-            "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
-            "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
-            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
-            "links": links,
-            "child_results": child_results,
-            "runs": [
-                _run_dict(r)
-                for r in kanban_db.list_runs(
-                    conn,
-                    task_id,
-                    state_type=run_state_type,
-                    state_name=run_state_name,
-                )
-            ],
-        }
+        with kanban_db.read_txn(conn):
+            snapshot = kanban_db.build_task_snapshot(
+                conn,
+                task_id,
+                run_state_type=run_state_type,
+                run_state_name=run_state_name,
+            )
+            if snapshot is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            serialized = snapshot.to_dict()
+            task = snapshot.task
+            # Preserve dashboard-only derived fields while sourcing canonical
+            # task fields from the shared versioned snapshot serializer.
+            task_d = _task_dict(task, latest_summary=snapshot.latest_summary)
+            task_d.update(serialized["task"])
+            links = _links_for(conn, task_id)
+            child_ids = snapshot.children
+            child_summaries = kanban_db.latest_summaries(conn, child_ids)
+            child_results = []
+            for child_id in child_ids:
+                child = kanban_db.get_task(conn, child_id)
+                if child is None:
+                    continue
+                child_results.append({
+                    "id": child.id,
+                    "title": child.title,
+                    "status": child.status,
+                    "latest_summary": child_summaries.get(child.id),
+                    "result": child.result,
+                })
+            # Attach diagnostics so the drawer's Diagnostics section can
+            # render recovery actions without a second round-trip.
+            diags = _compute_task_diagnostics(conn, task_ids=[task_id])
+            diag_list = diags.get(task_id) or []
+            if diag_list:
+                task_d["diagnostics"] = diag_list
+                task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+            return {
+                "schema_version": snapshot.schema_version,
+                "task": task_d,
+                "comments": [_comment_dict(c) for c in snapshot.comments],
+                "events": [_event_dict(e) for e in snapshot.events],
+                "attachments": [
+                    _attachment_dict(a)
+                    for a in kanban_db.list_attachments(conn, task_id)
+                ],
+                "links": links,
+                "child_results": child_results,
+                "runs": [_run_dict(r) for r in snapshot.runs],
+            }
     finally:
         conn.close()
 

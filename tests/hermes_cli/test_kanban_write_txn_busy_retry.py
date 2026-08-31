@@ -24,6 +24,7 @@ class _FakeConn:
     def __init__(self, script):
         self._script = {k: list(v) for k, v in script.items()}
         self.calls = []
+        self.in_transaction = False
 
     def execute(self, sql, *args):
         self.calls.append(sql)
@@ -33,6 +34,10 @@ class _FakeConn:
             outcome = outcomes.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
+        if key == "BEGIN":
+            self.in_transaction = True
+        elif key in {"COMMIT", "ROLLBACK"}:
+            self.in_transaction = False
         return None
 
     def count(self, prefix):

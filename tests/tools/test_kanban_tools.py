@@ -80,6 +80,42 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_show_versioned_snapshot_caps_model_events_to_last_50(worker_env):
+    """The model tool serves the versioned snapshot envelope but keeps the
+    established last-50 events cap at this consumer only; the raw
+    ``build_task_snapshot`` collection stays complete (full log via CLI)."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        for i in range(60):
+            kb.heartbeat_worker(conn, worker_env, note=f"hb {i}")
+        comment_id = kb.add_comment(conn, worker_env, "test-worker", "snapshot note")
+        all_events = kb.list_events(conn, worker_env)
+        snapshot = kb.build_task_snapshot(conn, worker_env)
+    finally:
+        conn.close()
+
+    assert len(all_events) > 50
+    # The raw versioned snapshot is complete -- the cap is not applied there.
+    assert [e.id for e in snapshot.events] == [e.id for e in all_events]
+
+    payload = json.loads(kt._handle_show({}))
+    assert payload["schema_version"] == kb.TASK_SNAPSHOT_SCHEMA_VERSION
+    assert payload["task"]["block_kind"] is None
+    assert payload["task"]["block_recurrences"] == 0
+    assert payload["task"]["current_run_id"] is not None
+    assert [item["id"] for item in payload["comments"]] == [comment_id]
+    # Model-tool consumer cap: exactly the LAST 50 events, same item shape,
+    # no truncation metadata (exact prior output contract).
+    assert [item["id"] for item in payload["events"]] == [
+        e.id for e in all_events[-50:]
+    ]
+    assert all(isinstance(item["id"], int) for item in payload["events"])
+    assert "worker_context" in payload
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

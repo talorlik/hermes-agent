@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Union
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -3057,6 +3057,168 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _unwind_savepoint(
+    conn: sqlite3.Connection, savepoint: str
+) -> Optional[BaseException]:
+    """Roll back and release one savepoint after a nested failure.
+
+    Returns ``None`` when the savepoint unwound cleanly (nested mutation
+    undone, outer transaction intact). ANY cleanup failure -- including a
+    BaseException interrupt -- escalates to a full ROLLBACK of the outer
+    transaction so a caller that swallows the inner error cannot later
+    commit the supposedly rolled-back nested mutation. The escalating
+    exception is returned so the caller can poison the remaining receipt
+    frames; a BaseException from the full ROLLBACK itself is returned the
+    same way (the outer exit then reports outcome-unknown instead of
+    attempting COMMIT).
+    """
+    escalation: Optional[BaseException] = None
+    try:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+    except BaseException as cleanup_exc:  # noqa: BLE001 -- interrupt-safe boundary
+        escalation = cleanup_exc
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            # No active transaction: SQLite already rolled everything back.
+            pass
+        except BaseException as rollback_exc:  # noqa: BLE001
+            escalation = rollback_exc
+    return escalation
+
+
+class _UnknownTransactionState:
+    """Sentinel type for :data:`_TXN_STATE_UNKNOWN`; never instantiated twice."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<transaction state unknown>"
+
+
+_TXN_STATE_UNKNOWN = _UnknownTransactionState()
+
+
+def _probe_in_transaction(
+    conn: sqlite3.Connection,
+) -> tuple[Union[bool, _UnknownTransactionState], Optional[BaseException]]:
+    """Read ``conn.in_transaction`` without trusting the wrapper.
+
+    Returns ``(True | False | _TXN_STATE_UNKNOWN, telemetry_failure)``
+    and never raises. Only an exact boolean from the attribute is a
+    usable state; a missing attribute, a getter that raises (any
+    BaseException -- an interrupt landing inside the property must not
+    escape a cleanup path), or a non-boolean value all yield
+    ``_TXN_STATE_UNKNOWN`` plus the telemetry failure so callers can
+    surface it as context without letting it replace an authoritative
+    original exception. There is deliberately NO ``getattr`` default
+    here: a fallback silently CHOOSES an outcome, and outcome claims
+    over an unreadable connection must fail closed instead.
+    """
+    try:
+        value = conn.in_transaction
+    except BaseException as telemetry_exc:  # noqa: BLE001 -- interrupt-safe boundary
+        return _TXN_STATE_UNKNOWN, telemetry_exc
+    if isinstance(value, bool):
+        return bool(value), None
+    return _TXN_STATE_UNKNOWN, TypeError(
+        f"in_transaction returned non-boolean {value!r}; "
+        "the transaction state cannot be trusted"
+    )
+
+
+def _describe_transaction_state(conn: sqlite3.Connection) -> str:
+    """Human-readable connection state for outcome-unknown messages."""
+    state, _ = _probe_in_transaction(conn)
+    if state is True:
+        return "still reports an open transaction"
+    if state is False:
+        return "reports no open transaction"
+    return "cannot report its transaction state"
+
+
+def _close_transaction_for_failure(
+    conn: sqlite3.Connection,
+) -> Optional[BaseException]:
+    """Best-effort ROLLBACK of an open transaction after a failure.
+
+    Returns ``None`` only when the transaction is PROVEN closed: the
+    pre-probe reported exactly False (no open transaction), the ROLLBACK
+    executed AND the post-probe corroborates exactly False, or SQLite
+    raised the specific benign no-active-transaction error
+    (auto-rollback already closed it -- typical under EIO, lock
+    contention, corruption) with the same exact-False corroboration.
+
+    Every state read goes through :func:`_probe_in_transaction`: a
+    wrapper without ``in_transaction``, a getter that raises, or a
+    non-boolean value is UNKNOWN, and UNKNOWN is never proof in either
+    direction -- it still ATTEMPTS the ROLLBACK (a transaction may be
+    open behind the wrapper) and it still refuses to certify closure
+    afterwards, even when the benign no-active-transaction message
+    appeared. Any other rollback failure -- an ordinary
+    ``sqlite3.OperationalError`` such as a disk I/O error, a ROLLBACK
+    that returns without error while the connection still reports (or
+    cannot report) an open transaction -- returns the cleanup/telemetry
+    exception: the transaction may still be open with the pending
+    mutation visible, so the caller must escalate to
+    :class:`TransactionOutcomeUnknownError` instead of re-raising the
+    original as an ordinary (falsely "rolled back") failure.
+    """
+    pre_state, _pre_failure = _probe_in_transaction(conn)
+    if pre_state is False:
+        return None
+    # True or UNKNOWN: a transaction may be open; the rollback attempt is
+    # mandatory either way.
+    try:
+        conn.execute("ROLLBACK")
+    except BaseException as cleanup_exc:  # noqa: BLE001 -- interrupt-safe boundary
+        post_state, _post_failure = _probe_in_transaction(conn)
+        if (
+            isinstance(cleanup_exc, sqlite3.OperationalError)
+            and "no transaction is active" in str(cleanup_exc).lower()
+            and post_state is False
+        ):
+            return None
+        return cleanup_exc
+    post_state, post_failure = _probe_in_transaction(conn)
+    if post_state is False:
+        return None
+    if post_state is _TXN_STATE_UNKNOWN:
+        # The ROLLBACK returned without error but the connection cannot
+        # report its state; a bare return from execute() is not proof of
+        # closure. post_failure is always set when the probe is UNKNOWN.
+        return post_failure
+    return RuntimeError(
+        "ROLLBACK returned without error but the connection still "
+        "reports an open transaction; closure cannot be proven"
+    )
+
+
+class TransactionOutcomeUnknownError(RuntimeError):
+    """The durable outcome of a write transaction cannot be proven.
+
+    Raised instead of an ordinary failure whenever boundary cleanup could
+    not prove the transaction closed (rollback interrupted), a COMMIT may
+    have executed before its wrapper raised, post-commit durability
+    verification failed, or a nested savepoint escalation invalidated the
+    outer transaction. The caller must treat the mutation as neither
+    committed nor rolled back and perform an authoritative readback on a
+    fresh connection. ``__cause__`` chains the triggering exception.
+    """
+
+
+class ReceiptFinalizationError(RuntimeError):
+    """The mutation committed durably but receipt publication was cut short.
+
+    Raised when a BaseException interrupts receipt publication after the
+    outer COMMIT already succeeded. Every capture that was not published
+    is cleared and unbound (no fabricated receipts); the committed
+    mutation is visible to a fresh-connection readback. ``__cause__``
+    chains the interrupting exception.
+    """
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """Context manager for an IMMEDIATE write transaction.
@@ -3079,9 +3241,21 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     The explicit ROLLBACK on exception is wrapped in try/except so that
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
+
+    Body and boundary failure handlers catch ``BaseException``, not
+    ``Exception``: a ``KeyboardInterrupt`` between a staged receipt and
+    the commit boundary must still roll back the savepoint/transaction
+    and pop the receipt frame, otherwise a caller that catches the
+    interruption inherits an open transaction, a bound capture, and a
+    leaked receipt frame. The original exception is always re-raised.
     """
     _assert_not_delegated_child_mutation()
-    if getattr(conn, "in_transaction", False):
+    # Entry routing trusts only an exact True from the probe. UNKNOWN
+    # (missing/raising/non-boolean telemetry) takes the top-level path:
+    # BEGIN IMMEDIATE is the authoritative nesting check -- SQLite raises
+    # inside an open transaction -- and its failure path fails closed.
+    entry_state, _ = _probe_in_transaction(conn)
+    if entry_state is True:
         if not allow_nested:
             raise RuntimeError(
                 "write_txn: already inside a transaction. Nested composition "
@@ -3091,45 +3265,151 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
+        _begin_receipt_transaction(conn, owner_managed=False)
         try:
             yield conn
-        except Exception:
+        except BaseException:
+            # A failed savepoint cleanup leaves the nested mutation's
+            # durability ambiguous: _unwind_savepoint escalates to a full
+            # ROLLBACK and returns the escalation so the outer frames can be
+            # poisoned -- a caller that catches the inner exception must not
+            # be able to commit the supposedly rolled-back mutation. Frame
+            # cleanup runs even when the poisoning bookkeeping fails.
+            escalation = _unwind_savepoint(conn, savepoint)
             try:
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
-            except sqlite3.OperationalError:
-                pass
+                if escalation is not None:
+                    _poison_receipt_transaction(conn, escalation)
+            finally:
+                _finish_receipt_transaction(conn, committed=False)
             raise
         else:
-            conn.execute(f"RELEASE {savepoint}")
+            try:
+                conn.execute(f"RELEASE {savepoint}")
+            except BaseException:
+                # RELEASE may have executed inside SQLite before the wrapper
+                # raised; the unwind below then escalates (no such savepoint)
+                # to a full ROLLBACK, and the poisoned outer frame refuses
+                # COMMIT instead of surfacing a misleading cannot-commit.
+                escalation = _unwind_savepoint(conn, savepoint)
+                try:
+                    if escalation is not None:
+                        _poison_receipt_transaction(conn, escalation)
+                finally:
+                    _finish_receipt_transaction(conn, committed=False)
+                raise
+            _finish_receipt_transaction(conn, committed=True)
         return
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    _begin_receipt_transaction(conn, owner_managed=True)
+    try:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    except BaseException as exc:
+        # The BEGIN may have executed before the wrapper raised (interrupt
+        # landing on the boundary). If a transaction is active, close it;
+        # the frame pop must run even when that cleanup itself fails.
+        cleanup_failure = None
+        try:
+            # _close_transaction_for_failure probes first and returns None
+            # on an exact-False state; True or UNKNOWN must attempt the
+            # ROLLBACK -- the BEGIN may have executed behind a wrapper that
+            # cannot report it.
+            cleanup_failure = _close_transaction_for_failure(conn)
+        finally:
+            _finish_receipt_transaction(conn, committed=False)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "BEGIN boundary failed and rollback cleanup could not prove "
+                "the transaction closed (cleanup: "
+                f"{cleanup_failure!r}); the connection "
+                f"{_describe_transaction_state(conn)}"
+            ) from exc
+        raise
     try:
         yield conn
-    except Exception:
+    except BaseException as exc:
+        # SQLite may have auto-rolled-back already (typical under EIO, lock
+        # contention, or corruption); that benign secondary failure must not
+        # shadow the real one. A rollback interrupted by a BaseException,
+        # however, leaves the outcome unprovable -- escalate explicitly
+        # instead of re-raising the original as a false "rolled back".
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
+            cleanup_failure = _close_transaction_for_failure(conn)
+        finally:
+            _finish_receipt_transaction(conn, committed=False)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "write transaction failed and rollback cleanup was itself "
+                f"interrupted (cleanup: {cleanup_failure!r}); the connection "
+                f"{_describe_transaction_state(conn)}"
+                " -- the mutation must be treated as neither committed nor "
+                "rolled back until an authoritative readback"
+            ) from exc
         raise
     else:
+        poison = _take_receipt_poison(conn)
+        if poison is not None:
+            # A nested savepoint escalation rolled back or invalidated this
+            # transaction and the caller swallowed the inner failure. COMMIT
+            # must not run: it would either surface a misleading
+            # cannot-commit or, worse, commit a supposedly rolled-back
+            # mutation. Fail closed with the escalation chained.
+            try:
+                _close_transaction_for_failure(conn)
+            finally:
+                _finish_receipt_transaction(conn, committed=False)
+            raise TransactionOutcomeUnknownError(
+                "a nested savepoint escalation invalidated this write "
+                "transaction; COMMIT was skipped -- perform an "
+                "authoritative readback on a fresh connection"
+            ) from poison
         try:
             _execute_boundary_with_retry(conn, "COMMIT")
-        except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
-            raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        except BaseException as exc:
+            commit_state, _ = _probe_in_transaction(conn)
+            if commit_state is not False:
+                # COMMIT failed with the txn still open (e.g. exhausted BUSY
+                # retries) OR the wrapper cannot report its state; roll back
+                # so the connection isn't poisoned for the next BEGIN
+                # IMMEDIATE, then re-raise the original. Only an exact False
+                # may take the commit-may-have-executed branch below.
+                try:
+                    cleanup_failure = _close_transaction_for_failure(conn)
+                finally:
+                    _finish_receipt_transaction(conn, committed=False)
+                if cleanup_failure is not None:
+                    raise TransactionOutcomeUnknownError(
+                        "COMMIT failed and rollback cleanup was itself "
+                        f"interrupted (cleanup: {cleanup_failure!r}); the "
+                        "transaction outcome cannot be proven"
+                    ) from exc
+                raise
+            # No open transaction after a COMMIT failure: the COMMIT may
+            # have executed durably before the wrapper raised. Never claim
+            # rollback and never publish a success receipt.
+            _finish_receipt_transaction(conn, committed=False)
+            raise TransactionOutcomeUnknownError(
+                "COMMIT raised but the connection reports no open "
+                "transaction -- the commit may have executed durably; "
+                "perform an authoritative readback on a fresh connection"
+            ) from exc
+        try:
+            # Post-commit file-length check: header page_count must match actual
+            # file pages. A discrepancy means a torn extend; do not publish a
+            # success receipt when durability verification failed.
+            _check_file_length_invariant(conn)
+        except BaseException as exc:
+            # The commit already happened; nothing can be rolled back.
+            # Suppress receipt publication (unbinding every staged capture)
+            # and raise the stronger committed-unverified error chained from
+            # the durability failure, not an ordinary success/failure
+            # ambiguity.
+            _finish_receipt_transaction(conn, committed=False)
+            raise TransactionOutcomeUnknownError(
+                "transaction committed but post-commit durability "
+                "verification failed; the mutation may be durable -- "
+                "perform an authoritative readback on a fresh connection"
+            ) from exc
+        _finish_receipt_transaction(conn, committed=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3996,6 +4276,384 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
+class UnsafeDurableTextError(ValueError):
+    """Raised in strict mode when durable text would be altered by redaction.
+
+    The message deliberately never contains the offending text — the whole
+    point of the boundary is that the raw value must not travel further.
+    """
+
+
+def canonicalize_durable_text(text: str, *, strict: bool = False) -> str:
+    """Canonicalize one string at the durable-storage domain boundary.
+
+    The single shared canonicalizer for text that is about to be durably
+    stored on a kanban board (comments, completion result/summary/metadata,
+    review handoffs, block/unblock reasons). Force-redacts secrets
+    (``agent.redact.redact_sensitive_text`` with ``force=True``) — a storage
+    boundary must never return raw secrets regardless of the user's
+    ``security.redact_secrets`` logging preference.
+
+    Canonical-return (default): safe text is returned byte-identical, so
+    replay/dedup contracts built on byte equality keep holding; unsafe text
+    is returned with every secret masked.
+
+    Strict-reject (``strict=True``): text the redactor would alter raises
+    :class:`UnsafeDurableTextError` instead of being silently rewritten.
+    For callers whose contract is "what was written is exactly what is
+    stored" and who would rather refuse than store an altered form.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    from agent.redact import redact_sensitive_text
+
+    canonical = redact_sensitive_text(text, force=True)
+    if strict and canonical != text:
+        raise UnsafeDurableTextError(
+            "durable text contains sensitive material the domain boundary "
+            "would redact; refusing to store it (strict mode)"
+        )
+    return canonical
+
+
+def _json_coerced_key(key: Any) -> Optional[str]:
+    """The string ``json.dumps`` would emit for a dictionary key.
+
+    Models CPython's encoder exactly: bool before int (bool is an int
+    subclass), ``float.__repr__`` with the Infinity/NaN spellings for
+    floats, ``int.__repr__`` for ints, ``"null"`` for None. Returns None
+    for key types ``json.dumps`` cannot coerce (those fail at
+    serialization time on their own).
+    """
+    if isinstance(key, str):
+        return key
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, float):
+        if key != key:
+            return "NaN"
+        if key == float("inf"):
+            return "Infinity"
+        if key == float("-inf"):
+            return "-Infinity"
+        return repr(key)
+    if isinstance(key, int):
+        return repr(key)
+    if key is None:
+        return "null"
+    return None
+
+
+def canonicalize_durable_value(value: Any, *, strict: bool = False) -> Any:
+    """Recursively canonicalize strings in container keys and values.
+
+    String dictionary keys are durable text too. Canonicalizing them can merge
+    two distinct source keys, so collisions fail closed rather than silently
+    dropping one value. The same fail-closed rule covers ``json.dumps`` key
+    coercion: distinct Python keys such as ``1``/``'1'``, ``None``/``'null'``,
+    ``False``/``'false'`` and ``True``/``'true'`` all coerce to one JSON
+    object key, which would silently drop a value (or emit duplicate keys)
+    at serialization time -- reject them here, before serialization.
+    Noncolliding non-string keys (e.g. ``1.0`` alongside ``'1'``) stay valid.
+    """
+    if isinstance(value, str):
+        return canonicalize_durable_text(value, strict=strict)
+    if isinstance(value, dict):
+        canonical: dict[Any, Any] = {}
+        seen_json_keys: set[str] = set()
+        for key, item in value.items():
+            canonical_key = (
+                canonicalize_durable_text(key, strict=strict)
+                if isinstance(key, str)
+                else key
+            )
+            if canonical_key in canonical:
+                raise UnsafeDurableTextError(
+                    "durable dictionary keys collide after canonicalization"
+                )
+            coerced = _json_coerced_key(canonical_key)
+            if coerced is not None:
+                if coerced in seen_json_keys:
+                    raise UnsafeDurableTextError(
+                        "durable dictionary keys collide under JSON key "
+                        "coercion"
+                    )
+                seen_json_keys.add(coerced)
+            canonical[canonical_key] = canonicalize_durable_value(
+                item, strict=strict
+            )
+        return canonical
+    if isinstance(value, list):
+        return [canonicalize_durable_value(item, strict=strict) for item in value]
+    if isinstance(value, tuple):
+        return tuple(
+            canonicalize_durable_value(item, strict=strict) for item in value
+        )
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle receipts
+# ---------------------------------------------------------------------------
+
+LIFECYCLE_RECEIPT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class LifecycleReceipt:
+    """Versioned evidence envelope for one committed lifecycle operation.
+
+    Every id is a stable DB row id captured inside the same write
+    transaction as the mutation it describes. ``newly_committed`` is False
+    only on the authoritative idempotent-replay paths (claim same-claimer
+    replay, comment ``if_absent`` dedup), where the referenced rows are
+    the ORIGINAL committed evidence rather than rows written by this call.
+    """
+
+    operation: str
+    task_id: str
+    prior_status: Optional[str]
+    final_status: Optional[str]
+    newly_committed: bool
+    run_id: Optional[int] = None
+    event_id: Optional[int] = None
+    comment_id: Optional[int] = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Serialize to the wire envelope — one schema for every verb."""
+        return {
+            "schema_version": LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+            "operation": self.operation,
+            "task_id": self.task_id,
+            "prior_status": self.prior_status,
+            "final_status": self.final_status,
+            "run_id": self.run_id,
+            "event_id": self.event_id,
+            "comment_id": self.comment_id,
+            "newly_committed": self.newly_committed,
+            "idempotent_replay": not self.newly_committed,
+        }
+
+
+class LifecycleReceiptCapture:
+    """Out-param publishing evidence only after the outer commit succeeds."""
+
+    def __init__(self) -> None:
+        self._receipt: Optional[LifecycleReceipt] = None
+        self._active_connection_id: Optional[int] = None
+
+    @property
+    def receipt(self) -> Optional[LifecycleReceipt]:
+        return self._receipt
+
+    def clear(self) -> None:
+        self._receipt = None
+
+    def _bind(self, conn: sqlite3.Connection) -> None:
+        key = id(conn)
+        if self._active_connection_id not in (None, key):
+            raise RuntimeError(
+                "lifecycle receipt capture is active on another connection"
+            )
+        self._active_connection_id = key
+        self._receipt = None
+
+    def _release(self, conn: sqlite3.Connection) -> None:
+        if self._active_connection_id == id(conn):
+            self._active_connection_id = None
+
+    def _publish(self, conn: sqlite3.Connection, receipt: LifecycleReceipt) -> None:
+        self._receipt = receipt
+        self._release(conn)
+
+    def _restore_unbound(self, conn: sqlite3.Connection) -> None:
+        """Uninterruptible invariant restoration: cleared and unbound.
+
+        Direct attribute writes only -- no overridable method calls -- so
+        cleanup that runs while a BaseException is already propagating
+        cannot itself be interrupted and leave the capture bound
+        (blocking reuse) or holding evidence that was never published.
+        """
+        self._receipt = None
+        if self._active_connection_id == id(conn):
+            self._active_connection_id = None
+
+
+@dataclass
+class _ReceiptFrame:
+    owner_managed: bool
+    receipts: dict[LifecycleReceiptCapture, LifecycleReceipt] = field(
+        default_factory=dict
+    )
+    # Set by _poison_receipt_transaction when a nested savepoint escalation
+    # rolled back (or left ambiguous) the transaction this frame belongs to.
+    # A poisoned owner frame must never COMMIT.
+    poisoned: Optional[BaseException] = None
+
+
+_RECEIPT_TXN_LOCK = threading.RLock()
+_RECEIPT_TXNS: dict[int, list[_ReceiptFrame]] = {}
+
+
+def _poison_receipt_transaction(
+    conn: sqlite3.Connection, cause: BaseException
+) -> None:
+    """Mark every open receipt frame invalidated by a nested escalation.
+
+    The first cause wins: a later, secondary escalation must not overwrite
+    the exception that originally invalidated the transaction.
+    """
+    with _RECEIPT_TXN_LOCK:
+        for frame in _RECEIPT_TXNS.get(id(conn), ()):
+            if frame.poisoned is None:
+                frame.poisoned = cause
+
+
+def _take_receipt_poison(
+    conn: sqlite3.Connection,
+) -> Optional[BaseException]:
+    """The escalation poisoning the current frame, or None."""
+    with _RECEIPT_TXN_LOCK:
+        frames = _RECEIPT_TXNS.get(id(conn))
+        return frames[-1].poisoned if frames else None
+
+
+def _begin_receipt_transaction(
+    conn: sqlite3.Connection, *, owner_managed: bool
+) -> None:
+    """Push receipt state for one outer transaction or nested savepoint."""
+
+    with _RECEIPT_TXN_LOCK:
+        frames = _RECEIPT_TXNS.setdefault(id(conn), [])
+        inherited_owner = frames[-1].owner_managed if frames else owner_managed
+        frames.append(_ReceiptFrame(owner_managed=inherited_owner))
+
+
+def _stage_receipt(
+    conn: sqlite3.Connection,
+    capture: Optional[LifecycleReceiptCapture],
+    receipt: LifecycleReceipt,
+) -> None:
+    """Stage evidence against the connection that performed the mutation."""
+
+    if capture is None:
+        return
+    with _RECEIPT_TXN_LOCK:
+        frames = _RECEIPT_TXNS.get(id(conn))
+        if not frames or not frames[-1].owner_managed:
+            raise RuntimeError(
+                "receipt capture requires an owner-managed outer write transaction"
+            )
+        capture._bind(conn)
+        frames[-1].receipts[capture] = receipt
+
+
+def _finish_receipt_transaction(conn: sqlite3.Connection, *, committed: bool) -> None:
+    """Merge a released savepoint or publish only an outer committed frame."""
+
+    publish: dict[LifecycleReceiptCapture, LifecycleReceipt] = {}
+    release: tuple[LifecycleReceiptCapture, ...] = ()
+    with _RECEIPT_TXN_LOCK:
+        key = id(conn)
+        frames = _RECEIPT_TXNS.get(key)
+        if not frames:
+            raise RuntimeError("receipt transaction tracking is not active")
+        frame = frames.pop()
+        if committed and frames:
+            frames[-1].receipts.update(frame.receipts)
+        elif committed and frame.owner_managed:
+            publish = frame.receipts
+        else:
+            parent_captures = {
+                capture for parent in frames for capture in parent.receipts
+            }
+            release = tuple(
+                capture
+                for capture in frame.receipts
+                if capture not in parent_captures
+            )
+        if not frames:
+            _RECEIPT_TXNS.pop(key, None)
+    # The rollback path runs inside the caller's failure handling: a
+    # cleanup BaseException here must neither replace the authoritative
+    # original exception nor abort cleanup of the remaining captures. Each
+    # capture is tried through the public path; on any failure its
+    # invariants are force-restored directly and the interruption is
+    # recorded as a note on the in-flight original.
+    release_failures: list[BaseException] = []
+    for capture in release:
+        try:
+            capture.clear()
+            capture._release(conn)
+        except BaseException as cleanup_exc:  # noqa: BLE001 -- interrupt-safe boundary
+            capture._restore_unbound(conn)
+            release_failures.append(cleanup_exc)
+    if release_failures:
+        original = sys.exc_info()[1]
+        if original is not None:
+            for cleanup_exc in release_failures:
+                original.add_note(
+                    "receipt capture cleanup was itself interrupted: "
+                    f"{cleanup_exc!r}"
+                )
+    # The frame is already popped above, so finalization is deterministic:
+    # an interrupt here cannot leave receipt-transaction state behind. Every
+    # capture that did not successfully publish is cleared and unbound (no
+    # fabricated receipts, capture reuse stays possible) and the interrupt
+    # surfaces as an explicit finalization failure -- the mutation is
+    # durable, only its evidence publication was cut short.
+    published: set[LifecycleReceiptCapture] = set()
+    try:
+        for capture, receipt in publish.items():
+            capture._publish(conn, receipt)
+            published.add(capture)
+    except BaseException as exc:  # noqa: BLE001 -- interrupt-safe boundary
+        # Cleanup must finish for EVERY unpublished capture even when it is
+        # itself interrupted again: force-restore the capture's invariants
+        # directly and record the later interruption as a note -- it must
+        # never replace the finalization error or its authoritative
+        # publication-failure cause.
+        cleanup_failures: list[BaseException] = []
+        for capture in publish:
+            if capture not in published:
+                try:
+                    capture.clear()
+                    capture._release(conn)
+                except BaseException as cleanup_exc:  # noqa: BLE001 -- interrupt-safe boundary
+                    capture._restore_unbound(conn)
+                    cleanup_failures.append(cleanup_exc)
+        error = ReceiptFinalizationError(
+            "transaction committed durably but receipt publication was "
+            "interrupted; unpublished captures were cleared -- perform an "
+            "authoritative readback for evidence"
+        )
+        for cleanup_exc in cleanup_failures:
+            error.add_note(
+                "receipt capture cleanup was itself interrupted: "
+                f"{cleanup_exc!r}"
+            )
+        raise error from exc
+
+
+def _clear_receipt_capture(
+    conn: sqlite3.Connection,
+    capture: Optional[LifecycleReceiptCapture],
+) -> None:
+    """Clear visible and staged evidence when a capture is reused."""
+
+    if capture is None:
+        return
+    with _RECEIPT_TXN_LOCK:
+        if capture._active_connection_id not in (None, id(conn)):
+            raise RuntimeError(
+                "lifecycle receipt capture is active on another connection"
+            )
+        capture.clear()
+        for frame in _RECEIPT_TXNS.get(id(conn), ()):
+            frame.receipts.pop(capture, None)
+        capture._release(conn)
+
+
 def add_comment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4004,6 +4662,7 @@ def add_comment(
     *,
     expected_status: Optional[str] = None,
     if_absent: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> int:
     """Append a comment and its ``commented`` event.
 
@@ -4026,6 +4685,7 @@ def add_comment(
     concurrent duplicate writer serializes behind ``BEGIN IMMEDIATE`` and
     the replay observes its committed row.
     """
+    _clear_receipt_capture(conn, receipt_capture)
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -4036,6 +4696,11 @@ def add_comment(
         raise ValueError(
             f"expected_status must be one of {sorted(VALID_STATUSES)}"
         )
+    # Domain-boundary canonicalization (canonical-return policy): safe
+    # bodies stay byte-identical, secret-bearing bodies are masked before
+    # the dedup read below, so an ``if_absent`` replay of unsafe text
+    # matches the stored canonical form instead of inserting twice.
+    body = canonicalize_durable_text(body)
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -4061,19 +4726,55 @@ def add_comment(
                 (task_id, author.strip(), body.strip()),
             ).fetchone()
             if existing is not None:
+                # Authoritative replay receipt: the original comment row id.
+                # No event was written by this call, so none is claimed.
+                if receipt_capture is not None:
+                    _stage_receipt(
+                        conn,
+                        receipt_capture,
+                        LifecycleReceipt(
+                            operation="comment",
+                            task_id=task_id,
+                            prior_status=row["status"],
+                            final_status=row["status"],
+                            newly_committed=False,
+                            comment_id=int(existing["id"]),
+                        ),
+                    )
                 return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        event_id = _append_event(
+            conn, task_id, "commented", {"author": author, "len": len(body)}
+        )
+        if receipt_capture is not None:
+            _stage_receipt(
+                conn,
+                receipt_capture,
+                LifecycleReceipt(
+                    operation="comment",
+                    task_id=task_id,
+                    prior_status=row["status"],
+                    final_status=row["status"],
+                    newly_committed=True,
+                    event_id=event_id,
+                    comment_id=int(cur.lastrowid or 0),
+                ),
+            )
         return int(cur.lastrowid or 0)
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+    # ``id`` tie-breaker: order among equal created_at values is unspecified
+    # SQL, and same-second comment bursts are common. Every public ordered
+    # comment sequence (CLI show --json, snapshot envelope, dashboard) is
+    # built from this read, so the full ordering is pinned here once.
     rows = conn.execute(
-        "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at ASC, id ASC",
         (task_id,),
     ).fetchall()
     return [
@@ -4372,8 +5073,9 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
-    """Record an event row.  Called from within an already-open txn.
+) -> int:
+    """Record an event row and return its id.  Called from within an
+    already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
@@ -4382,11 +5084,12 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return int(cur.lastrowid or 0)
 
 
 def _end_run(
@@ -4689,6 +5392,7 @@ def claim_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
     idempotent_replay: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4699,6 +5403,7 @@ def claim_task(
     existing task without creating another run, event, or lifecycle hook. A
     foreign, expired, or runless claim still returns ``None``.
     """
+    _clear_receipt_capture(conn, receipt_capture)
     if idempotent_replay and (
         not isinstance(claimer, str) or not claimer.strip()
     ):
@@ -4740,6 +5445,33 @@ def claim_task(
                     and int(run_claim_expires) == int(claim_expires)
                     and current["run_ended_at"] is None
                 ):
+                    if receipt_capture is not None:
+                        # Authoritative replay evidence: the ORIGINAL run
+                        # row and its ``claimed`` event (linked by run_id),
+                        # read inside the same write transaction that
+                        # validated the live matching claim.
+                        replay_run_id = int(current["current_run_id"])
+                        ev = conn.execute(
+                            "SELECT id FROM task_events "
+                            "WHERE task_id = ? AND kind = 'claimed' "
+                            "AND run_id = ? ORDER BY id ASC LIMIT 1",
+                            (task_id, replay_run_id),
+                        ).fetchone()
+                        if ev is None:
+                            return None
+                        _stage_receipt(
+                            conn,
+                            receipt_capture,
+                            LifecycleReceipt(
+                                operation="claim",
+                                task_id=task_id,
+                                prior_status="running",
+                                final_status="running",
+                                newly_committed=False,
+                                run_id=replay_run_id,
+                                event_id=int(ev["id"]),
+                            ),
+                        )
                     return get_task(conn, task_id)
                 return None
         # Structural invariant: never transition ready -> running while any
@@ -4832,11 +5564,27 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
-        _append_event(
+        event_id = _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
+        if receipt_capture is not None:
+            # prior_status is a transactional fact: the CAS UPDATE above
+            # matched exactly one row WHERE status = 'ready'.
+            _stage_receipt(
+                conn,
+                receipt_capture,
+                LifecycleReceipt(
+                    operation="claim",
+                    task_id=task_id,
+                    prior_status="ready",
+                    final_status="running",
+                    newly_committed=True,
+                    run_id=int(run_id) if run_id else None,
+                    event_id=event_id,
+                ),
+            )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -5472,6 +6220,7 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     expected_status: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5515,6 +6264,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    _clear_receipt_capture(conn, receipt_capture)
     now = int(time.time())
     # An unknown guard value would never match any row and read as a
     # mismatch; a typo'd caller must fail loudly instead.
@@ -5522,6 +6272,15 @@ def complete_task(
         raise ValueError(
             f"expected_status must be one of {sorted(VALID_STATUSES)}"
         )
+    # Domain-boundary canonicalization (canonical-return policy) for every
+    # durable completion text surface: tasks.result, the closing run's
+    # summary/metadata, and the ``completed`` event's summary excerpt all
+    # derive from these three values.
+    result = canonicalize_durable_text(result) if result is not None else None
+    summary = canonicalize_durable_text(summary) if summary is not None else None
+    metadata = (
+        canonicalize_durable_value(metadata) if metadata is not None else None
+    )
     normalized_expected_run_id = (
         int(expected_run_id) if expected_run_id is not None else None
     )
@@ -5687,11 +6446,25 @@ def complete_task(
                     ]
                     if cleaned_artifacts:
                         completed_payload["artifacts"] = cleaned_artifacts
-            _append_event(
+            event_id = _append_event(
                 conn, task_id, "completed",
                 completed_payload,
                 run_id=run_id,
             )
+            if receipt_capture is not None:
+                _stage_receipt(
+                    conn,
+                    receipt_capture,
+                    LifecycleReceipt(
+                        operation="complete",
+                        task_id=task_id,
+                        prior_status=prior_status,
+                        final_status="done",
+                        newly_committed=True,
+                        run_id=run_id,
+                        event_id=event_id,
+                    ),
+                )
     if phantom_cards:
         # The audit event above is durable (the transaction committed on
         # clean exit); reject the completion only now.
@@ -6334,6 +7107,13 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    # Domain-boundary canonicalization (canonical-return policy): the
+    # backfill writes the same durable completion surfaces as complete_task.
+    result = canonicalize_durable_text(result) if result is not None else None
+    summary = canonicalize_durable_text(summary) if summary is not None else None
+    metadata = (
+        canonicalize_durable_value(metadata) if metadata is not None else None
+    )
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
@@ -6400,6 +7180,7 @@ def block_task(
     expected_status: Optional[str] = None,
     reason_comment_author: Optional[str] = None,
     with_reason: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ):
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6453,6 +7234,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    _clear_receipt_capture(conn, receipt_capture)
 
     def _ret(ok: bool, why: Optional[str] = None):
         return (ok, why) if with_reason else ok
@@ -6467,6 +7249,10 @@ def block_task(
         raise ValueError(
             f"expected_status must be one of {sorted(VALID_STATUSES)}"
         )
+    # Domain-boundary canonicalization (canonical-return policy): the reason
+    # lands on the event payload, the closed/synthesized run summary, and
+    # the transactional ``BLOCKED:`` comment — mask secrets once here.
+    reason = canonicalize_durable_text(reason) if reason is not None else None
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6546,7 +7332,7 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
-            _append_event(
+            event_id = _append_event(
                 conn, task_id, "dependency_wait",
                 {
                     "reason": reason,
@@ -6557,77 +7343,47 @@ def block_task(
             )
             # Same-transaction reason comment, BEFORE the lifecycle hook: a
             # failed comment write must abort the transition without the
-            # hook ever having fired (this branch fires it pre-commit).
+            # hook ever having fired (the hook fires post-commit, in the
+            # shared tail below).
+            comment_id: Optional[int] = None
             if reason and reason_comment_author:
-                add_comment(
+                comment_id = add_comment(
                     conn, task_id, reason_comment_author, f"BLOCKED: {reason}"
                 )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return _ret(True)
-
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
-
-        if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?,
-                       block_recurrences = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return _ret(False, "task changed concurrently")
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+            if receipt_capture is not None:
+                _stage_receipt(
+                    conn,
+                    receipt_capture,
+                    LifecycleReceipt(
+                        operation="block",
+                        task_id=task_id,
+                        prior_status=cur_row["status"],
+                        final_status="todo",
+                        newly_committed=True,
+                        run_id=run_id,
+                        event_id=event_id,
+                        comment_id=comment_id,
+                    ),
                 )
-            _append_event(
-                conn, task_id, "block_loop_detected",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "limit": BLOCK_RECURRENCE_LIMIT,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
         else:
-            if expected_run_id is None:
+            # Truly-blocked kinds. Increment the unblock-loop counter when
+            # this is a re-block for the SAME reason after a prior unblock.
+            # block_task only fires from running/ready (i.e. AFTER an unblock
+            # returned the task to the work pool), so a stored block_kind that
+            # matches the incoming kind means: blocked → unblocked →
+            # about-to-re-block for the same cause. An un-typed (None) block
+            # compares as "same" to a prior un-typed block.
+            same_cause = prev_kind == kind
+            recurrences = prev_recurrences + 1 if same_cause else 1
+
+            if recurrences >= BLOCK_RECURRENCE_LIMIT:
+                # Loop detected — stop letting the unblocker spin this task.
+                # Route to triage for a human-in-the-loop decision instead of
+                # blocked.
                 cur = conn.execute(
                     """
                     UPDATE tasks
-                       SET status        = 'blocked',
+                       SET status        = 'triage',
                            claim_lock    = NULL,
                            claim_expires = NULL,
                            worker_pid    = NULL,
@@ -6635,58 +7391,118 @@ def block_task(
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
+                    """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                    (kind, recurrences, task_id) if expected_run_id is None
+                    else (kind, recurrences, task_id, int(expected_run_id)),
                 )
-            else:
-                cur = conn.execute(
-                    """
-                    UPDATE tasks
-                       SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
-                           block_kind    = ?,
-                           block_recurrences = ?
-                     WHERE id = ?
-                       AND status IN ('running', 'ready')
-                       AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
-                )
-            if cur.rowcount != 1:
-                return _ret(False, "task changed concurrently")
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
+                if cur.rowcount != 1:
+                    return _ret(False, "task changed concurrently")
+                run_id = _end_run(
                     conn, task_id,
-                    outcome="blocked",
+                    outcome="blocked", status="blocked",
                     summary=reason,
                 )
-            _append_event(
-                conn, task_id, "blocked",
-                {
-                    "reason": reason,
-                    "kind": kind,
-                    "recurrences": recurrences,
-                    "source_status": source_status,
-                },
-                run_id=run_id,
-            )
-        # Same-transaction reason comment for the blocked/triage branches.
-        # Inserted before the transaction commits (and therefore before the
-        # post-commit lifecycle hook below): a failed comment write rolls
-        # back the whole transition and the hook never fires.
-        if reason and reason_comment_author:
-            add_comment(
-                conn, task_id, reason_comment_author, f"BLOCKED: {reason}"
-            )
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=reason,
+                    )
+                event_id = _append_event(
+                    conn, task_id, "block_loop_detected",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "limit": BLOCK_RECURRENCE_LIMIT,
+                        "source_status": source_status,
+                    },
+                    run_id=run_id,
+                )
+                landed_status = "triage"
+            else:
+                if expected_run_id is None:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                        """,
+                        (kind, recurrences, task_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        UPDATE tasks
+                           SET status        = 'blocked',
+                               claim_lock    = NULL,
+                               claim_expires = NULL,
+                               worker_pid    = NULL,
+                               block_kind    = ?,
+                               block_recurrences = ?
+                         WHERE id = ?
+                           AND status IN ('running', 'ready')
+                           AND current_run_id = ?
+                        """,
+                        (kind, recurrences, task_id, int(expected_run_id)),
+                    )
+                if cur.rowcount != 1:
+                    return _ret(False, "task changed concurrently")
+                run_id = _end_run(
+                    conn, task_id,
+                    outcome="blocked", status="blocked",
+                    summary=reason,
+                )
+                # Synthesize a run when blocking a never-claimed task so the
+                # reason is preserved in attempt history.
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id,
+                        outcome="blocked",
+                        summary=reason,
+                    )
+                event_id = _append_event(
+                    conn, task_id, "blocked",
+                    {
+                        "reason": reason,
+                        "kind": kind,
+                        "recurrences": recurrences,
+                        "source_status": source_status,
+                    },
+                    run_id=run_id,
+                )
+                landed_status = "blocked"
+            # Same-transaction reason comment for the blocked/triage branches.
+            # Inserted before the transaction commits (and therefore before
+            # the post-commit lifecycle hook below): a failed comment write
+            # rolls back the whole transition and the hook never fires.
+            comment_id = None
+            if reason and reason_comment_author:
+                comment_id = add_comment(
+                    conn, task_id, reason_comment_author, f"BLOCKED: {reason}"
+                )
+            if receipt_capture is not None:
+                _stage_receipt(
+                    conn,
+                    receipt_capture,
+                    LifecycleReceipt(
+                        operation="block",
+                        task_id=task_id,
+                        prior_status=cur_row["status"],
+                        final_status=landed_status,
+                        newly_committed=True,
+                        run_id=run_id,
+                        event_id=event_id,
+                        comment_id=comment_id,
+                    ),
+                )
+        # Fresh task read inside the transaction; the hook itself fires only
+        # after COMMIT succeeds (shared post-commit tail below) on EVERY
+        # routing branch — a failed or rolled-back commit fires no hook.
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -6701,18 +7517,12 @@ def block_task(
 
 
 def redact_review_value(value: Any) -> Any:
-    """Redact secrets at the domain boundary for durable review handoffs."""
-    if isinstance(value, str):
-        from agent.redact import redact_sensitive_text
+    """Redact secrets at the domain boundary for durable review handoffs.
 
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, dict):
-        return {key: redact_review_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_review_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_review_value(item) for item in value)
-    return value
+    Compatibility alias over :func:`canonicalize_durable_value` — the shared
+    canonicalizer every durable text write routes through.
+    """
+    return canonicalize_durable_value(value)
 
 
 def request_review(
@@ -6726,6 +7536,7 @@ def request_review(
     expected_status: Optional[str] = None,
     force: bool = False,
     with_reason: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -6754,6 +7565,7 @@ def request_review(
     ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
     diagnostic string on failure, ``None`` on success.
     """
+    _clear_receipt_capture(conn, receipt_capture)
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
@@ -6887,7 +7699,7 @@ def request_review(
             )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
-        _append_event(
+        event_id = _append_event(
             conn,
             task_id,
             "review_requested",
@@ -6898,6 +7710,20 @@ def request_review(
             },
             run_id=run_id,
         )
+        if receipt_capture is not None:
+            _stage_receipt(
+                conn,
+                receipt_capture,
+                LifecycleReceipt(
+                    operation="request_review",
+                    task_id=task_id,
+                    prior_status=trow["status"],
+                    final_status="review",
+                    newly_committed=True,
+                    run_id=run_id,
+                    event_id=event_id,
+                ),
+            )
     return _ret(True)
 
 
@@ -7146,6 +7972,7 @@ def unblock_task(
     expected_block_kind: Optional[str] = None,
     reason: Optional[str] = None,
     reason_comment_author: Optional[str] = None,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -7179,6 +8006,7 @@ def unblock_task(
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    _clear_receipt_capture(conn, receipt_capture)
     # An unknown guard value would never match any row and read as a
     # mismatch; a typo'd caller must fail loudly instead. ``dependency`` is
     # rejected here too — see VALID_UNBLOCK_EXPECTED_KINDS.
@@ -7190,6 +8018,10 @@ def unblock_task(
             f"expected_block_kind must be one of "
             f"{sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
         )
+    # Domain-boundary canonicalization (canonical-return policy): the reason
+    # lands on the ``unblocked`` event payload and the transactional
+    # ``UNBLOCK:`` comment — mask secrets once here.
+    reason = canonicalize_durable_text(reason) if reason is not None else None
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
@@ -7242,8 +8074,9 @@ def unblock_task(
             return False
         # Same-transaction reason comment (guarded CLI path): a failed
         # write here rolls back the status flip and the event below.
+        comment_id: Optional[int] = None
         if reason and reason_comment_author:
-            add_comment(
+            comment_id = add_comment(
                 conn, task_id, reason_comment_author, f"UNBLOCK: {reason}"
             )
         payload: Optional[dict] = (
@@ -7256,7 +8089,21 @@ def unblock_task(
             # the event itself, not only in the (deletable) comment stream.
             payload = dict(payload or {})
             payload["reason"] = reason
-        _append_event(conn, task_id, "unblocked", payload)
+        event_id = _append_event(conn, task_id, "unblocked", payload)
+        if receipt_capture is not None:
+            _stage_receipt(
+                conn,
+                receipt_capture,
+                LifecycleReceipt(
+                    operation="unblock",
+                    task_id=task_id,
+                    prior_status=current["status"] if current else None,
+                    final_status=new_status,
+                    newly_committed=True,
+                    event_id=event_id,
+                    comment_id=comment_id,
+                ),
+            )
         return True
 
 
@@ -12449,3 +13296,199 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Task snapshot — one consistent read for CLI show / model tool / dashboard
+# ---------------------------------------------------------------------------
+
+TASK_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+@contextlib.contextmanager
+def read_txn(conn: sqlite3.Connection):
+    """Context manager for a consistent multi-statement read.
+
+    Under WAL (the kanban default) a deferred transaction pins its read
+    snapshot when the first statement inside it runs; every later read in
+    the block then sees that same point in time even while concurrent
+    writers commit. Reentrant: a caller already inside a transaction keeps
+    its existing snapshot (a second ``BEGIN`` would raise), so composed
+    readers like :func:`build_task_snapshot` can run under an outer
+    ``read_txn`` or ``write_txn`` unchanged.
+    """
+    # Reentrant passthrough only on an exact True: UNKNOWN telemetry
+    # (missing/raising/non-boolean) opens its own transaction so the
+    # closing boundary below can fail closed instead of silently handing
+    # the caller an unproven snapshot.
+    entry_state, _ = _probe_in_transaction(conn)
+    if entry_state is True:
+        yield conn
+        return
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException as body_exc:  # noqa: BLE001 -- interrupt-safe boundary
+        # Read-only transaction: nothing to persist, but closure must still
+        # be PROVEN. _close_transaction_for_failure applies the same rule as
+        # the write boundary: accept the benign no-active-transaction signal
+        # (SQLite auto-rolled-back already, e.g. on I/O error) only when
+        # ``conn.in_transaction`` corroborates it, and never trust a
+        # ROLLBACK that returns while the transaction is still open. An
+        # unproven closure escalates instead of re-raising the body failure
+        # as an ordinary (falsely closed) error.
+        cleanup_failure = _close_transaction_for_failure(conn)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "read transaction failed and rollback cleanup could not "
+                f"prove the snapshot closed (cleanup: {cleanup_failure!r}); "
+                "the connection may still hold the open read transaction"
+            ) from body_exc
+        raise
+    cleanup_failure = _close_transaction_for_failure(conn)
+    if cleanup_failure is not None:
+        # Never return the read result over an unproven boundary: the
+        # connection may still hold the open transaction, pinning a stale
+        # snapshot and poisoning the next BEGIN on this connection.
+        raise TransactionOutcomeUnknownError(
+            "read completed but rollback cleanup could not prove the "
+            f"snapshot closed (cleanup: {cleanup_failure!r}); the "
+            "connection may still hold the open read transaction"
+        ) from cleanup_failure
+
+
+@dataclass
+class KanbanTaskSnapshot:
+    """One task's full durable state captured at a single point in time.
+
+    Built by :func:`build_task_snapshot` under one :func:`read_txn`, so the
+    task row, graph links, comments, events, runs, and latest summary are
+    mutually consistent — a concurrent commit landing mid-build cannot
+    produce an envelope that mixes two board states (e.g. a ``ready`` task
+    row alongside the concurrent claim's run).
+
+    ``to_dict`` is the shared serializer for every read surface (CLI
+    ``show --json``, the ``kanban_show`` model tool, the dashboard task
+    endpoint). It preserves the legacy ``show --json`` envelope
+    byte-compatibly and adds only new keys: ``schema_version``, the
+    authoritative ``block_kind`` / ``block_recurrences`` /
+    ``current_run_id`` on the task, and stable rowids on comments/events.
+    """
+
+    task: Task
+    parents: list[str]
+    children: list[str]
+    comments: list[Comment]
+    events: list[Event]
+    runs: list[Run]
+    latest_summary: Optional[str]
+    schema_version: int = TASK_SNAPSHOT_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        t = self.task
+        return {
+            "schema_version": self.schema_version,
+            "task": {
+                "id": t.id,
+                "title": t.title,
+                "body": t.body,
+                "assignee": t.assignee,
+                "status": t.status,
+                "priority": t.priority,
+                "tenant": t.tenant,
+                "workspace_kind": t.workspace_kind,
+                "workspace_path": t.workspace_path,
+                "branch_name": t.branch_name,
+                "project_id": t.project_id,
+                "created_by": t.created_by,
+                "created_at": t.created_at,
+                "started_at": t.started_at,
+                "completed_at": t.completed_at,
+                "result": t.result,
+                # Legacy normalization: NULL and [] both serialize as [].
+                "skills": list(t.skills) if t.skills else [],
+                "max_retries": t.max_retries,
+                "model_override": t.model_override,
+                "provider_override": t.provider_override,
+                "session_id": t.session_id,
+                "workflow_template_id": t.workflow_template_id,
+                "current_step_key": t.current_step_key,
+                # Additive authoritative lifecycle fields (schema_version 1).
+                "block_kind": t.block_kind,
+                "block_recurrences": t.block_recurrences,
+                "current_run_id": t.current_run_id,
+            },
+            "latest_summary": self.latest_summary,
+            "parents": list(self.parents),
+            "children": list(self.children),
+            "comments": [
+                {
+                    "id": c.id,
+                    "author": c.author,
+                    "body": c.body,
+                    "created_at": c.created_at,
+                }
+                for c in self.comments
+            ],
+            "events": [
+                {
+                    "id": e.id,
+                    "kind": e.kind,
+                    "payload": e.payload,
+                    "created_at": e.created_at,
+                    "run_id": e.run_id,
+                }
+                for e in self.events
+            ],
+            "runs": [
+                {
+                    "id": r.id,
+                    "profile": r.profile,
+                    "step_key": r.step_key,
+                    "status": r.status,
+                    "outcome": r.outcome,
+                    "summary": r.summary,
+                    "error": r.error,
+                    "metadata": r.metadata,
+                    "worker_pid": r.worker_pid,
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
+                }
+                for r in self.runs
+            ],
+        }
+
+
+def build_task_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_state_type: Optional[str] = None,
+    run_state_name: Optional[str] = None,
+) -> Optional[KanbanTaskSnapshot]:
+    """Capture a task's full state under one consistent read transaction.
+
+    Returns ``None`` for an unknown task id. ``run_state_type`` /
+    ``run_state_name`` pass through to :func:`list_runs` for the CLI's
+    run-state time-travel filter; all other collections are always
+    complete (no truncation — surface-level caps are the consumer's
+    decision, applied to the serialized form).
+    """
+    with read_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None:
+            return None
+        return KanbanTaskSnapshot(
+            task=task,
+            parents=parent_ids(conn, task_id),
+            children=child_ids(conn, task_id),
+            comments=list_comments(conn, task_id),
+            events=list_events(conn, task_id),
+            runs=list_runs(
+                conn,
+                task_id,
+                state_type=run_state_type,
+                state_name=run_state_name,
+            ),
+            latest_summary=latest_summary(conn, task_id),
+        )
