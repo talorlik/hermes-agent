@@ -43,12 +43,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Cap for the unified diff injected into the prompt.
+# Prompt-injection caps: unified diff, and new-output block (mirrors the 8k context_from truncation
+# in cron/scheduler.py). Then bounded-GET limits for monitor_url sources.
 MAX_DIFF_CHARS = 4000
-# Cap for the new-output block injected into the prompt (mirrors the 8k
-# context_from truncation in cron/scheduler.py).
 MAX_OUTPUT_CHARS = 8000
-# Bounded GET limits for monitor_url sources.
 URL_TIMEOUT_SECONDS = 30
 MAX_URL_BYTES = 262_144  # 256 KiB
 
@@ -83,11 +81,7 @@ def build_monitor_diff(old: str, new: str) -> str:
     """Unified diff of old vs new monitor output, capped at MAX_DIFF_CHARS."""
     diff = "\n".join(
         difflib.unified_diff(
-            old.splitlines(),
-            new.splitlines(),
-            fromfile="previous",
-            tofile="current",
-            lineterm="",
+            old.splitlines(), new.splitlines(), fromfile="previous", tofile="current", lineterm="",
         )
     )
     if len(diff) > MAX_DIFF_CHARS:
@@ -128,30 +122,31 @@ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
         req = urllib.request.Request(url, headers={"User-Agent": "hermes-cron-monitor"})
         with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as resp:  # nosec B310 — scheme checked above
             body = resp.read(MAX_URL_BYTES + 1)
-        if len(body) > MAX_URL_BYTES:
-            body = body[:MAX_URL_BYTES]
-        return True, body.decode("utf-8", errors="replace")
+        return True, body[:MAX_URL_BYTES].decode("utf-8", errors="replace")
     except Exception as exc:
         return False, f"monitor_url fetch failed: {exc}"
 
 
+def _field(job: dict, key: str) -> str:
+    return (job.get(key) or "").strip()
+
+
 def _run_monitor_source(job: dict) -> tuple[bool, str]:
     """Run the job's monitor source (script or URL). Returns (ok, output)."""
-    monitor_script = (job.get("monitor_script") or "").strip()
+    monitor_script = _field(job, "monitor_script")
     if monitor_script:
         # Same containment + interpreter rules as the existing `script` field.
-        from cron.scheduler import _run_job_script
+        from cron.scheduler_script import _run_job_script
 
-        workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(monitor_script, workdir=workdir)
-    monitor_url = (job.get("monitor_url") or "").strip()
+        return _run_job_script(monitor_script, workdir=_field(job, "workdir") or None)
+    monitor_url = _field(job, "monitor_url")
     if monitor_url:
         return _fetch_monitor_url(monitor_url)
     return False, "monitor job has neither monitor_script nor monitor_url"
 
 
 def job_has_monitor(job: dict) -> bool:
-    return bool((job.get("monitor_script") or "").strip() or (job.get("monitor_url") or "").strip())
+    return bool(_field(job, "monitor_script") or _field(job, "monitor_url"))
 
 
 def check_monitor(job: dict) -> MonitorOutcome:
@@ -199,20 +194,19 @@ def check_monitor(job: dict) -> MonitorOutcome:
     if len(shown_output) > MAX_OUTPUT_CHARS:
         shown_output = shown_output[:MAX_OUTPUT_CHARS] + "\n... [output truncated]"
 
+    current = f"### Current output\n\n```\n{shown_output}\n```"
     if first_run:
         context_block = (
             "## Monitor Baseline (first run)\n\n"
             "This is the first observation of the monitored source — there is "
-            "no previous output to diff against.\n\n"
-            f"### Current output\n\n```\n{shown_output}\n```"
+            "no previous output to diff against.\n\n" + current
         )
     else:
         diff = build_monitor_diff(old_output, output)
         context_block = (
             "## MONITOR CHANGE DETECTED\n\n"
             "The monitored source's output changed since the last run.\n\n"
-            f"### Diff (previous → current)\n\n```diff\n{diff}\n```\n\n"
-            f"### Current output\n\n```\n{shown_output}\n```"
+            f"### Diff (previous → current)\n\n```diff\n{diff}\n```\n\n" + current
         )
 
     return MonitorOutcome(

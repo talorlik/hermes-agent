@@ -128,7 +128,8 @@ def test_plain_tuple_without_returncode_keeps_legacy_semantics():
 
 
 def test_run_job_script_surfaces_exit_code(tmp_path, monkeypatch):
-    import cron.scheduler as scheduler
+    # The script runner lives in cron.scheduler_script since the upstream decomposition.
+    import cron.scheduler_script as scheduler_script
 
     home = tmp_path / "hermes-home"
     scripts = home / "scripts"
@@ -137,7 +138,7 @@ def test_run_job_script_surfaces_exit_code(tmp_path, monkeypatch):
     script = scripts / "defer.sh"
     script.write_text("#!/bin/bash\necho 'busy: lock held'\nexit 75\n")
 
-    result = scheduler._run_job_script(str(script))
+    result = scheduler_script._run_job_script(str(script))
     ok, output = result  # 2-tuple unpack contract must survive
     assert ok is False
     assert getattr(result, "returncode", None) == 75
@@ -149,7 +150,8 @@ def test_run_job_script_surfaces_exit_code(tmp_path, monkeypatch):
 
 
 def _defer_script_result():
-    from cron.scheduler import ScriptResult
+    # ScriptResult is defined in cron.outcomes; the runner imports it from there.
+    from cron.outcomes import ScriptResult
 
     return ScriptResult(
         False,

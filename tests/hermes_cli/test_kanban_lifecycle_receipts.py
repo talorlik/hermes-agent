@@ -39,6 +39,14 @@ from typing import Any, Optional
 
 import pytest
 
+# Every test imports ``kanban_db`` (kb) and ``kanban_db_connect`` (kbc) LOCALLY:
+# other kanban test modules wipe ``hermes_cli*`` from ``sys.modules``, so a
+# module-level import here would be a stale copy and monkeypatching it would
+# not reach the ``write_txn`` the fresh ``kanban_db`` actually calls. Boundary
+# helpers (``_execute_boundary_with_retry``, ``_check_file_length_invariant``)
+# are defined in ``kanban_db_connect`` (``kanban_db`` only re-exports them), so
+# fault injection patches ``kbc``.
+
 ROOT = Path(__file__).parents[2]
 
 RECEIPT_KEYS = {
@@ -273,12 +281,13 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn = kb.connect(tmp_path / "raw-outer.db")
+        conn = kbc.connect(tmp_path / "raw-outer.db")
         try:
             tid = kb.create_task(conn, title="raw outer")
             capture = kb.LifecycleReceiptCapture()
@@ -303,12 +312,13 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn = kb.connect(tmp_path / "release-failure.db")
+        conn = kbc.connect(tmp_path / "release-failure.db")
         connection_type = type(conn)
         original_execute = connection_type.execute
         failed = False
@@ -344,13 +354,14 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn_a = kb.connect(tmp_path / "reuse-a.db")
-        conn_b = kb.connect(tmp_path / "reuse-b.db")
+        conn_a = kbc.connect(tmp_path / "reuse-a.db")
+        conn_b = kbc.connect(tmp_path / "reuse-b.db")
         try:
             tid_a = kb.create_task(conn_a, title="reuse A")
             tid_b = kb.create_task(conn_b, title="reuse B")
@@ -388,12 +399,13 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn = kb.connect(home / "kanban" / "boards" / "default" / "kanban.db")
+        conn = kbc.connect(home / "kanban" / "boards" / "default" / "kanban.db")
         try:
             tid = kb.create_task(conn, title="savepoint receipt")
             capture = kb.LifecycleReceiptCapture()
@@ -425,13 +437,14 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn_a = kb.connect(tmp_path / "a.db")
-        conn_b = kb.connect(tmp_path / "b.db")
+        conn_a = kbc.connect(tmp_path / "a.db")
+        conn_b = kbc.connect(tmp_path / "b.db")
         try:
             tid = kb.create_task(conn_a, title="connection A")
             capture = kb.LifecycleReceiptCapture()
@@ -460,11 +473,12 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         path_a = tmp_path / "a.db"
         path_b = tmp_path / "b.db"
-        conn_a = kb.connect(path_a)
-        conn_b = kb.connect(path_b)
+        conn_a = kbc.connect(path_a)
+        conn_b = kbc.connect(path_b)
         try:
             with kb.write_txn(conn_a):
                 with kb.write_txn(conn_b):
@@ -480,11 +494,12 @@ class TestReceiptTransactionBoundaries:
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         kb._INITIALIZED_PATHS.clear()
         kb.init_db()
         capture = kb.LifecycleReceiptCapture()
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="nested receipt")
             with pytest.raises(RuntimeError, match="rollback outer"):
                 with kb.write_txn(conn):
@@ -507,11 +522,12 @@ class TestReceiptTransactionBoundaries:
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         kb._INITIALIZED_PATHS.clear()
         kb.init_db()
         capture = kb.LifecycleReceiptCapture()
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="capture reuse")
             kb.add_comment(conn, tid, "lt4", "first", receipt_capture=capture)
             assert capture.receipt is not None
@@ -529,12 +545,13 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn = kb.connect(tmp_path / "interrupt-nested.db")
+        conn = kbc.connect(tmp_path / "interrupt-nested.db")
         try:
             tid = kb.create_task(conn, title="nested interrupt")
             capture = kb.LifecycleReceiptCapture()
@@ -573,12 +590,13 @@ class TestReceiptTransactionBoundaries:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        conn = kb.connect(tmp_path / "interrupt-outer.db")
+        conn = kbc.connect(tmp_path / "interrupt-outer.db")
         try:
             tid = kb.create_task(conn, title="outer interrupt")
             capture = kb.LifecycleReceiptCapture()
@@ -959,12 +977,13 @@ class TestTransactionOutcomeContract:
 
     def _connect(self, tmp_path: Path, monkeypatch, name: str):
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        return kb.connect(tmp_path / name)
+        return kbc.connect(tmp_path / name)
 
     def test_outer_rollback_interrupt_raises_outcome_unknown(
         self, tmp_path: Path, monkeypatch
@@ -1116,10 +1135,11 @@ class TestTransactionOutcomeContract:
         held the open transaction from the executed BEGIN.
         """
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         conn = self._connect(tmp_path, monkeypatch, "outcome-g.db")
         connection_type = type(conn)
-        original_boundary = kb._execute_boundary_with_retry
+        original_boundary = kbc._execute_boundary_with_retry
         original_execute, fail_first_rollback = self._failing_rollback_patch(
             conn, connection_type
         )
@@ -1131,14 +1151,14 @@ class TestTransactionOutcomeContract:
 
         try:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", begin_then_interrupt
+                kbc, "_execute_boundary_with_retry", begin_then_interrupt
             )
             monkeypatch.setattr(connection_type, "execute", fail_first_rollback)
             with pytest.raises(BaseException) as excinfo:
                 with kb.write_txn(conn):
                     raise AssertionError("body must not run")
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             monkeypatch.setattr(connection_type, "execute", original_execute)
             # Closure was not proved: the interrupt escalates instead of
@@ -1152,7 +1172,7 @@ class TestTransactionOutcomeContract:
                 conn.execute("SELECT 1")
         finally:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             monkeypatch.setattr(connection_type, "execute", original_execute)
             conn.close()
@@ -1168,10 +1188,11 @@ class TestTransactionOutcomeContract:
         mutation visible.
         """
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         conn = self._connect(tmp_path, monkeypatch, "outcome-h.db")
         connection_type = type(conn)
-        original_boundary = kb._execute_boundary_with_retry
+        original_boundary = kbc._execute_boundary_with_retry
         original_execute, fail_first_rollback = self._failing_rollback_patch(
             conn, connection_type
         )
@@ -1186,7 +1207,7 @@ class TestTransactionOutcomeContract:
         try:
             tid = kb.create_task(conn, title="outcome H")
             capture = kb.LifecycleReceiptCapture()
-            monkeypatch.setattr(kb, "_execute_boundary_with_retry", fail_commit)
+            monkeypatch.setattr(kbc, "_execute_boundary_with_retry", fail_commit)
             monkeypatch.setattr(connection_type, "execute", fail_first_rollback)
             with pytest.raises(BaseException) as excinfo:
                 kb.add_comment(
@@ -1197,7 +1218,7 @@ class TestTransactionOutcomeContract:
                     receipt_capture=capture,
                 )
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             monkeypatch.setattr(connection_type, "execute", original_execute)
             assert isinstance(excinfo.value, kb.TransactionOutcomeUnknownError)
@@ -1213,7 +1234,7 @@ class TestTransactionOutcomeContract:
             ).fetchone()[0] == 0
         finally:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             monkeypatch.setattr(connection_type, "execute", original_execute)
             conn.close()
@@ -1265,10 +1286,11 @@ class TestTransactionOutcomeContract:
         real transaction stayed open with the mutation visible.
         """
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         conn = self._connect(tmp_path, monkeypatch, f"swallow-{boundary}.db")
         connection_type = type(conn)
-        original_boundary = kb._execute_boundary_with_retry
+        original_boundary = kbc._execute_boundary_with_retry
         original_execute, swallow_first_rollback = (
             self._swallowing_rollback_patch(conn, connection_type)
         )
@@ -1290,11 +1312,11 @@ class TestTransactionOutcomeContract:
             capture = kb.LifecycleReceiptCapture()
             if boundary == "begin":
                 monkeypatch.setattr(
-                    kb, "_execute_boundary_with_retry", begin_then_interrupt
+                    kbc, "_execute_boundary_with_retry", begin_then_interrupt
                 )
             elif boundary == "commit":
                 monkeypatch.setattr(
-                    kb, "_execute_boundary_with_retry", fail_commit
+                    kbc, "_execute_boundary_with_retry", fail_commit
                 )
             monkeypatch.setattr(
                 connection_type, "execute", swallow_first_rollback
@@ -1322,7 +1344,7 @@ class TestTransactionOutcomeContract:
                         )
                         raise ValueError("original body failure")
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             monkeypatch.setattr(connection_type, "execute", original_execute)
             # Closure was never proven: escalate to the explicit unknown
@@ -1347,7 +1369,7 @@ class TestTransactionOutcomeContract:
                 conn.execute("SELECT 1")
         finally:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             monkeypatch.setattr(connection_type, "execute", original_execute)
             conn.close()
@@ -1443,6 +1465,7 @@ class TestTransactionOutcomeContract:
         mutation was already durably committed.
         """
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         db_path = tmp_path / "outcome-j.db"
         conn = self._connect(tmp_path, monkeypatch, "outcome-j.db")
@@ -1507,7 +1530,7 @@ class TestTransactionOutcomeContract:
             assert not conn.in_transaction
             # The COMMIT preceded publication: both mutations are durable
             # on a fresh connection; no fabricated receipt exists.
-            fresh = kb.connect(db_path)
+            fresh = kbc.connect(db_path)
             try:
                 assert fresh.execute(
                     "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
@@ -1534,9 +1557,10 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         conn = self._connect(tmp_path, monkeypatch, "outcome-b.db")
-        original_boundary = kb._execute_boundary_with_retry
+        original_boundary = kbc._execute_boundary_with_retry
 
         def begin_then_interrupt(target, sql):
             original_boundary(target, sql)
@@ -1545,13 +1569,13 @@ class TestTransactionOutcomeContract:
 
         try:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", begin_then_interrupt
+                kbc, "_execute_boundary_with_retry", begin_then_interrupt
             )
             with pytest.raises(BaseException) as excinfo:
                 with kb.write_txn(conn):
                     raise AssertionError("body must not run")
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             # Cleanup proved closure, so the ORIGINAL interrupt re-raises.
             assert isinstance(excinfo.value, KeyboardInterrupt)
@@ -1563,7 +1587,7 @@ class TestTransactionOutcomeContract:
                 conn.execute("SELECT 1")
         finally:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             conn.close()
 
@@ -1571,10 +1595,11 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         db_path = tmp_path / "outcome-c.db"
         conn = self._connect(tmp_path, monkeypatch, "outcome-c.db")
-        original_boundary = kb._execute_boundary_with_retry
+        original_boundary = kbc._execute_boundary_with_retry
 
         def commit_then_interrupt(target, sql):
             original_boundary(target, sql)
@@ -1585,7 +1610,7 @@ class TestTransactionOutcomeContract:
             tid = kb.create_task(conn, title="outcome C commit")
             capture = kb.LifecycleReceiptCapture()
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", commit_then_interrupt
+                kbc, "_execute_boundary_with_retry", commit_then_interrupt
             )
             with pytest.raises(BaseException) as excinfo:
                 kb.add_comment(
@@ -1596,7 +1621,7 @@ class TestTransactionOutcomeContract:
                     receipt_capture=capture,
                 )
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             # COMMIT executed before the interrupt: never claim rollback,
             # never publish success -- explicit unknown, interrupt chained.
@@ -1608,7 +1633,7 @@ class TestTransactionOutcomeContract:
             assert not conn.in_transaction
             # Authoritative readback on a FRESH connection: the mutation is
             # durable even though no receipt was published.
-            fresh = kb.connect(db_path)
+            fresh = kbc.connect(db_path)
             try:
                 assert fresh.execute(
                     "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
@@ -1618,7 +1643,7 @@ class TestTransactionOutcomeContract:
                 fresh.close()
         finally:
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             conn.close()
 
@@ -1626,6 +1651,7 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         db_path = tmp_path / "outcome-c2.db"
         conn = self._connect(tmp_path, monkeypatch, "outcome-c2.db")
@@ -1637,7 +1663,7 @@ class TestTransactionOutcomeContract:
             tid = kb.create_task(conn, title="outcome C durability")
             capture = kb.LifecycleReceiptCapture()
             monkeypatch.setattr(
-                kb, "_check_file_length_invariant", interrupt_durability
+                kbc, "_check_file_length_invariant", interrupt_durability
             )
             with pytest.raises(BaseException) as excinfo:
                 kb.add_comment(
@@ -1656,7 +1682,7 @@ class TestTransactionOutcomeContract:
             assert capture.receipt is None
             assert capture._active_connection_id is None
             assert id(conn) not in kb._RECEIPT_TXNS
-            fresh = kb.connect(db_path)
+            fresh = kbc.connect(db_path)
             try:
                 assert fresh.execute(
                     "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
@@ -1671,6 +1697,7 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         conn = self._connect(tmp_path, monkeypatch, "outcome-c3.db")
 
@@ -1680,7 +1707,7 @@ class TestTransactionOutcomeContract:
         try:
             tid = kb.create_task(conn, title="outcome C ordinary")
             monkeypatch.setattr(
-                kb, "_check_file_length_invariant", torn_extend
+                kbc, "_check_file_length_invariant", torn_extend
             )
             with pytest.raises(kb.TransactionOutcomeUnknownError) as excinfo:
                 kb.add_comment(conn, tid, "reviewer", "durable, torn check")
@@ -1694,6 +1721,7 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         db_path = tmp_path / "outcome-d1.db"
         conn = self._connect(tmp_path, monkeypatch, "outcome-d1.db")
@@ -1740,7 +1768,7 @@ class TestTransactionOutcomeContract:
             assert capture.receipt is None
             assert capture._active_connection_id is None
             # No phantom durability on a fresh connection.
-            fresh = kb.connect(db_path)
+            fresh = kbc.connect(db_path)
             try:
                 assert fresh.execute(
                     "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
@@ -1761,6 +1789,7 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         db_path = tmp_path / "outcome-d2.db"
         conn = self._connect(tmp_path, monkeypatch, "outcome-d2.db")
@@ -1808,7 +1837,7 @@ class TestTransactionOutcomeContract:
             # The invalidated transaction must never reach COMMIT.
             assert not any(s.strip().upper().startswith("COMMIT") for s in statements)
             assert id(conn) not in kb._RECEIPT_TXNS
-            fresh = kb.connect(db_path)
+            fresh = kbc.connect(db_path)
             try:
                 assert fresh.execute(
                     "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
@@ -1826,6 +1855,7 @@ class TestTransactionOutcomeContract:
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         db_path = tmp_path / "outcome-e.db"
         conn = self._connect(tmp_path, monkeypatch, "outcome-e.db")
@@ -1865,7 +1895,7 @@ class TestTransactionOutcomeContract:
             assert capture.receipt is None
             assert capture._active_connection_id is None
             assert id(conn) not in kb._RECEIPT_TXNS
-            fresh = kb.connect(db_path)
+            fresh = kbc.connect(db_path)
             try:
                 assert fresh.execute(
                     "SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
@@ -1888,17 +1918,19 @@ class TestDependencyBlockHookOrdering:
 
     def _connect(self, tmp_path: Path, monkeypatch, name: str):
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        return kb.connect(tmp_path / name)
+        return kbc.connect(tmp_path / name)
 
     def test_no_hook_when_dependency_block_commit_fails(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         conn = self._connect(tmp_path, monkeypatch, "dep-hook-fail.db")
         try:
@@ -1910,7 +1942,7 @@ class TestDependencyBlockHookOrdering:
                 "_fire_kanban_lifecycle_hook",
                 lambda event, task_id, **fields: hooks.append(event),
             )
-            original_boundary = kb._execute_boundary_with_retry
+            original_boundary = kbc._execute_boundary_with_retry
 
             def fail_commit(target, sql):
                 if sql == "COMMIT":
@@ -1918,14 +1950,14 @@ class TestDependencyBlockHookOrdering:
                 return original_boundary(target, sql)
 
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", fail_commit
+                kbc, "_execute_boundary_with_retry", fail_commit
             )
             with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
                 kb.block_task(
                     conn, tid, reason="waiting on parent", kind="dependency"
                 )
             monkeypatch.setattr(
-                kb, "_execute_boundary_with_retry", original_boundary
+                kbc, "_execute_boundary_with_retry", original_boundary
             )
             # The transition rolled back, so the hook must never have fired.
             assert hooks == []
@@ -2067,12 +2099,13 @@ class TestOwnerTelemetryFailClosed:
 
     def _connect(self, tmp_path: Path, monkeypatch, name: str):
         from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
 
         home = _home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
         kb._INITIALIZED_PATHS.clear()
-        return kb.connect(tmp_path / name)
+        return kbc.connect(tmp_path / name)
 
     @staticmethod
     def _staged_receipt(kb, tid: str):

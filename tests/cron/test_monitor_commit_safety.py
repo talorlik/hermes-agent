@@ -99,7 +99,12 @@ def _install_agent_stubs(monkeypatch, observed: dict, *, agent_raises=False):
             "api_mode": "chat_completions",
         },
     )
-    monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
+    # _resolve_origin moved to cron.scheduler_delivery in the upstream decomposition and
+    # is only called from that module; _resolve_delivery_target is re-exported into
+    # cron.scheduler and called through its globals, so it is patched where it is looked up.
+    import cron.scheduler_delivery as sched_delivery
+
+    monkeypatch.setattr(sched_delivery, "_resolve_origin", lambda job: None)
     monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
     monkeypatch.setattr(
         sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None

@@ -87,13 +87,18 @@ def test_failed_send_leaves_pending_outbox_with_attempt_and_incident(
     assert history[0]["status"] == "failed"
     assert "unreachable" in history[0]["error"]
 
-    # Delivery-only failure is incident-visible while the job itself is OK.
+    # Delivery-only failure is incident-visible while the agent run itself succeeded.
+    # Upstream (8fd76fd1d6) records a successful run with an undelivered result as
+    # ``last_status = "delivery_failed"`` rather than "ok" so the CLI/tool surfaces can
+    # distinguish "ran but nobody received it" from a clean run; the failure streak is
+    # untouched because the job logic did not fail.
     assert I.count_incidents() == 1
     import cron.jobs as J
 
     refreshed = J.get_job(outbox_env["job_id"])
-    assert refreshed["last_status"] == "ok"
+    assert refreshed["last_status"] == "delivery_failed"
     assert refreshed["last_delivery_error"]
+    assert not refreshed.get("failure_streak")
 
 
 def test_successful_send_marks_outbox_delivered(outbox_env, monkeypatch):

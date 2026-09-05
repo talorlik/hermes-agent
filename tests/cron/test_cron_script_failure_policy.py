@@ -535,7 +535,9 @@ def test_script_runner_forces_strict_redaction_when_global_setting_is_disabled(
     tmp_path, monkeypatch
 ):
     import agent.redact as redact
-    from cron.scheduler import _run_job_script
+    # The script runner lives in cron.scheduler_script since the upstream decomposition;
+    # cron.scheduler only re-exports the claim-heartbeat wrapper.
+    from cron.scheduler_script import _run_job_script
 
     hermes_home = tmp_path / ".hermes"
     scripts_dir = hermes_home / "scripts"
@@ -583,7 +585,7 @@ def test_script_runner_redacts_credentials_from_early_path_failures(
     tmp_path, monkeypatch, script_path, secrets
 ):
     import agent.redact as redact
-    from cron.scheduler import _run_job_script
+    from cron.scheduler_script import _run_job_script
 
     hermes_home = tmp_path / ".hermes"
     (hermes_home / "scripts").mkdir(parents=True)
@@ -602,7 +604,7 @@ def test_script_runner_redacts_credentials_from_launch_exception(
     tmp_path, monkeypatch
 ):
     import agent.redact as redact
-    import cron.scheduler as scheduler
+    import cron.scheduler_script as scheduler_script
 
     hermes_home = tmp_path / ".hermes"
     scripts_dir = hermes_home / "scripts"
@@ -616,12 +618,12 @@ def test_script_runner_redacts_credentials_from_launch_exception(
         f"transport https://user:{url_password}@example.invalid/?token={query_token}"
     )
     monkeypatch.setattr(
-        scheduler.subprocess,
+        scheduler_script.subprocess,
         "Popen",
         MagicMock(side_effect=launch_error),
     )
 
-    success, output = scheduler._run_job_script("launch.py")
+    success, output = scheduler_script._run_job_script("launch.py")
 
     assert success is False
     assert "Script execution failed" in output
@@ -632,7 +634,7 @@ def test_script_runner_redacts_credentials_from_launch_exception(
 
 def test_script_runner_redacts_credentials_from_timeout_path(tmp_path, monkeypatch):
     import agent.redact as redact
-    import cron.scheduler as scheduler
+    import cron.scheduler_script as scheduler_script
 
     hermes_home = tmp_path / ".hermes"
     scripts_dir = hermes_home / "scripts"
@@ -642,22 +644,26 @@ def test_script_runner_redacts_credentials_from_timeout_path(tmp_path, monkeypat
     (scripts_dir / script_name).write_text("print('unused')\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
-    monkeypatch.setattr(scheduler, "_get_script_timeout", lambda: 1)
+    monkeypatch.setattr(scheduler_script, "_get_script_timeout", lambda: 1)
     monkeypatch.setattr(
-        scheduler.time,
+        scheduler_script.time,
         "monotonic",
         MagicMock(side_effect=[0.0, 0.0, 2.0]),
     )
-    monkeypatch.setattr(scheduler, "_terminate_cron_script_process", MagicMock())
-    monkeypatch.setattr(scheduler, "_drain_script_pipes", MagicMock())
+    # The deadline path calls _terminate_cron_script_tree, which short-circuits when
+    # proc.poll() is truthy (MagicMock), so only the fallback + drain need stubbing.
+    monkeypatch.setattr(scheduler_script, "_terminate_cron_script_process", MagicMock())
+    monkeypatch.setattr(scheduler_script, "_drain_script_pipes", MagicMock())
 
     proc = MagicMock()
-    proc.communicate.side_effect = scheduler.subprocess.TimeoutExpired(
+    proc.communicate.side_effect = scheduler_script.subprocess.TimeoutExpired(
         ["python", script_name], 0.1
     )
-    monkeypatch.setattr(scheduler.subprocess, "Popen", MagicMock(return_value=proc))
+    monkeypatch.setattr(
+        scheduler_script.subprocess, "Popen", MagicMock(return_value=proc)
+    )
 
-    success, output = scheduler._run_job_script(script_name)
+    success, output = scheduler_script._run_job_script(script_name)
 
     assert success is False
     assert "timed out after 1s" in output
@@ -667,7 +673,7 @@ def test_script_runner_redacts_credentials_from_timeout_path(tmp_path, monkeypat
 
 def test_script_runner_redaction_failure_emits_safe_constant(tmp_path, monkeypatch):
     import agent.redact as redact
-    import cron.scheduler as scheduler
+    import cron.scheduler_script as scheduler_script
 
     hermes_home = tmp_path / ".hermes"
     scripts_dir = hermes_home / "scripts"
@@ -680,10 +686,10 @@ def test_script_runner_redaction_failure_emits_safe_constant(tmp_path, monkeypat
         MagicMock(side_effect=RuntimeError("redactor unavailable")),
     )
 
-    success, output = scheduler._run_job_script("ok.py")
+    success, output = scheduler_script._run_job_script("ok.py")
 
     assert success is True
-    assert output == scheduler._CRON_SCRIPT_REDACTION_FAILURE
+    assert output == scheduler_script._CRON_SCRIPT_REDACTION_FAILURE
     assert "ordinary output" not in output
     assert "redactor unavailable" not in output
 
@@ -691,7 +697,7 @@ def test_script_runner_redaction_failure_emits_safe_constant(tmp_path, monkeypat
 def test_script_runner_redacts_credentials_when_path_resolution_fails(
     tmp_path, monkeypatch
 ):
-    from cron.scheduler import _run_job_script
+    from cron.scheduler_script import _run_job_script
 
     hermes_home = tmp_path / ".hermes"
     (hermes_home / "scripts").mkdir(parents=True)
@@ -710,13 +716,16 @@ def test_script_runner_contains_credential_bearing_hermes_home_failure(
     tmp_path, monkeypatch
 ):
     import cron.scheduler as scheduler
+    import cron.scheduler_script as scheduler_script
 
     secret = "home-query-secret-8675309"
     overlong_home = tmp_path / f"{'x' * 300}?token={secret}"
+    # The HERMES_HOME cache still lives on cron.scheduler; scheduler_script resolves
+    # the scripts directory through _sched._get_hermes_home(), so reset it there.
     monkeypatch.setattr(scheduler, "_hermes_home", None)
     monkeypatch.setenv("HERMES_HOME", str(overlong_home))
 
-    success, output = scheduler._run_job_script("job.py")
+    success, output = scheduler_script._run_job_script("job.py")
 
     assert success is False
     assert secret not in output

@@ -540,7 +540,7 @@ def test_guarded_block_passes_reason_comment_into_db_transaction(monkeypatch):
     from hermes_cli import kanban as cli
 
     calls: list[dict[str, object]] = []
-    monkeypatch.setattr(cli.kb, "connect_closing", lambda: contextlib.nullcontext(object()))
+    monkeypatch.setattr(cli.kbc, "connect_closing", lambda: contextlib.nullcontext(object()))
     monkeypatch.setattr(cli, "_profile_author", lambda: "tester")
     monkeypatch.setattr(cli, "_worker_run_id_for", lambda _task_id: None)
     monkeypatch.setattr(
@@ -582,7 +582,7 @@ def test_guarded_unblock_passes_reason_comment_into_db_transaction(monkeypatch):
     from hermes_cli import kanban as cli
 
     calls: list[dict[str, object]] = []
-    monkeypatch.setattr(cli.kb, "connect_closing", lambda: contextlib.nullcontext(object()))
+    monkeypatch.setattr(cli.kbc, "connect_closing", lambda: contextlib.nullcontext(object()))
     monkeypatch.setattr(cli, "_profile_author", lambda: "tester")
     monkeypatch.setattr(
         cli.kb,
@@ -690,7 +690,7 @@ def test_cmd_comment_forwards_if_absent_flag(monkeypatch):
 
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
-        cli.kb, "connect_closing", lambda: contextlib.nullcontext(object())
+        cli.kbc, "connect_closing", lambda: contextlib.nullcontext(object())
     )
     monkeypatch.setattr(
         cli.kb,

@@ -23,6 +23,8 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -65,7 +67,7 @@ class _InjectingConn:
 
 class TestSnapshotBuilder:
     def test_snapshot_has_version_and_authoritative_fields(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             task = kb.claim_task(conn, tid)
@@ -87,7 +89,7 @@ class TestSnapshotBuilder:
             assert snap2.task.block_recurrences == 1
 
     def test_snapshot_unknown_task_returns_none(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             assert kb.build_task_snapshot(conn, "t_nope") is None
 
     def test_snapshot_consistent_under_injected_concurrent_commit(
@@ -96,17 +98,17 @@ class TestSnapshotBuilder:
         """A commit landing between the builder's reads must not tear the
         envelope: a snapshot that says 'ready' cannot contain the
         concurrent claim's run, event, or comment."""
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
 
         def concurrent_claim():
-            with kb.connect_closing() as other:
+            with kbc.connect_closing() as other:
                 claimed = kb.claim_task(other, tid)
                 assert claimed is not None
                 kb.add_comment(other, tid, "alice", "racing comment")
 
-        with kb.connect_closing() as raw:
+        with kbc.connect_closing() as raw:
             proxy = _InjectingConn(raw, after_select=1, side_effect=concurrent_claim)
             snap = kb.build_task_snapshot(proxy, tid)
             assert snap is not None
@@ -118,12 +120,12 @@ class TestSnapshotBuilder:
         assert snap.runs == []
         assert not [c for c in snap.comments if c.body == "racing comment"]
         # ...and the injected commit really did land (sanity).
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             after = kb.get_task(conn, tid)
             assert after.status == "running"
 
     def test_snapshot_to_dict_exposes_stable_ids(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             assert kb.claim_task(conn, tid) is not None
@@ -150,12 +152,12 @@ class TestSnapshotBuilder:
 
 class TestCliShowConsumer:
     def _make_busy_task(self, n_extra_events: int = 60) -> str:
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="busy", assignee="alice")
             kb.recompute_ready(conn)
             assert kb.claim_task(conn, tid) is not None
             for i in range(n_extra_events):
-                kb.heartbeat_worker(conn, tid, note=f"hb {i}")
+                kbd.heartbeat_worker(conn, tid, note=f"hb {i}")
             kb.add_comment(conn, tid, "alice", "progress note")
             return tid
 
@@ -201,7 +203,7 @@ class TestCliShowConsumer:
 
     def test_show_json_never_truncates_events(self, kanban_home):
         tid = self._make_busy_task(n_extra_events=60)
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             total = len(kb.list_events(conn, tid))
         assert total > 55
         payload = json.loads(kc.run_slash(f"show {tid} --json"))
@@ -222,7 +224,7 @@ class TestCommentOrderContract:
     """
 
     def test_list_comments_declares_id_tiebreak(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="order contract")
             statements: list[str] = []
             conn.set_trace_callback(statements.append)
@@ -237,7 +239,7 @@ class TestCommentOrderContract:
     def test_same_second_comments_order_by_id_everywhere(
         self, kanban_home, monkeypatch
     ):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="same-second order")
             # Freeze the clock so all three comment rows share one
             # created_at second.
@@ -304,7 +306,7 @@ class TestReadTxnClosureContract:
         connection still held the open transaction -- pinning a stale
         snapshot and poisoning the next BEGIN on the connection.
         """
-        with kb.connect_closing() as raw:
+        with kbc.connect_closing() as raw:
             tid = kb.create_task(raw, title="closure")
             proxy = _RollbackClosureConn(raw, mode=mode)
             body_ran = False
@@ -345,7 +347,7 @@ class TestReadTxnClosureContract:
         """The benign auto-rollback signal stays accepted -- but only when
         ``in_transaction`` is False, corroborating that nothing is open.
         """
-        with kb.connect_closing() as raw:
+        with kbc.connect_closing() as raw:
             kb.create_task(raw, title="benign")
 
             class _AutoRolledBackConn(_RollbackClosureConn):

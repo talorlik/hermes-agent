@@ -461,6 +461,7 @@ class TestRealAgentInitExplicitEmptyToolsets:
     def _build_agent(self, monkeypatch, enabled_toolsets, discover_calls):
         import hermes_cli.plugins as plugins_mod
         import run_agent as run_agent_mod
+        from agent import process_bootstrap
 
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
         monkeypatch.setattr(
@@ -468,14 +469,22 @@ class TestRealAgentInitExplicitEmptyToolsets:
             "discover_plugins",
             lambda *a, **k: discover_calls.append("discover"),
         )
+        # The wire client is constructed via ``agent.process_bootstrap.OpenAI``
+        # (``run_agent.OpenAI`` is only a deprecated plugin-compat pointer that
+        # upstream CI's check_compat_pointers.py forbids in-tree code from using).
         monkeypatch.setattr(
-            run_agent_mod, "OpenAI", lambda **_kw: object(), raising=False
+            process_bootstrap, "OpenAI", lambda **_kw: object(), raising=False
         )
         if enabled_toolsets is None or len(enabled_toolsets) > 0:
             # The full/named catalog path is not under test here; keep the
-            # control cases fast and environment-independent.
+            # control cases fast and environment-independent. Upstream's
+            # agent_init._load_tools resolves the catalog through
+            # ``model_tools.get_tool_definitions`` (not a run_agent re-export),
+            # so that is the seam to stub.
+            import model_tools as model_tools_mod
+
             monkeypatch.setattr(
-                run_agent_mod,
+                model_tools_mod,
                 "get_tool_definitions",
                 lambda *a, **k: [
                     {"type": "function", "function": {"name": "stub_tool"}}
