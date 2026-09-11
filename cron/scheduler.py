@@ -42,6 +42,12 @@ from hermes_cli.config import (
     _expand_env_vars, load_config, resolve_cron_model_drift_defaults)
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from cron.outcomes import (
+    TRANSIENT_DEFER,
+    CronPreScriptDefer,
+    classify_script_result,
+    job_occurrence_key,
+)
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
@@ -1256,13 +1262,23 @@ def _run_no_agent_job(
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
     try:
-        ok, output = _run_job_script_with_claim_heartbeat(
+        script_result = _run_job_script_with_claim_heartbeat(
             job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
     except Exception as exc:
         logger.exception("Job '%s': script execution raised unexpectedly", job_id)
-        ok, output = False, f"Script execution failed: {exc}"
+        script_result = (False, f"Script execution failed: {exc}")
+    ok, output = script_result
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    script_outcome = classify_script_result(
+        ok,
+        output,
+        getattr(script_result, "returncode", None),
+        occurrence_key=job_occurrence_key(job),
+    )
+    if script_outcome.kind == TRANSIENT_DEFER:
+        return _deferred_script_result(job_id, job_name, script_outcome, now_iso)
+
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
 
     if not ok:
@@ -1963,6 +1979,29 @@ def _fail_closed_script_result(
     return False, failure_doc, "", FAIL_CLOSED_SCRIPT_FAILURE
 
 
+def _deferred_script_result(
+    job_id: str, job_name: str, outcome, now_iso: str,
+) -> tuple[bool, str, str, CronPreScriptDefer]:
+    """Build a typed transient result without reporting a script failure."""
+    defer = CronPreScriptDefer(
+        outcome.reason,
+        retry_after_seconds=outcome.retry_after_seconds,
+        occurrence_key=outcome.occurrence_key,
+    )
+    logger.info(
+        "Job '%s' (ID: %s): pre-script deferred (transient) — retry in %ss",
+        job_name, job_id, defer.retry_after_seconds,
+    )
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        "**Status:** deferred (transient)\n\n"
+        f"{defer.reason or 'No reason given by the pre-script.'}\n"
+    )
+    return False, doc, "", defer
+
+
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
@@ -2013,6 +2052,19 @@ def _prepare_job_prompt(
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path, cancel_event=cancel_event)
         _ran_ok, _script_output = prerun_script
+        prerun_outcome = classify_script_result(
+            _ran_ok,
+            _script_output,
+            getattr(prerun_script, "returncode", None),
+            occurrence_key=job_occurrence_key(job),
+        )
+        if prerun_outcome.kind == TRANSIENT_DEFER:
+            return _deferred_script_result(
+                job_id,
+                job_name,
+                prerun_outcome,
+                _hermes_now().strftime("%Y-%m-%d %H:%M:%S"),
+            ), None
         if not _ran_ok and script_failure_policy == "fail_closed":
             result = _fail_closed_script_result(job_id, job_name, _script_output)
             logger.error(

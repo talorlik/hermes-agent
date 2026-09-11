@@ -20,6 +20,7 @@ import threading
 import time
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from cron.outcomes import ScriptResult
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -426,8 +427,10 @@ def _run_job_script(
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return _redact_job_script_result(False, "\n".join(parts))
-        return _redact_job_script_result(True, stdout)
+            ok, text = _redact_job_script_result(False, "\n".join(parts))
+            return ScriptResult(ok, text, returncode=proc.returncode)
+        ok, text = _redact_job_script_result(True, stdout)
+        return ScriptResult(ok, text, returncode=proc.returncode)
     except Exception as exc:
         return _redact_job_script_result(False, f"Script execution failed: {exc}")
 
