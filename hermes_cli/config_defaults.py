@@ -2132,6 +2132,11 @@ DEFAULT_CONFIG = {
         # merge origin/<target> INTO it after leaving a pre-update-<stamp> tag; a conflict stops the
         # update cleanly. `hermes update --switch-branch` overrides to switch for one run.
         "parked_branch_strategy": "switch",
+        # Fork synchronization policy when origin/main carries commits that are not on the official
+        # upstream/main. ff_only preserves the conservative skip behavior. merge creates a recovery
+        # tag, merges upstream/main without rewriting fork history, validates later update stages,
+        # and pushes only after the merge succeeds.
+        "fork_sync_strategy": "ff_only",
         # Refresh an installed cua-driver during `hermes update` (best-effort, macOS only). Turn off
         # e.g. on non-admin accounts where /Applications isn't writable.
         "refresh_cua_driver": True,
