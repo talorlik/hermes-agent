@@ -54,7 +54,7 @@ def test_claim_idempotent_replay_is_same_claimer_only(
         "_fire_kanban_lifecycle_hook",
         lambda event, task_id, **_fields: hooks.append((event, task_id)),
     )
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="claim replay", assignee="dream-cron")
         first = kb.claim_task(
             conn,
@@ -105,11 +105,11 @@ def test_claim_idempotent_replay_serializes_concurrent_same_claimer(
     kanban_home,
 ) -> None:
     """Concurrent lost-ack retries converge to one owner run and event."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="concurrent claim replay")
 
     def claim() -> int:
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             task = kb.claim_task(
                 conn,
                 task_id,
@@ -124,7 +124,7 @@ def test_claim_idempotent_replay_serializes_concurrent_same_claimer(
         run_ids = list(pool.map(lambda _: claim(), range(8)))
 
     assert len(set(run_ids)) == 1
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         assert len(kb.list_runs(conn, task_id)) == 1
         assert sum(
             event.kind == "claimed" for event in kb.list_events(conn, task_id)
@@ -133,12 +133,12 @@ def test_claim_idempotent_replay_serializes_concurrent_same_claimer(
 
 def test_claim_idempotent_replay_serializes_mixed_claimers(kanban_home) -> None:
     """Exactly one identity wins a mixed race and owns the only run."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="mixed claim replay")
     claimers = ["dream:mixed"] * 4 + ["foreign:mixed"] * 4
 
     def claim(claimer: str) -> tuple[str, bool]:
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             task = kb.claim_task(
                 conn,
                 task_id,
@@ -150,7 +150,7 @@ def test_claim_idempotent_replay_serializes_mixed_claimers(kanban_home) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(claim, claimers))
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         row = conn.execute(
             "SELECT claim_lock FROM tasks WHERE id = ?",
             (task_id,),
@@ -167,7 +167,7 @@ def test_claim_idempotent_replay_serializes_mixed_claimers(kanban_home) -> None:
 
 def test_claim_idempotent_replay_requires_explicit_claimer(kanban_home) -> None:
     """Replay mode must never fall back to a process-generated claim identity."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="claim replay identity")
         with pytest.raises(ValueError, match="claimer"):
             kb.claim_task(conn, task_id, idempotent_replay=True)
@@ -175,7 +175,7 @@ def test_claim_idempotent_replay_requires_explicit_claimer(kanban_home) -> None:
 
 def test_claim_idempotent_replay_refuses_expired_same_claimer(kanban_home) -> None:
     """An expired lease is not a valid acknowledgement of the original claim."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="expired claim replay")
         assert kb.claim_task(
             conn,
@@ -201,7 +201,7 @@ def test_claim_idempotent_replay_expiry_boundary(kanban_home, monkeypatch) -> No
     """The lease is live at equality and expired immediately afterward."""
     now = [1_000]
     monkeypatch.setattr(kb.time, "time", lambda: now[0])
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="claim expiry boundary")
         assert kb.claim_task(
             conn,
@@ -228,7 +228,7 @@ def test_claim_idempotent_replay_expiry_boundary(kanban_home, monkeypatch) -> No
 
 def test_claim_idempotent_replay_refuses_missing_current_run(kanban_home) -> None:
     """A matching lease without an authoritative run is corruption, not success."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="claim without current run")
         assert kb.claim_task(
             conn,
@@ -280,7 +280,7 @@ def test_claim_idempotent_replay_refuses_invalid_current_run_identity(
         ),
     )
     for label, sql, target in corruptions:
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             task_id = kb.create_task(conn, title=f"invalid current run {label}")
             claimed = kb.claim_task(
                 conn,
@@ -1933,7 +1933,7 @@ def test_complete_task_expected_status_mismatch_blocked_has_no_side_effects(
         kb, "_fire_kanban_lifecycle_hook",
         lambda *a, **k: hook_calls.append((a, k)),
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cas guard", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="waiting on input")
@@ -1960,7 +1960,7 @@ def test_complete_task_expected_status_mismatch_precedes_created_card_audit(
     kanban_home,
 ):
     """A stale CAS guard must refuse before phantom-card audit side effects."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cas audit ordering", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="waiting on input")
@@ -1990,7 +1990,7 @@ def test_complete_task_expected_run_id_mismatch_precedes_created_card_audit(
     kanban_home,
 ):
     """A stale run guard must refuse before phantom-card audit side effects."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="run cas audit ordering", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
@@ -2020,7 +2020,7 @@ def test_complete_task_expected_run_id_mismatch_precedes_created_card_audit(
 
 def test_complete_task_invalid_expected_status_raises(kanban_home):
     """A typo'd guard value must fail loudly, not read as a mismatch."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cas guard typo", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         with pytest.raises(ValueError, match="expected_status"):
@@ -2030,7 +2030,7 @@ def test_complete_task_invalid_expected_status_raises(kanban_home):
 
 def test_complete_task_expected_status_running_match_succeeds(kanban_home):
     """A matching guard must not change the normal completion path."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cas guard match", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.complete_task(
@@ -2050,7 +2050,7 @@ def test_complete_task_expected_status_running_match_succeeds(kanban_home):
 
 def test_complete_task_expected_status_and_run_id_are_conjunctive(kanban_home):
     """Both guards must match; either mismatch alone refuses completion."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="cas guard conj", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
@@ -2090,7 +2090,7 @@ def _lifecycle_snapshot(conn, tid):
 
 
 def test_add_comment_expected_status_match_succeeds(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="comment cas match", assignee="worker")
         assert kb.get_task(conn, tid).status == "ready"
         cid = kb.add_comment(
@@ -2104,7 +2104,7 @@ def test_add_comment_expected_status_mismatch_raises_with_no_side_effects(
     kanban_home,
 ):
     """A stale 'running' observation must not append a comment or event."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="comment cas stale", assignee="worker")
         before = _lifecycle_snapshot(conn, tid)
         with pytest.raises(ValueError, match="expected status"):
@@ -2115,7 +2115,7 @@ def test_add_comment_expected_status_mismatch_raises_with_no_side_effects(
 
 
 def test_add_comment_invalid_expected_status_raises_before_mutation(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="comment cas typo", assignee="worker")
         before = _lifecycle_snapshot(conn, tid)
         with pytest.raises(ValueError, match="expected_status"):
@@ -2126,7 +2126,7 @@ def test_add_comment_invalid_expected_status_raises_before_mutation(kanban_home)
 
 
 def test_request_review_expected_status_match_succeeds(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="review cas match", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
@@ -2143,7 +2143,7 @@ def test_request_review_expected_status_mismatch_refuses_with_no_side_effects(
     kanban_home,
 ):
     """Stale 'ready' vs actual running must refuse and keep the live claim."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="review cas stale", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
@@ -2167,7 +2167,7 @@ def test_request_review_expected_status_is_conjunctive_with_claim_rules(
     kanban_home,
 ):
     """A matching guard must not bypass the running/ready source rule."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="review cas conj", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="waiting on input")
@@ -2180,7 +2180,7 @@ def test_request_review_expected_status_is_conjunctive_with_claim_rules(
 
 
 def test_request_review_invalid_expected_status_raises(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="review cas typo", assignee="worker")
         with pytest.raises(ValueError, match="expected_status"):
             kb.request_review(conn, tid, expected_status="runing")
@@ -2188,7 +2188,7 @@ def test_request_review_invalid_expected_status_raises(kanban_home):
 
 
 def test_block_task_expected_status_match_succeeds(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block cas match", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(
@@ -2211,7 +2211,7 @@ def test_block_task_expected_status_mismatch_has_no_side_effects(
         kb, "_fire_kanban_lifecycle_hook",
         lambda *a, **k: hook_calls.append((a, k)),
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block cas stale", assignee="worker")
         before = _lifecycle_snapshot(conn, tid)
         assert kb.block_task(
@@ -2236,7 +2236,7 @@ def test_block_task_expected_status_mismatch_precedes_dependency_routing(
         kb, "_fire_kanban_lifecycle_hook",
         lambda *a, **k: hook_calls.append((a, k)),
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block cas dep", assignee="worker")
         before = _lifecycle_snapshot(conn, tid)
         assert kb.block_task(
@@ -2251,7 +2251,7 @@ def test_block_task_expected_status_mismatch_precedes_dependency_routing(
 
 
 def test_block_task_invalid_expected_status_raises(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block cas typo", assignee="worker")
         with pytest.raises(ValueError, match="expected_status"):
             kb.block_task(conn, tid, expected_status="runing")
@@ -2259,7 +2259,7 @@ def test_block_task_invalid_expected_status_raises(kanban_home):
 
 
 def test_unblock_task_expected_block_kind_match_succeeds(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock cas match", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
@@ -2273,7 +2273,7 @@ def test_unblock_task_expected_block_kind_match_succeeds(kanban_home):
 def test_unblock_task_expected_block_kind_mismatch_has_no_side_effects(
     kanban_home,
 ):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock cas stale", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
@@ -2289,7 +2289,7 @@ def test_unblock_task_expected_block_kind_mismatch_has_no_side_effects(
 
 def test_unblock_task_expected_block_kind_untyped_block_mismatches(kanban_home):
     """A legacy un-typed block never matches a canonical expected kind."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock cas untyped", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="untyped")
@@ -2304,7 +2304,7 @@ def test_unblock_task_expected_block_kind_untyped_block_mismatches(kanban_home):
 def test_unblock_task_expected_block_kind_requires_blocked_status(kanban_home):
     """The kind guard demands 'blocked'; scheduled tasks are refused, and a
     plain unguarded unblock still resumes them (compatibility)."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock cas sched", assignee="worker")
         assert kb.schedule_task(conn, tid, reason="wait for window")
         assert kb.get_task(conn, tid).status == "scheduled"
@@ -2319,7 +2319,7 @@ def test_unblock_task_expected_block_kind_requires_blocked_status(kanban_home):
 
 
 def test_unblock_task_invalid_expected_block_kind_raises(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock cas typo", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
@@ -2347,7 +2347,7 @@ def test_block_task_guarded_reason_comment_failure_rolls_back_everything(
         kb, "_fire_kanban_lifecycle_hook",
         lambda *a, **k: hook_calls.append((a, k)),
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block atomic", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         before = _lifecycle_snapshot(conn, tid)
@@ -2384,7 +2384,7 @@ def test_block_task_guarded_dependency_comment_failure_precedes_hook(
         kb, "_fire_kanban_lifecycle_hook",
         lambda *a, **k: hook_calls.append((a, k)),
     )
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="dep atomic", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         before = _lifecycle_snapshot(conn, tid)
@@ -2409,7 +2409,7 @@ def test_block_task_guarded_dependency_comment_failure_precedes_hook(
 
 
 def test_block_task_guarded_success_writes_comment_in_same_txn(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block atomic ok", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(
@@ -2429,7 +2429,7 @@ def test_block_task_guarded_success_writes_comment_in_same_txn(kanban_home):
 def test_unblock_task_guarded_reason_comment_failure_rolls_back(
     kanban_home, monkeypatch,
 ):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock atomic", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
@@ -2458,7 +2458,7 @@ def test_unblock_task_guarded_success_persists_reason_in_event_and_comment(
 ):
     """The guarded unblock's audit evidence — the operator reason — must
     survive on the ``unblocked`` event, not only in the comment stream."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock audit", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
@@ -2483,7 +2483,7 @@ def test_block_task_with_reason_stale_run_id_produces_run_id_diagnostic(
     kanban_home,
 ):
     """Matching status + stale run id must name the run id, not the status."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="block reason runid", assignee="worker")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
@@ -2504,7 +2504,7 @@ def test_block_task_with_reason_stale_run_id_produces_run_id_diagnostic(
 
 
 def test_block_task_with_reason_distinguishes_refusal_causes(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         # Unknown task.
         ok, why = kb.block_task(conn, "t_missing", with_reason=True)
         assert ok is False
@@ -2531,7 +2531,7 @@ def test_block_task_with_reason_distinguishes_refusal_causes(kanban_home):
 def test_unblock_task_expected_block_kind_dependency_rejected(kanban_home):
     """dependency waits live in todo, never blocked — an expected kind of
     'dependency' can never match and must fail loudly before mutation."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock dep kind", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
@@ -2551,7 +2551,7 @@ def test_add_comment_if_absent_replay_returns_existing_id_without_side_effects(
     kanban_home,
 ):
     """An exact (author, canonical body) replay must be a no-op success."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="idempotent comment", assignee="worker")
         first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
         before = _lifecycle_snapshot(conn, tid)
@@ -2565,7 +2565,7 @@ def test_add_comment_if_absent_replay_returns_existing_id_without_side_effects(
 def test_add_comment_if_absent_dedupes_on_canonical_body(kanban_home):
     """Bodies canonicalize (strip) on insert; dedup must compare the same
     canonical form, so a whitespace-padded replay still deduplicates."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="canonical dedup", assignee="worker")
         first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
         before = _lifecycle_snapshot(conn, tid)
@@ -2577,7 +2577,7 @@ def test_add_comment_if_absent_dedupes_on_canonical_body(kanban_home):
 
 
 def test_add_comment_if_absent_different_body_or_author_inserts(kanban_home):
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="no false dedup", assignee="worker")
         first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
         other_body = kb.add_comment(
@@ -2602,7 +2602,7 @@ def test_add_comment_if_absent_stale_expected_status_fails_before_dedup(
 ):
     """The CAS guard is validated first: a stale guard must raise even when
     an exact duplicate exists, and must leave zero traces."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="stale guard first", assignee="worker")
         kb.add_comment(conn, tid, "dream", "sync checkpoint")
         before = _lifecycle_snapshot(conn, tid)
@@ -2624,7 +2624,7 @@ def test_add_comment_if_absent_matching_expected_status_inserts_once(
 ):
     """The Dream call shape: --expected-status running --if-absent replayed
     twice must produce exactly one comment and one commented event."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="dream call shape", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.get_task(conn, tid).status == "running"
@@ -2653,7 +2653,7 @@ def test_add_comment_if_absent_dedup_serializes_under_begin_immediate(
     IMMEDIATE writer, then observe its committed duplicate and dedupe."""
     import threading
 
-    with kb.connect() as conn1:
+    with kbc.connect() as conn1:
         tid = kb.create_task(conn1, title="two-conn dedup", assignee="worker")
 
     conn1.execute("BEGIN IMMEDIATE")
@@ -2662,7 +2662,7 @@ def test_add_comment_if_absent_dedup_serializes_under_begin_immediate(
     results: dict[str, int] = {}
 
     def _replay() -> None:
-        with kb.connect() as conn2:
+        with kbc.connect() as conn2:
             results["replay"] = kb.add_comment(
                 conn2, tid, "dream", "sync checkpoint", if_absent=True,
             )
@@ -2678,7 +2678,7 @@ def test_add_comment_if_absent_dedup_serializes_under_begin_immediate(
     assert not worker.is_alive()
 
     assert results["replay"] == first
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         comments = kb.list_comments(conn, tid)
         assert [(c.author, c.body) for c in comments] == [
             ("dream", "sync checkpoint")

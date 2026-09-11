@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 # Realistic fake credentials (never real; entropy-shaped to match vendor
@@ -173,7 +174,7 @@ def _all_durable_text(conn, task_id: str) -> str:
 
 class TestDurableBoundaries:
     def test_comment_body_canonicalized_at_db_boundary(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.add_comment(conn, tid, "alice", f"my key is {FAKE_GHP} thanks")
             stored = kb.list_comments(conn, tid)[-1].body
@@ -183,7 +184,7 @@ class TestDurableBoundaries:
 
     def test_comment_safe_body_byte_identical(self, kanban_home):
         body = "Plain progress note: tests pass, moving on."
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.add_comment(conn, tid, "alice", body)
             assert kb.list_comments(conn, tid)[-1].body == body
@@ -192,7 +193,7 @@ class TestDurableBoundaries:
         """A retry of the same unsafe body must dedupe against the stored
         canonical form instead of inserting a second (masked) copy."""
         body = f"lost-ack retry with {FAKE_GHP} inside"
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             first = kb.add_comment(conn, tid, "alice", body, if_absent=True)
             replay = kb.add_comment(conn, tid, "alice", body, if_absent=True)
@@ -200,7 +201,7 @@ class TestDurableBoundaries:
             assert len(kb.list_comments(conn, tid)) == 1
 
     def test_complete_result_summary_metadata_canonicalized(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             assert kb.claim_task(conn, tid) is not None
@@ -223,7 +224,7 @@ class TestDurableBoundaries:
 
     def test_complete_safe_result_byte_identical(self, kanban_home):
         result = "All 7 acceptance criteria verified."
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             assert kb.claim_task(conn, tid) is not None
@@ -234,7 +235,7 @@ class TestDurableBoundaries:
 
     def test_block_reason_canonicalized_everywhere(self, kanban_home):
         reason = f"blocked: cannot use {FAKE_GHP} to auth"
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             assert kb.claim_task(conn, tid) is not None
@@ -252,7 +253,7 @@ class TestDurableBoundaries:
             assert blocked and blocked[-1].payload["reason"].startswith("blocked: ")
 
     def test_unblock_reason_canonicalized(self, kanban_home):
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             assert kb.claim_task(conn, tid) is not None
@@ -273,7 +274,7 @@ class TestDurableBoundaries:
     def test_review_summary_canonicalized(self, kanban_home):
         """Pre-existing request_review redaction keeps working through the
         shared canonicalizer (parity guard for the LT-1 refactor)."""
-        with kb.connect_closing() as conn:
+        with kbc.connect_closing() as conn:
             tid = kb.create_task(conn, title="t", assignee="alice")
             kb.recompute_ready(conn)
             task = kb.claim_task(conn, tid)
