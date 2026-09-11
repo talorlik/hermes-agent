@@ -349,23 +349,57 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type and run_state_name must be passed together or omitted")
         if run_state_type not in (None, "status", "outcome"):
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
-        task = _require_task(conn, task_id)
-        # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
-        task_d = _task_dict(task, latest_summary=kanban_db.latest_summary(conn, task_id))
-        links = _links_for(conn, task_id)
-        child_summaries = kanban_db.latest_summaries(conn, links["children"])
-        children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
-        _attach_diagnostics(task_d, _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id) or [])
-        return {
-            "task": task_d,
-            "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
-            "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
-            "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
-            "links": links,
-            "child_results": [
-                {"id": c.id, "title": c.title, "status": c.status, "latest_summary": child_summaries.get(c.id), "result": c.result}
-                for c in children],
-            "runs": [asdict(r) for r in kanban_db.list_runs(conn, task_id, state_type=run_state_type, state_name=run_state_name)]}
+        with kbc.read_txn(conn):
+            snapshot = kanban_db.build_task_snapshot(
+                conn,
+                task_id,
+                run_state_type=run_state_type,
+                run_state_name=run_state_name,
+            )
+            if snapshot is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"task {task_id} not found",
+                )
+            serialized = snapshot.to_dict()
+            task = snapshot.task
+            # Preserve dashboard-only derived fields while sourcing canonical
+            # lifecycle fields from the shared versioned serializer.
+            task_d = _task_dict(task, latest_summary=snapshot.latest_summary)
+            task_d.update(serialized["task"])
+            links = _links_for(conn, task_id)
+            child_summaries = kanban_db.latest_summaries(conn, snapshot.children)
+            children = filter(
+                None,
+                (kanban_db.get_task(conn, cid) for cid in snapshot.children),
+            )
+            _attach_diagnostics(
+                task_d,
+                _compute_task_diagnostics(conn, task_ids=[task_id]).get(task_id)
+                or [],
+            )
+            return {
+                "schema_version": snapshot.schema_version,
+                "task": task_d,
+                "comments": [asdict(comment) for comment in snapshot.comments],
+                "events": [asdict(event) for event in snapshot.events],
+                "attachments": [
+                    _attachment_dict(attachment)
+                    for attachment in kanban_db.list_attachments(conn, task_id)
+                ],
+                "links": links,
+                "child_results": [
+                    {
+                        "id": child.id,
+                        "title": child.title,
+                        "status": child.status,
+                        "latest_summary": child_summaries.get(child.id),
+                        "result": child.result,
+                    }
+                    for child in children
+                ],
+                "runs": [asdict(run) for run in snapshot.runs],
+            }
 
 
 # --- POST /tasks ------------------------------------------------------------

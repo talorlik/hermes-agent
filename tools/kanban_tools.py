@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli import kanban_db_connect as kbc
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -495,17 +496,15 @@ def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
-        task = _existing_task(kb, conn, tid)
-        return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
-            "parents": kb.parent_ids(conn, tid),
-            "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
-            # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+        with kbc.read_txn(conn):
+            snapshot = kb.build_task_snapshot(conn, tid)
+            if snapshot is None:
+                return tool_error(f"task {tid} not found")
+            payload = snapshot.to_dict()
+            # Consumer cap only; the canonical snapshot and CLI retain all events.
+            payload["events"] = payload["events"][-50:]
+            payload["worker_context"] = kb.build_worker_context(conn, tid)
+        return json.dumps(payload)
 
 
 @_kanban_handler("kanban_list")
