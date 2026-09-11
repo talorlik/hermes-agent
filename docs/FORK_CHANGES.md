@@ -42,7 +42,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 `retiring` (scheduled for removal by a named plan item).
 
 ## G-UPDATE-FORKSYNC: automatic upstream merge in `hermes update`
-- Commits: d1066f3439f937acc68b6190aa9724ef0b66e130, 4e7e4488dafd2e43a8a96b27d0460a41be6d12bc, 76c7a422884a48b84a6c9fea5e8f3408cf8f6bd5, 239e3f5bf5892cd3cb14225394db2765d74b7db0, f95f8b4a76b74ee78a4a81e0d6f92fd0cc83140e, 244763a48d0a57be66d53bdd2831a898251af67a
+- Commits: aba881e2ffa40ba856be2b76014d36164442dce1, b2516e8cafa38c8f8baeddda06e7d25ae1a79e73, c6ecaa241ceae6810f61a46c993a9dc2ec36f4ef, 7a2fa7d862d4a8f6b3e470b3fb790564ff484a5d, 33ef1d9eccfc2e56fbcd8b9c369daf929e0a3966, 6dc9457923d5df14a4b5fe7d2179a9fb717b3b3f
 - Owned-Files:
   - hermes_cli/update_cmd.py
   - hermes_cli/update_cmd_git.py
@@ -57,7 +57,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: 558528c06d72382e0f22eefc397429762d7b0ac6, 859599f4ffaea4c86a8a335de2f2ed4de0b65d04, 6b6f4d414e12557801e3057f12b687cef7a615c7, 1c0291cce81a81248fb7c5727b2a10dec0a19b9a, 1e0e3e2fbba930bae94ae225ec7fde5e27cfb45e, 0cd04128b2560cd428e5ba67089ab9ad2039da1e, 0861fa470a76a4bb7070c9d034eb60e288f6df71, d63999668f8e45dc24c81c9abddbed99594cc9dd
+- Commits: 38ae13a9f9725ea4db0a31e7942fbf4eb73ccc48, 76b3bdb6a122bde59d35620f8d39852fdb826fe5, b2f257e6c93f7c7db166c30f4145c01e65be03fc, 7c8169add6115cfa8ed884eec20d14318484f6a1, 4c2bf7a57ca9b94e7241200b2e02e15bce61b99d, 2a30ea4197c7b54d9b6a1965bb4a53e32ff924ff, 0d81c2683c2184287a448fbbd6524a2bf69084e9, 7645bd928652408811def4c9d36e641c539be743
 - Owned-Files:
   - cron/deferrals.py
   - cron/outcomes.py
@@ -97,7 +97,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-LIFECYCLE: durable Kanban lifecycle contracts and CAS guards
-- Commits: dcacabd74f2677ba7bcef2384a8ad5b70a87a523, 062f119e2907f40142f6ef5f549e1ebea8b1fe2d, 6c4985b8283306ed75cbfe7ee8e25a2d603ccdd1, 67e926c3b1972609f89acb3455645f287b2a5f34, 9a2fb822aa4032947675c27bd9a0fa9b55d8ab27, 973611b856b02fb0f1b2c5901d4d883e8629af12, 22f76698544c5260b3f9087df55da81b5ad1bd8e, 1d7b3834d9bb58a13d20d7f724a01e6c7b4d3bfc, a3589d26cb6ab71cecd8168a3e34963611b62c09, 70f70d6313b8b01b94c88b481ddf8ddb87504cf8, 3051b46850fa33ef5f837cdeef92a47fc2c08434
+- Commits: ffb8b2230304e9118ecea17aa3453cd9a2975cf2, ad5e50cde1ca6bbe9a615fc6f80c4c61295a3d4d, 283b361e052b5b549163fc3d16e4d7b23cdfc27d, 1f0e76fffd4a47655c76dddaf8c5b2c95b2cfbb1, 5cac2c018b6b4c661ae5de9c321201cbc2edf1f2, 0156f4c52edf9e76013ad8387c26ec034c5988f2, f5c35003f7b7e79d9d2be9d9cf836631843125cd, 28ac7a4fc1d0ba767be75557daef5ec56cf2e65a, d316ef018418ffe60209c58ed57bf7d285e90712, 1a864f3185421395748f4c29df2aa5e631877455, 7b5923575292b4620835419c4ca32b2222b5a4f1
 - Owned-Files:
   - hermes_cli/kanban.py
   - hermes_cli/kanban_db.py
@@ -121,7 +121,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-DEEPLINKS: browser task deep links in the Kanban dashboard
-- Commits: 71c5d069176de74357ad6d181a134be645a73d2d, 94ce0f54c853810416de945b1b898f5295135300
+- Commits: d654ae4a989894b2b05151466b7c07b479ad564d, 49fde2b6a146a6de62636184dfff214808b216a1
 - Owned-Files:
   - plugins/kanban/dashboard/dist/index.js
   - apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
@@ -133,7 +133,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: a4915b3e095ce7eac3236dad84c844fa8bcb210f, ed1289aefd1f2f86ea904d4a5facc1b606306893, 6ad540c3bb9586064c4afdce2893a1423f380a86, 0f8f1120af7548bb52339dcefa5582636fd83d78, 6277c0e77aaf0eb9636c046e004fffcb0e4e5d9e, 13cc5c9f5419994f334404a7b4b4370b510c16b1
+- Commits: 2bc46ec71153edc302aa81ba1b6b9c711fe99ec0, 3185e41e38e920a9d5f2ea6eacf14bf3f079aca7, 4f756a626bf910ae53c6cf05030e7dcf92c7a977, 4f6a43d7ead94f8a95b0db0d9255ff0e4804f41b, a7bf0c4109dc036a53c267a5bec5ec9dfe27945e, 3e1445d798fa83c04e97f99e63e9654b4f602d0b
 - Owned-Files:
   - agent/agent_init.py
   - hermes_cli/main.py
@@ -149,7 +149,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-TELEGRAM-MDV2: escape chunk indicators on the standalone Telegram send path
-- Commits: 34971a47930f614d8614f4e759430a9946a7240c
+- Commits: f76b9e55620473d4954b74ff8b38c670c0810599
 - Owned-Files:
   - tools/send_message_senders.py
   - tests/tools/test_send_message_tool.py
@@ -160,7 +160,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-SKILL-CLAUDE-OAUTH: verify Claude OAuth before delegation, current model examples
-- Commits: cbd09bc001c3075269f887328bc05717d33e3d6a, 73a82ca13ede374ada35428e5a5e2e54ec7b29fc
+- Commits: 4f7c66dba165c30bc35c73913f2ee78b7d5296f4, 5754e022149b38d60797ec8b17f37411504d25d1
 - Owned-Files:
   - skills/autonomous-ai-agents/claude-code/SKILL.md
   - tests/skills/test_claude_code_skill.py
@@ -171,7 +171,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DOCS-GITHUB-WORKTREE: worktree cleanup guidance after PR merge
-- Commits: ebc1472900d691109707686e9c5b65e3f6beb320
+- Commits: f60096048732539902dde55bdcbf6459bf5f4fb1
 - Owned-Files:
   - skills/software-development/github/references/pr-workflow.md
   - website/docs/user-guide/skills/bundled/github/github-github-pr-workflow.md
@@ -182,7 +182,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-TEST-ISOLATION: isolate desktop test fixtures and mutex paths
-- Commits: af99756b24f6676aeb4b7535b3f524b922b64c09
+- Commits: e94e76bda25551262444f19310ffff784668bcaa
 - Owned-Files:
   - apps/desktop/electron/git-review-ops.test.ts
   - apps/desktop/electron/git-worktree-ops.test.ts
@@ -199,7 +199,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ELECTRON-PATCH: Electron patched-release bump
-- Commits: dcd8af7fda4696e2585bcdc9c2286f1220ec890e
+- Commits: d0e3f86783db32d7c20f0188e02bf24a1f74d4df
 - Owned-Files:
   - apps/desktop/package.json
   - package.json
@@ -246,7 +246,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 5
+- Ledger-Revision: 6
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
