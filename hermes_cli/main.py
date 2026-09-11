@@ -48,7 +48,7 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
         if (
             profile_name == "default"
             or not hasattr(os, "geteuid")
-            or os.geteuid() != 0
+            or os.geteuid() != 0  # windows-footgun: ok - guarded by hasattr above
         ):
             return False
         sudo_user = os.environ.get("SUDO_USER", "").strip()
