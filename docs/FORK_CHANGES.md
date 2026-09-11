@@ -57,7 +57,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: 38ae13a9f9725ea4db0a31e7942fbf4eb73ccc48, 76b3bdb6a122bde59d35620f8d39852fdb826fe5, b2f257e6c93f7c7db166c30f4145c01e65be03fc, 7c8169add6115cfa8ed884eec20d14318484f6a1, 4c2bf7a57ca9b94e7241200b2e02e15bce61b99d, 2a30ea4197c7b54d9b6a1965bb4a53e32ff924ff, 0d81c2683c2184287a448fbbd6524a2bf69084e9, 7645bd928652408811def4c9d36e641c539be743
+- Commits: 38ae13a9f9725ea4db0a31e7942fbf4eb73ccc48, 76b3bdb6a122bde59d35620f8d39852fdb826fe5, b2f257e6c93f7c7db166c30f4145c01e65be03fc, 7c8169add6115cfa8ed884eec20d14318484f6a1, 4c2bf7a57ca9b94e7241200b2e02e15bce61b99d, 2a30ea4197c7b54d9b6a1965bb4a53e32ff924ff, 0d81c2683c2184287a448fbbd6524a2bf69084e9, 7645bd928652408811def4c9d36e641c539be743, e0fe0a84139498cfcebb5a73efd6e82f8fdce546
 - Owned-Files:
   - cron/deferrals.py
   - cron/outcomes.py
@@ -84,6 +84,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/cron/test_monitor_commit_safety.py
   - tests/cron/test_outcome_serializers.py
   - tests/cron/test_pre_script_typed_outcomes.py
+  - tests/cron/test_recurring_eagain_redispatch.py
   - tests/cron/test_cron_script_failure_policy.py
   - tests/cron/test_cronjob_schema.py
   - tests/cron/test_script_claim_heartbeat.py
@@ -246,7 +247,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 6
+- Ledger-Revision: 7
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
