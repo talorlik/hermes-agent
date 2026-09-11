@@ -2824,6 +2824,24 @@ def _save_compose_deliver(
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
         and not _resolve_delivery_targets(job, for_failure=not d.success)
     )
+    normalized_deliver = _normalize_deliver_value(
+        _delivery_lane_value(job, for_failure=not d.success)
+    )
+    outbox_entry = None
+    if normalized_deliver != "local" and not d.unresolved_origin:
+        try:
+            from cron.outbox import enqueue_with_intent
+
+            outbox_entry = enqueue_with_intent(
+                execution_id=job.get("execution_id"),
+                job_id=job["id"],
+                target=normalized_deliver,
+                content=deliver_content,
+                intent_success=d.success,
+                intent_error=d.error,
+            )
+        except Exception:
+            logger.warning("Outbox enqueue failed for job %s", job["id"], exc_info=True)
     try:
         with fence.side_effect_fence() as owns_delivery:
             if not owns_delivery:
@@ -2843,6 +2861,19 @@ def _save_compose_deliver(
             raise
         d.delivery_error = str(de)
         logger.error("Delivery failed for job %s: %s", job["id"], de)
+    if outbox_entry is not None:
+        try:
+            from cron.outbox import record_attempt
+
+            record_attempt(
+                outbox_entry["id"],
+                status="failed" if d.delivery_error else "delivered",
+                error=d.delivery_error,
+            )
+        except Exception:
+            logger.warning(
+                "Outbox attempt record failed for job %s", job["id"], exc_info=True
+            )
 
 
 def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
@@ -2942,7 +2973,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, execution_id: str, *, adapters, loop,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
@@ -2950,13 +2981,34 @@ def _deliver_crash_failure(
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
+    alert_content = (
+        _summarize_cron_failure_for_delivery(job, err_text)
+        + _failure_streak_nudge(job)
+    )
+    unresolved_origin = bool(
+        normalized_deliver == "origin"
+        and not _resolve_delivery_targets(job, for_failure=True)
+    )
+    outbox_entry = None
+    if normalized_deliver != "local" and not unresolved_origin:
+        try:
+            from cron.outbox import enqueue_with_intent
+
+            outbox_entry = enqueue_with_intent(
+                execution_id=execution_id,
+                job_id=job["id"],
+                target=normalized_deliver,
+                content=alert_content,
+                intent_success=False,
+                intent_error=err_text,
+            )
+        except Exception:
+            logger.warning("Outbox enqueue failed for job %s", job["id"], exc_info=True)
     delivery_error = None
     try:
         delivery_error = _deliver_result(
             job,
-            # Same text as the normal failure delivery: this run also counts toward
-            # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            alert_content,
             adapters=adapters,
             loop=loop,
             for_failure=True,
@@ -2964,17 +3016,41 @@ def _deliver_crash_failure(
     except Exception as delivery_exc:
         delivery_error = str(delivery_exc)
         logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
-    unresolved_origin = bool(
-        not delivery_error
-        and normalized_deliver == "origin"
-        and not _resolve_delivery_targets(job, for_failure=True)
-    )
+    if outbox_entry is not None:
+        try:
+            from cron.outbox import record_attempt
+
+            record_attempt(
+                outbox_entry["id"],
+                status="failed" if delivery_error else "delivered",
+                error=delivery_error,
+            )
+        except Exception:
+            logger.warning(
+                "Outbox attempt record failed for job %s", job["id"], exc_info=True
+            )
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"))
     if delivery_outcome == "delivered":
         _mark_incident_alerted(failure_incident_id)
+    if normalized_deliver != "local":
+        try:
+            from cron.executions import record_delivery
+
+            record_delivery(
+                execution_id,
+                target=normalized_deliver,
+                status=delivery_outcome,
+                error=delivery_error,
+            )
+        except Exception:
+            logger.debug(
+                "Execution delivery record failed for job %s",
+                job["id"],
+                exc_info=True,
+            )
     return delivery_error, delivery_outcome
 
 
@@ -3218,7 +3294,7 @@ def _run_one_job_body(
             and not _fire_claim_ownership_lost()
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
-                job, _err_text, adapters=adapters, loop=loop)
+                job, _err_text, execution_id, adapters=adapters, loop=loop)
         try:
             if not _consume_interrupted_flag(job["id"], execution_token):
                 mark_kwargs = {}
@@ -3788,6 +3864,48 @@ def _maybe_reap_dead_owners() -> None:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
 
 
+def _retry_pending_deliveries(adapters=None, loop=None, max_rows: int = 10) -> int:
+    """Retry pending deliveries before dispatching new cron work."""
+    try:
+        from cron.jobs import get_job
+        from cron.outbox import pending_outbox, record_attempt
+
+        backlog = pending_outbox(limit=max_rows)
+    except Exception:
+        logger.debug("Outbox backlog scan failed", exc_info=True)
+        return 0
+    delivered = 0
+    for entry in backlog:
+        try:
+            job = get_job(str(entry["job_id"]))
+            if job is None:
+                record_attempt(
+                    entry["id"],
+                    status="failed",
+                    error="job no longer exists",
+                    abandon=True,
+                )
+                continue
+            try:
+                send_error = _deliver_result(
+                    job, entry["content"], adapters=adapters, loop=loop
+                )
+            except Exception as exc:
+                send_error = str(exc)
+            record_attempt(
+                entry["id"],
+                status="failed" if send_error else "delivered",
+                error=send_error,
+            )
+            if not send_error:
+                delivered += 1
+        except Exception:
+            logger.debug(
+                "Outbox retry failed for entry %r", entry.get("id"), exc_info=True
+            )
+    return delivered
+
+
 def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:
     """Bound the in-flight set BEFORE the dedup guard so a leaked claim is force-released now
     rather than eating every later fire until restart. Skipped when nothing is in flight."""
@@ -3995,6 +4113,7 @@ def tick(
         except Exception as _wt_exc:
             logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
+        _retry_pending_deliveries(adapters=adapters, loop=loop)
         due_jobs = get_due_jobs()
         _sweep_stale_inflight_for_tick(due_jobs)
 

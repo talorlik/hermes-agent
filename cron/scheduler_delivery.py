@@ -1499,10 +1499,16 @@ def _standalone_send(
         try:
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             try:
-                # A fresh thread does NOT inherit the profile ContextVars (home override + secret
-                # scope); run in the active context or the sender reads the default bot token.
-                return pool.submit(contextvars.copy_context().run, asyncio.run, _send()).result(
-                    timeout=30), None
+                # Build the coroutine only after submit succeeds. The copied
+                # context preserves the profile home and secret scope in the
+                # fresh thread without leaking an unawaited coroutine when the
+                # executor rejects work during interpreter shutdown.
+                context = contextvars.copy_context()
+
+                def _run_send_in_fresh_loop():
+                    return context.run(asyncio.run, _send())
+
+                return pool.submit(_run_send_in_fresh_loop).result(timeout=30), None
             finally:
                 pool.shutdown(wait=False)
         except Exception as e:
