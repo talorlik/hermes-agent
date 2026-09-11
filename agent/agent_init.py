@@ -1042,13 +1042,17 @@ def _init_fallback_chain(agent, fallback_model):
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    explicit_no_tools = enabled_toolsets is not None and len(enabled_toolsets) == 0
+    agent._skip_mcp_refresh = explicit_no_tools
     # A multiplexed gateway may have switched HERMES_HOME since model_tools was imported;
     # make sure this profile's plugins are discovered before the tool snapshot.
-    try:
-        from hermes_cli.plugins import discover_plugins
-        discover_plugins()
-    except Exception:
-        logger.warning("Plugin discovery failed during agent setup", exc_info=True)
+    if not explicit_no_tools:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception:
+            logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
     # Capture the registry generation FIRST so a concurrent refresh can detect staleness.
     try:
@@ -1056,11 +1060,16 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    import model_tools
-    agent.tools = model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    if explicit_no_tools:
+        agent.tools = []
+    else:
+        import model_tools
+
+        agent.tools = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
