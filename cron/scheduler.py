@@ -1308,42 +1308,43 @@ def _run_no_agent_job(
 
 def _apply_monitor_gate(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str],
-) -> tuple[Optional[tuple], Optional[str]]:
-    """Monitor gate (hash-suppressed change detection). Must run BEFORE any agent machinery so an
-    unchanged tick costs no LLM/delivery. Returns ``(early_result | None, extra_prompt)``; when
-    early_result is None, extra_prompt may carry the injected monitor context.
-    """
+) -> tuple[Optional[tuple], Optional[str], Optional[object]]:
+    """Evaluate a monitor and return any early result, prompt context, and pending commit."""
     from cron.monitor import check_monitor, job_has_monitor
 
     if not job_has_monitor(job):
-        return None, extra_prompt
-    _mon = check_monitor(job)
-    _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
-    header = _job_doc_header(job_name, job_id, _mon_now, "monitor")
-    if not _mon.ok:
-        # Source failure is an ERROR, never a change: alert so a broken monitor can't silently
-        # stop watching. Stored hash untouched.
-        logger.error("Job '%s': monitor source failed: %s", job_id, _mon.error)
-        _mon_alert = (
+        return None, extra_prompt, None
+    outcome = check_monitor(job)
+    now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    header = _job_doc_header(job_name, job_id, now, "monitor")
+    if not outcome.ok:
+        logger.error("Job '%s': monitor source failed: %s", job_id, outcome.error)
+        alert = (
             f"⚠ Cron monitor '{job_name}' source failed\n\n"
-            f"{_mon.error}\n\n"
-            f"Time: {_mon_now}"
+            f"{outcome.error}\n\n"
+            f"Time: {now}"
         )
         return (
-            False, f"{header}**Status:** monitor source failed\n\n{_mon.error}\n", _mon_alert, _mon.error,
-        ), extra_prompt
-    if not _mon.changed:
-        # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
+            False,
+            f"{header}**Status:** monitor source failed\n\n{outcome.error}\n",
+            alert,
+            outcome.error,
+        ), extra_prompt, None
+    if not outcome.changed:
         logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
         return (
-            True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
-        ), extra_prompt
-    # Changed (or first run): inject monitor context via the per-run seam, then normal agent run.
-    if _mon.context_block:
+            True,
+            f"{header}**Status:** no_change (agent run suppressed)\n",
+            SILENT_MARKER,
+            None,
+        ), extra_prompt, None
+    if outcome.context_block:
         extra_prompt = (
-            f"{_mon.context_block}\n\n{extra_prompt}" if extra_prompt else _mon.context_block
+            f"{outcome.context_block}\n\n{extra_prompt}"
+            if extra_prompt
+            else outcome.context_block
         )
-    return None, extra_prompt
+    return None, extra_prompt, outcome
 
 
 @dataclass
@@ -2039,7 +2040,7 @@ def _detached_script_result(
 
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
-) -> tuple[Optional[_RunResult], Optional[str]]:
+) -> tuple[Optional[_RunResult], Optional[str], Optional[object]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
@@ -2048,7 +2049,7 @@ def _prepare_job_prompt(
     try:
         script_failure_policy = get_job_script_failure_policy(job)
     except ValueError as exc:
-        return _block_and_pause_job(job_id, job_name, str(exc)), None
+        return _block_and_pause_job(job_id, job_name, str(exc)), None, None
 
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
@@ -2059,21 +2060,23 @@ def _prepare_job_prompt(
             require_parseable_user_config()
         except InvalidUserConfigError as exc:
             logger.error("Job '%s': refusing to run — %s", job_id, exc)
-            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
+            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None, None
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
+        return _run_no_agent_job(job, job_id, job_name, cancel_event), None, None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
 
     if job_payload_is_empty(job):
-        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
+        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None, None
 
-    _early, extra_prompt = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
+    _early, extra_prompt, pending_monitor = _apply_monitor_gate(
+        job, job_id, job_name, extra_prompt
+    )
     if _early is not None:
-        return _early, None
+        return _early, None, None
 
     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
     # _build_job_prompt so the script runs only once.
@@ -2099,21 +2102,21 @@ def _prepare_job_prompt(
                 job_name,
                 prerun_outcome,
                 _hermes_now().strftime("%Y-%m-%d %H:%M:%S"),
-            ), None
+            ), None, None
         if prerun_outcome.kind == DETACHED:
             return _detached_script_result(
                 job_id,
                 job_name,
                 prerun_outcome,
                 _hermes_now().strftime("%Y-%m-%d %H:%M:%S"),
-            ), None
+            ), None, None
         if not _ran_ok and script_failure_policy == "fail_closed":
             result = _fail_closed_script_result(job_id, job_name, _script_output)
             logger.error(
                 "Job '%s' (ID: %s): pre-run script failed closed; agent not started: %s",
                 job_name, job_id, result[3],
             )
-            return result, None
+            return result, None, None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             silent_doc = (
@@ -2122,7 +2125,7 @@ def _prepare_job_prompt(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
-            return (True, silent_doc, SILENT_MARKER, None), None
+            return (True, silent_doc, SILENT_MARKER, None), None, None
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script, extra_prompt=extra_prompt)
@@ -2144,11 +2147,11 @@ def _prepare_job_prompt(
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
-        return (False, blocked_doc, "", str(block_exc)), None
+        return (False, blocked_doc, "", str(block_exc)), None, None
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
-        return (True, "", SILENT_MARKER, None), None
-    return None, prompt
+        return (True, "", SILENT_MARKER, None), None, None
+    return None, prompt, pending_monitor
 
 
 _CRON_DELIVERY_VARS = (
@@ -2375,7 +2378,9 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt, pending_monitor = _prepare_job_prompt(
+        job, job_id, job_name, extra_prompt, cancel_event
+    )
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2403,6 +2408,11 @@ def run_job(
         if setup.blocked is not None:
             return setup.blocked
         model = setup.model
+
+        if pending_monitor is not None:
+            from cron.monitor import commit_monitor_state
+
+            commit_monitor_state(job_id, pending_monitor)
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)

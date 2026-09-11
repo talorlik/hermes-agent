@@ -1,13 +1,35 @@
 """Monitor-mode cron support — hash-suppressed change detection.
 
-A monitor job attaches a cheap source (``monitor_script`` / ``monitor_url``) to an LLM cron job.
-Each tick runs the source FIRST and hashes its EXACT output bytes (no timestamp/whitespace
-normalization — scripts must emit stable output) against the hash from the last agent-triggering
-tick: unchanged → agent run suppressed (silent ``no_change`` run); changed/first run → a "MONITOR
-CHANGE DETECTED" block (capped unified diff + new output) is injected into the prompt; source
-failure → an ERROR, never a change, and the stored hash is left untouched. State:
-``job["monitor_state"]`` in jobs.json (hash + last_changed_at) and
-``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` (for the diff).
+A monitor job attaches a cheap *monitor source* (``monitor_script`` or
+``monitor_url``) to an ordinary LLM cron job. Each tick the scheduler runs
+the source FIRST and compares a hash of its exact output bytes against the
+hash stored from the last agent-triggering tick:
+
+* unchanged → the agent run is suppressed entirely (no LLM, no delivery);
+  the tick is recorded as a silent ``no_change`` run.
+* changed (or first run) → a "MONITOR CHANGE DETECTED" context block —
+  unified diff of old vs new output (capped) plus the new output — is
+  injected into the prompt and the agent runs normally.
+* source failure → treated as an ERROR, never as a change. The stored hash
+  is left untouched so a source that recovers to its previous output still
+  suppresses.
+
+Output is compared as EXACT BYTES — no timestamp stripping or whitespace
+normalization. Monitor scripts should emit stable output (sort results,
+omit "generated at" lines) or every tick will look like a change.
+
+State lives in two places, both durable across scheduler restarts:
+
+* ``OUTPUT_DIR/<job_id>/monitor_last_output.txt`` — the SINGLE COMMIT
+  AUTHORITY. The dedup hash is derived from this file's exact bytes; it is
+  written last, atomically (tmp + rename), so a commit either fully
+  happened or fully did not — there is no torn state to reconcile.
+* ``job["monitor_state"]`` in jobs.json — display metadata only
+  (``last_output_hash`` + ``last_changed_at``), journaled BEFORE the
+  snapshot. Recovery converges on the snapshot whatever the mirror says.
+
+Inspired by: ChatGPT Work monitor tasks (idea-level, docs-only);
+enabler: #80774.
 """
 
 from __future__ import annotations
@@ -15,6 +37,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,13 +55,21 @@ _SNAPSHOT_FILENAME = "monitor_last_output.txt"
 
 @dataclass
 class MonitorOutcome:
-    """Result of one monitor-source evaluation."""
+    """Result of one monitor-source evaluation.
+
+    ``pending_hash``/``pending_output`` carry a detected change that has NOT
+    been committed yet — the scheduler commits via ``commit_monitor_state``
+    only after the provider/model/tool preflight succeeds, so a blocked or
+    crashed run leaves the change fully retryable.
+    """
 
     ok: bool
     changed: bool = False
     first_run: bool = False
     context_block: Optional[str] = None
     error: Optional[str] = None
+    pending_hash: Optional[str] = None
+    pending_output: Optional[str] = None
 
 
 def hash_monitor_output(output: str) -> str:
@@ -64,25 +95,21 @@ def _snapshot_path(job_id: str):
     return _job_output_dir(job_id) / _SNAPSHOT_FILENAME
 
 
-def _read_last_output(job_id: str) -> str:
-    try:
-        path = _snapshot_path(job_id)
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Monitor: failed to read last output for %r: %s", job_id, exc)
-    return ""
-
-
 def _write_last_output(job_id: str, output: str) -> None:
-    try:
-        from cron.jobs import _ensure_cron_dir
+    """Atomically replace the snapshot — the commit authority.
 
-        path = _snapshot_path(job_id)
-        _ensure_cron_dir(path.parent)
-        path.write_text(output, encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
+    tmp + ``os.replace`` in the same directory: a crash mid-write leaves
+    the previous snapshot fully intact. RAISES on failure — a commit that
+    did not land must fail the run visibly, never proceed silently.
+    Directory creation goes through ``_ensure_cron_dir`` so upstream's
+    cron-directory permission semantics are preserved.
+    """
+    path = _snapshot_path(job_id)
+    from cron.jobs import _ensure_cron_dir
+    _ensure_cron_dir(path.parent)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(output, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _fetch_monitor_url(url: str) -> tuple[bool, str]:
@@ -125,9 +152,13 @@ def job_has_monitor(job: dict) -> bool:
 def check_monitor(job: dict) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 
-    On change (or first run) the new hash + snapshot are persisted BEFORE the agent runs — detection
-    time is the state boundary, so a failed agent run doesn't re-alert on the same content forever.
-    On failure nothing is persisted.
+    Detection persists NOTHING. On change (or first run) the outcome
+    carries the pending hash + output; the scheduler calls
+    ``commit_monitor_state`` after its provider/model/tool preflight
+    succeeds and durable work intent exists — right before the agent runs.
+    That keeps the original no-realert boundary (a failed AGENT run does
+    not re-alert forever) while a failed PREFLIGHT leaves the change
+    retryable. On source failure nothing is persisted either.
     """
     job_id = str(job.get("id") or "")
     ok, output = _run_monitor_source(job)
@@ -135,14 +166,29 @@ def check_monitor(job: dict) -> MonitorOutcome:
         return MonitorOutcome(ok=False, error=output)
 
     new_hash = hash_monitor_output(output)
-    raw_state = job.get("monitor_state")
-    last_hash = raw_state.get("last_output_hash") if isinstance(raw_state, dict) else None
+    # The SNAPSHOT file is the single dedup authority; the jobs.json
+    # ``monitor_state`` mirror is display metadata and is deliberately not
+    # consulted — a torn crash between the two can never fork detection.
+    snapshot: Optional[str] = None
+    try:
+        snapshot_path = _snapshot_path(job_id)
+        if snapshot_path.exists():
+            snapshot = snapshot_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        # An unreadable authority cannot vouch for "seen before" — treat it
+        # as a source ERROR (no commit, no alert loop), never as a change.
+        return MonitorOutcome(
+            ok=False, error=f"monitor snapshot unreadable: {exc}"
+        )
+    last_hash = (
+        hash_monitor_output(snapshot) if snapshot is not None else None
+    )
 
     if last_hash is not None and new_hash == last_hash:
         return MonitorOutcome(ok=True, changed=False)
 
     first_run = last_hash is None
-    old_output = "" if first_run else _read_last_output(job_id)
+    old_output = snapshot or ""
 
     shown_output = output
     if len(shown_output) > MAX_OUTPUT_CHARS:
@@ -163,23 +209,48 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Diff (previous → current)\n\n```diff\n{diff}\n```\n\n" + current
         )
 
-    _persist_monitor_state(job_id, new_hash, output)
-    return MonitorOutcome(ok=True, changed=True, first_run=first_run, context_block=context_block)
+    return MonitorOutcome(
+        ok=True,
+        changed=True,
+        first_run=first_run,
+        context_block=context_block,
+        pending_hash=new_hash,
+        pending_output=output,
+    )
+
+
+def commit_monitor_state(job_id: str, outcome: MonitorOutcome) -> None:
+    """Commit a detected change's dedup hash + snapshot.
+
+    The scheduler calls this exactly once per detected change, after
+    preflight succeeds and before the agent runs. Idempotent per outcome.
+    """
+    if not outcome.changed or outcome.pending_hash is None:
+        return
+    _persist_monitor_state(
+        str(job_id), outcome.pending_hash, outcome.pending_output or ""
+    )
 
 
 def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
+    """Journaled two-resource commit; ANY failure raises to the caller.
+
+    Order matters: the jobs.json mirror (display metadata) is journaled
+    FIRST, the snapshot — the commit authority — lands LAST via an atomic
+    replace. A crash or failure at either step leaves the authority on the
+    previous output, so the change re-detects and re-alerts next tick; a
+    stale mirror is overwritten by the next successful commit. Nothing is
+    swallowed: a commit that cannot land must fail the run visibly.
+    """
     from cron.jobs import _hermes_now, update_job
 
+    update_job(
+        job_id,
+        {
+            "monitor_state": {
+                "last_output_hash": new_hash,
+                "last_changed_at": _hermes_now().isoformat(),
+            }
+        },
+    )
     _write_last_output(job_id, output)
-    try:
-        update_job(
-            job_id,
-            {
-                "monitor_state": {
-                    "last_output_hash": new_hash,
-                    "last_changed_at": _hermes_now().isoformat(),
-                }
-            },
-        )
-    except Exception as exc:
-        logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)
