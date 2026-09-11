@@ -239,9 +239,13 @@ _FORK_SYNC_TEST_PATHS = (
 
 
 def _subprocess_detail(result: subprocess.CompletedProcess[str]) -> str:
-    """Return the last eight lines across stdout and stderr."""
-    streams = [stream.strip() for stream in (result.stdout, result.stderr) if stream.strip()]
-    return "\n".join("\n".join(streams).splitlines()[-8:])
+    """Return up to eight lines from each output stream, preserving both."""
+    sections: list[str] = []
+    for label, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+        lines = stream.strip().splitlines()
+        if lines:
+            sections.append(f"{label}:\n" + "\n".join(lines[-8:]))
+    return "\n".join(sections)
 
 
 def _run_fork_sync_tests(cwd: Path) -> tuple[bool, str]:
