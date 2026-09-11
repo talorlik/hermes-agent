@@ -1675,6 +1675,83 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
+class UnsafeDurableTextError(ValueError):
+    """Raised when strict durable-text handling would redact the input."""
+
+
+def canonicalize_durable_text(text: str, *, strict: bool = False) -> str:
+    """Force-redact one string before it crosses the durable-storage boundary."""
+    if not isinstance(text, str):
+        text = str(text)
+    from agent.redact import redact_sensitive_text
+
+    canonical = redact_sensitive_text(text, force=True)
+    if strict and canonical != text:
+        raise UnsafeDurableTextError(
+            "durable text contains sensitive material the domain boundary "
+            "would redact; refusing to store it (strict mode)"
+        )
+    return canonical
+
+
+def _json_coerced_key(key: Any) -> Optional[str]:
+    """Return the object-key spelling used by ``json.dumps`` when supported."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, float):
+        if key != key:
+            return "NaN"
+        if key == float("inf"):
+            return "Infinity"
+        if key == float("-inf"):
+            return "-Infinity"
+        return repr(key)
+    if isinstance(key, int):
+        return repr(key)
+    if key is None:
+        return "null"
+    return None
+
+
+def canonicalize_durable_value(value: Any, *, strict: bool = False) -> Any:
+    """Recursively canonicalize durable strings and reject key collisions."""
+    if isinstance(value, str):
+        return canonicalize_durable_text(value, strict=strict)
+    if isinstance(value, dict):
+        canonical: dict[Any, Any] = {}
+        seen_json_keys: set[str] = set()
+        for key, item in value.items():
+            canonical_key = (
+                canonicalize_durable_text(key, strict=strict)
+                if isinstance(key, str)
+                else key
+            )
+            if canonical_key in canonical:
+                raise UnsafeDurableTextError(
+                    "durable dictionary keys collide after canonicalization"
+                )
+            coerced = _json_coerced_key(canonical_key)
+            if coerced is not None:
+                if coerced in seen_json_keys:
+                    raise UnsafeDurableTextError(
+                        "durable dictionary keys collide under JSON key coercion"
+                    )
+                seen_json_keys.add(coerced)
+            canonical[canonical_key] = canonicalize_durable_value(
+                item, strict=strict
+            )
+        return canonical
+    if isinstance(value, list):
+        return [canonicalize_durable_value(item, strict=strict) for item in value]
+    if isinstance(value, tuple):
+        return tuple(
+            canonicalize_durable_value(item, strict=strict) for item in value
+        )
+    return value
+
+
 def add_comment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1691,6 +1768,7 @@ def add_comment(
         raise ValueError("comment author is required")
     if expected_status is not None and expected_status not in VALID_STATUSES:
         raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+    body = canonicalize_durable_text(body)
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
@@ -2618,6 +2696,11 @@ def complete_task(
     now = int(time.time())
     if expected_status is not None and expected_status not in VALID_STATUSES:
         raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+    result = canonicalize_durable_text(result) if result is not None else None
+    summary = canonicalize_durable_text(summary) if summary is not None else None
+    metadata = (
+        canonicalize_durable_value(metadata) if metadata is not None else None
+    )
     normalized_expected_run_id = (
         int(expected_run_id) if expected_run_id is not None else None
     )
@@ -2969,6 +3052,11 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    result = canonicalize_durable_text(result)
+    summary = canonicalize_durable_text(summary) if summary is not None else None
+    metadata = (
+        canonicalize_durable_value(metadata) if metadata is not None else None
+    )
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         if _task_status(conn, task_id) != "done":
@@ -3032,6 +3120,7 @@ def block_task(
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     if expected_status is not None and expected_status not in VALID_STATUSES:
         raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+    reason = canonicalize_durable_text(reason) if reason is not None else None
 
     with write_txn(conn):
         cur_row = conn.execute(
@@ -3129,18 +3218,8 @@ def _route_block(
 
 
 def redact_review_value(value: Any) -> Any:
-    """Redact secrets at the domain boundary for durable review handoffs."""
-    if isinstance(value, str):
-        from agent.redact import redact_sensitive_text
-
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, dict):
-        return {key: redact_review_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_review_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_review_value(item) for item in value)
-    return value
+    """Compatibility alias for the shared durable-storage canonicalizer."""
+    return canonicalize_durable_value(value)
 
 
 def request_review(
@@ -3435,6 +3514,7 @@ def unblock_task(
             f"{sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
         )
 
+    reason = canonicalize_durable_text(reason) if reason is not None else None
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
