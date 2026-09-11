@@ -820,6 +820,41 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _expected_run_id_for(args: argparse.Namespace, task_id: str) -> Optional[int]:
+    """Resolve explicit ownership and require matching worker attestation."""
+    explicit = getattr(args, "expected_run_id", None)
+    if explicit is None:
+        return _worker_run_id_for(task_id)
+
+    env_task = os.environ.get("HERMES_KANBAN_TASK")
+    env_run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if env_task is not None and env_task != task_id:
+        raise ValueError(
+            f"--expected-run-id task {task_id!r} does not match "
+            f"HERMES_KANBAN_TASK {env_task!r}"
+        )
+    if env_run_raw is not None:
+        if env_task != task_id:
+            raise ValueError(
+                "HERMES_KANBAN_RUN_ID is present without a matching "
+                "HERMES_KANBAN_TASK"
+            )
+        try:
+            env_run_id = int(env_run_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "HERMES_KANBAN_RUN_ID is not a positive integer"
+            ) from exc
+        if env_run_id <= 0:
+            raise ValueError("HERMES_KANBAN_RUN_ID is not a positive integer")
+        if explicit != env_run_id:
+            raise ValueError(
+                f"--expected-run-id {explicit} does not match "
+                f"HERMES_KANBAN_RUN_ID {env_run_id}"
+            )
+    return explicit
+
+
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     """Goal judge for every terminal worker handoff (including review).
 
@@ -879,6 +914,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
     expected_status = getattr(args, "expected_status", None)
+    explicit_run_id = getattr(args, "expected_run_id", None)
+    if explicit_run_id is not None and len(ids) != 1:
+        return _err(
+            "kanban: --expected-run-id cannot be used with multiple task ids",
+            2,
+        )
+    try:
+        expected_run_id = (
+            _expected_run_id_for(args, ids[0]) if len(ids) == 1 else None
+        )
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     # Handoff fields are per-run; refuse to copy them across N runs.
     if len(ids) > 1 and (summary or raw_meta):
         return _err("kanban: --summary / --metadata are per-task and can't be used "
@@ -904,6 +951,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     f"refusing to complete {tid}: expected status "
                     f"{expected_status!r}, task is {actual!r}"
                 )
+            elif explicit_run_id is not None:
+                current = kb.get_task(conn, tid)
+                actual_run_id = current.current_run_id if current else None
+                fail_msg[tid] = (
+                    f"refusing to complete {tid}: expected run id "
+                    f"{expected_run_id!r}, task current run is {actual_run_id!r}"
+                )
             else:
                 fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             return kb.complete_task(
@@ -912,7 +966,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=(
+                    expected_run_id if len(ids) == 1 else _worker_run_id_for(tid)
+                ),
                 expected_status=expected_status,
             )
 
@@ -953,6 +1009,18 @@ def _cmd_block(args: argparse.Namespace) -> int:
     else:
         author = _profile_author()
     ids = _bulk_ids(args)
+    explicit_run_id = getattr(args, "expected_run_id", None)
+    if explicit_run_id is not None and len(ids) != 1:
+        return _err(
+            "kanban: --expected-run-id cannot be used with multiple task ids",
+            2,
+        )
+    try:
+        expected_run_id = (
+            _expected_run_id_for(args, ids[0]) if len(ids) == 1 else None
+        )
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     suffix = f": {reason}" if reason else ""
     fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
@@ -966,7 +1034,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — needs a human decision){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        if expected_status is None and explicit_author is None:
+        if (
+            expected_status is None
+            and explicit_author is None
+            and explicit_run_id is None
+        ):
             op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
             return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
@@ -977,12 +1049,16 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=(
+                    expected_run_id if len(ids) == 1 else _worker_run_id_for(tid)
+                ),
                 expected_status=expected_status,
                 reason_comment_author=author if reason else None,
-                with_reason=expected_status is not None,
+                with_reason=(
+                    expected_status is not None or explicit_run_id is not None
+                ),
             )
-            if expected_status is not None:
+            if expected_status is not None or explicit_run_id is not None:
                 ok, refusal = cast(tuple[bool, Optional[str]], block_result)
                 fail_msg[tid] = (
                     f"refusing to block {tid}: "
@@ -1059,6 +1135,10 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
+    try:
+        expected_run_id = _expected_run_id_for(args, tid)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     summary = _stripped_or_none(getattr(args, "summary", None))
     metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
     if rc:
@@ -1072,7 +1152,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=expected_run_id,
             expected_status=getattr(args, "expected_status", None),
             force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:

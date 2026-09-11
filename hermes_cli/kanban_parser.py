@@ -38,6 +38,21 @@ def _json_flag(**kw):
     return _arg("--json", action="store_true", **kw)
 
 
+def _positive_run_id(value: str) -> int:
+    """Argparse validator for an explicit run-ownership guard."""
+    try:
+        run_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "--expected-run-id must be a positive integer"
+        ) from exc
+    if run_id <= 0:
+        raise argparse.ArgumentTypeError(
+            "--expected-run-id must be a positive integer"
+        )
+    return run_id
+
+
 def _reason(help: str):
     return _arg("--reason", help=help)
 
@@ -294,6 +309,11 @@ _SPECS = [
             choices=sorted(kb.VALID_STATUSES),
             help="Only complete if the task still has this exact status.",
         ),
+        _arg(
+            "--expected-run-id",
+            type=_positive_run_id,
+            help="Only complete if this exact positive owning run is still current.",
+        ),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -313,6 +333,11 @@ _SPECS = [
         _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
              help="Only block if the task still has this exact status."),
         _arg("--author", help="Explicit author for the transactional BLOCKED reason comment."),
+        _arg(
+            "--expected-run-id",
+            type=_positive_run_id,
+            help="Only block if this exact positive owning run is still current.",
+        ),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -336,6 +361,11 @@ _SPECS = [
                   "task to review even without owning its run (clears the worker's claim)."),
         _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
              help="Only request review if the task still has this exact status."),
+        _arg(
+            "--expected-run-id",
+            type=_positive_run_id,
+            help="Only request review if this exact positive owning run is still current.",
+        ),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
