@@ -1810,7 +1810,12 @@ def _task_rows(conn: sqlite3.Connection, table: str, task_id: str, order: str) -
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
-    return [Comment.from_row(r) for r in _task_rows(conn, "task_comments", task_id, "created_at ASC")]
+    return [
+        Comment.from_row(r)
+        for r in _task_rows(
+            conn, "task_comments", task_id, "created_at ASC, id ASC"
+        )
+    ]
 
 
 def list_comments_after(
@@ -4296,10 +4301,136 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
     return {r["task_id"]: r["summary"] for r in rows}
 
 
+# ---------------------------------------------------------------------------
+# Task snapshot - one consistent read for CLI and API consumers
+# ---------------------------------------------------------------------------
+
+TASK_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+@dataclass
+class KanbanTaskSnapshot:
+    """One task's durable state captured at a single point in time."""
+
+    task: Task
+    parents: list[str]
+    children: list[str]
+    comments: list[Comment]
+    events: list[Event]
+    runs: list[Run]
+    latest_summary: Optional[str]
+    schema_version: int = TASK_SNAPSHOT_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the legacy show envelope plus versioned lifecycle fields."""
+        task = self.task
+        task_payload = {
+            "id": task.id,
+            "title": task.title,
+            "body": task.body,
+            "assignee": task.assignee,
+            "status": task.status,
+            "priority": task.priority,
+            "tenant": task.tenant,
+            "workspace_kind": task.workspace_kind,
+            "workspace_path": task.workspace_path,
+            "branch_name": task.branch_name,
+            "project_id": task.project_id,
+            "created_by": task.created_by,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+            "result": task.result,
+            "skills": list(task.skills) if task.skills else [],
+            "max_retries": task.max_retries,
+            "model_override": task.model_override,
+            "provider_override": task.provider_override,
+            "session_id": task.session_id,
+            "workflow_template_id": task.workflow_template_id,
+            "current_step_key": task.current_step_key,
+            "completion_contract": task.completion_contract,
+            "last_failure_error": task.last_failure_error,
+            "block_kind": task.block_kind,
+            "block_recurrences": task.block_recurrences,
+            "current_run_id": task.current_run_id,
+        }
+        return {
+            "schema_version": self.schema_version,
+            "task": task_payload,
+            "latest_summary": self.latest_summary,
+            "parents": list(self.parents),
+            "children": list(self.children),
+            "comments": [
+                {
+                    "id": comment.id,
+                    "author": comment.author,
+                    "body": comment.body,
+                    "created_at": comment.created_at,
+                }
+                for comment in self.comments
+            ],
+            "events": [
+                {
+                    "id": event.id,
+                    "kind": event.kind,
+                    "payload": event.payload,
+                    "created_at": event.created_at,
+                    "run_id": event.run_id,
+                }
+                for event in self.events
+            ],
+            "runs": [
+                {
+                    "id": run.id,
+                    "profile": run.profile,
+                    "step_key": run.step_key,
+                    "status": run.status,
+                    "outcome": run.outcome,
+                    "summary": run.summary,
+                    "error": run.error,
+                    "metadata": run.metadata,
+                    "worker_pid": run.worker_pid,
+                    "started_at": run.started_at,
+                    "ended_at": run.ended_at,
+                }
+                for run in self.runs
+            ],
+        }
+
+
+def build_task_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_state_type: Optional[str] = None,
+    run_state_name: Optional[str] = None,
+) -> Optional[KanbanTaskSnapshot]:
+    """Capture one task and all show collections under one read snapshot."""
+    with read_txn(conn):
+        task = get_task(conn, task_id)
+        if task is None:
+            return None
+        return KanbanTaskSnapshot(
+            task=task,
+            parents=parent_ids(conn, task_id),
+            children=child_ids(conn, task_id),
+            comments=list_comments(conn, task_id),
+            events=list_events(conn, task_id),
+            runs=list_runs(
+                conn,
+                task_id,
+                state_type=run_state_type,
+                state_name=run_state_name,
+            ),
+            latest_summary=latest_summary(conn, task_id),
+        )
+
+
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
     init_db,
+    read_txn,
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402

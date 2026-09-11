@@ -1144,6 +1144,92 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+class _UnknownTransactionState:
+    """Sentinel for a connection whose transaction state cannot be trusted."""
+
+    __slots__ = ()
+
+
+_TXN_STATE_UNKNOWN = _UnknownTransactionState()
+
+
+def _probe_in_transaction(
+    conn: sqlite3.Connection,
+) -> tuple[bool | _UnknownTransactionState, Optional[BaseException]]:
+    """Return an exact transaction state without trusting wrapper defaults."""
+    try:
+        value = conn.in_transaction
+    except BaseException as telemetry_exc:  # noqa: BLE001 - boundary telemetry
+        return _TXN_STATE_UNKNOWN, telemetry_exc
+    if isinstance(value, bool):
+        return value, None
+    return _TXN_STATE_UNKNOWN, TypeError(
+        f"in_transaction returned non-boolean {value!r}; "
+        "the transaction state cannot be trusted"
+    )
+
+
+def _close_transaction_for_failure(
+    conn: sqlite3.Connection,
+) -> Optional[BaseException]:
+    """Roll back and return ``None`` only when closure is proven."""
+    pre_state, _ = _probe_in_transaction(conn)
+    if pre_state is False:
+        return None
+    try:
+        conn.execute("ROLLBACK")
+    except BaseException as cleanup_exc:  # noqa: BLE001 - interrupt-safe cleanup
+        post_state, _ = _probe_in_transaction(conn)
+        if (
+            isinstance(cleanup_exc, sqlite3.OperationalError)
+            and "no transaction is active" in str(cleanup_exc).lower()
+            and post_state is False
+        ):
+            return None
+        return cleanup_exc
+    post_state, post_failure = _probe_in_transaction(conn)
+    if post_state is False:
+        return None
+    if post_state is _TXN_STATE_UNKNOWN:
+        return post_failure
+    return RuntimeError(
+        "ROLLBACK returned without error but the connection still "
+        "reports an open transaction; closure cannot be proven"
+    )
+
+
+class TransactionOutcomeUnknownError(RuntimeError):
+    """Raised when transaction closure cannot be proven."""
+
+
+@contextlib.contextmanager
+def read_txn(conn: sqlite3.Connection):
+    """Pin a consistent multi-statement read and prove boundary closure."""
+    entry_state, _ = _probe_in_transaction(conn)
+    if entry_state is True:
+        yield conn
+        return
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException as body_exc:  # noqa: BLE001 - interrupt-safe boundary
+        cleanup_failure = _close_transaction_for_failure(conn)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "read transaction failed and rollback cleanup could not "
+                f"prove the snapshot closed (cleanup: {cleanup_failure!r}); "
+                "the connection may still hold the open read transaction"
+            ) from body_exc
+        raise
+    cleanup_failure = _close_transaction_for_failure(conn)
+    if cleanup_failure is not None:
+        raise TransactionOutcomeUnknownError(
+            "read completed but rollback cleanup could not prove the "
+            f"snapshot closed (cleanup: {cleanup_failure!r}); the "
+            "connection may still hold the open read transaction"
+        ) from cleanup_failure
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one

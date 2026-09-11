@@ -474,29 +474,30 @@ def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
         return rc
+    rsk = rsk or {}
     graph = None
     want_json = getattr(args, "json", False)
     with kbc.connect_closing() as conn:
-        task = kb.get_task(conn, args.task_id)
-        if not task:
+        snapshot = kb.build_task_snapshot(
+            conn,
+            args.task_id,
+            run_state_type=rsk.get("state_type"),
+            run_state_name=rsk.get("state_name"),
+        )
+        if snapshot is None:
             return _err(f"no such task: {args.task_id}")
-        comments = kb.list_comments(conn, args.task_id)
-        events = kb.list_events(conn, args.task_id)
-        parents = kb.parent_ids(conn, args.task_id)
-        children = kb.child_ids(conn, args.task_id)
-        runs = kb.list_runs(conn, args.task_id, **rsk)
-        # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
-        latest_summary = kb.latest_summary(conn, args.task_id)
+        task = snapshot.task
+        comments = snapshot.comments
+        events = snapshot.events
+        parents = snapshot.parents
+        children = snapshot.children
+        runs = snapshot.runs
+        latest_summary = snapshot.latest_summary
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
-        _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
-            "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
-            "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
-            "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
-        })
+        _print_json(snapshot.to_dict())
         return 0
 
     def field(label: str, value) -> None:
