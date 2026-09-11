@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -465,6 +466,34 @@ class TestSendTelegramMediaDelivery:
         assert "error" in result
         assert "No deliverable text or media remained" in result["error"]
         bot.send_message.assert_not_awaited()
+
+
+class TestSendTelegramChunkIndicatorEscaping:
+    def test_multi_chunk_indicators_are_mdv2_escaped(self, monkeypatch):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(message_id=1)
+        )
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        message = "*Executive summary*\n" + ("Some findings line\\.\n" * 400)
+
+        result = asyncio.run(_send_telegram("token", "12345", message))
+
+        assert result["success"] is True
+        assert bot.send_message.await_count > 1
+        for call in bot.send_message.await_args_list:
+            text = call.kwargs["text"]
+            match = re.search(r"\((\d+)/(\d+)\)$", text)
+            if match:
+                assert text.endswith(
+                    f"\\({match.group(1)}/{match.group(2)}\\)"
+                )
 
 
 # ---------------------------------------------------------------------------
