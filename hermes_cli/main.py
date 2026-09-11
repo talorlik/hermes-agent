@@ -28,6 +28,188 @@ import os
 import re
 import sys
 
+# Import-time no-tools lease. The real parser is stdlib-only, so classification
+# can match current argparse behavior without copying its option surface.
+_EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
+_TOOLSETS_NONE_SENTINEL_RAW = "none"
+
+
+def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
+    """Return whether authoritative CLI parsing selects no-tools one-shot."""
+    import contextlib
+    import io
+    from pathlib import Path as _Path
+
+    from hermes_cli._parser import build_top_level_parser, top_level_value_flag_sets
+
+    required_flags, optional_flags = top_level_value_flag_sets()
+
+    def _profile_resolves(name: str) -> bool:
+        canonical = name.strip().lower()
+        if not canonical or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", canonical):
+            return False
+        if canonical in {"hermes", "test", "tmp", "root", "sudo"}:
+            return False
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        env_path = _Path(env_home) if env_home else _Path.home() / ".hermes"
+        profile_root = (
+            env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+        )
+        if canonical == "default":
+            return True
+        profile_dir = profile_root / "profiles" / canonical
+        tombstone = profile_root / "profiles" / ".deleted" / canonical
+        return profile_dir.is_dir() and not tombstone.exists()
+
+    cleaned = list(argv)
+    explicit_profile = False
+    index = 0
+    while index < len(cleaned):
+        token = cleaned[index]
+        if token == "--":
+            break
+        if token in ("-p", "--profile"):
+            if index + 1 >= len(cleaned):
+                return False
+            profile_name = cleaned[index + 1]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_name):
+                return False
+            if not _profile_resolves(profile_name):
+                return False
+            del cleaned[index : index + 2]
+            explicit_profile = True
+            break
+        if token.startswith("--profile="):
+            profile_name = token.partition("=")[2]
+            if not _profile_resolves(profile_name):
+                return False
+            del cleaned[index]
+            explicit_profile = True
+            break
+        if "=" not in token and token in required_flags and index + 1 < len(cleaned):
+            index += 2
+            continue
+        if (
+            "=" not in token
+            and token in optional_flags
+            and index + 1 < len(cleaned)
+            and not cleaned[index + 1].startswith("-")
+        ):
+            index += 2
+            continue
+        index += 1
+
+    external_supervisor = os.environ.get(
+        "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    first_non_flag = next((item for item in argv if not item.startswith("-")), None)
+    supervised = bool(
+        os.environ.get("HERMES_SUPERVISED_CHILD")
+        or os.environ.get("HERMES_S6_SUPERVISED_CHILD")
+        or (first_non_flag == "gateway" and os.environ.get("INVOCATION_ID"))
+        or external_supervisor
+    )
+    desktop_ssh_backend = "--ssh-session-token-file" in argv
+
+    if (
+        not explicit_profile
+        and not supervised
+        and not desktop_ssh_backend
+        and not (
+            os.environ.get("HERMES_HOME", "").strip()
+            and _Path(os.environ["HERMES_HOME"]).parent.name == "profiles"
+        )
+    ):
+        env_home = os.environ.get("HERMES_HOME", "").strip()
+        active_root = _Path(env_home) if env_home else _Path.home() / ".hermes"
+        active_path = active_root / "active_profile"
+        try:
+            active_name = active_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            active_name = ""
+        if active_name and active_name.casefold() != "default":
+            if not _profile_resolves(active_name):
+                return False
+
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        try:
+            args = build_top_level_parser()[0].parse_args(cleaned)
+        except SystemExit:
+            return False
+
+    if getattr(args, "version", False):
+        return False
+    prompt = getattr(args, "oneshot", None)
+    toolsets_value = getattr(args, "toolsets", None)
+    if not prompt or toolsets_value is None:
+        return False
+    raw_tokens = [part.strip() for part in str(toolsets_value).split(",")]
+    normalized = [token for token in raw_tokens if token]
+    if not normalized:
+        return False
+    if any(token.lower() == _TOOLSETS_NONE_SENTINEL_RAW for token in raw_tokens):
+        return True
+    return len(normalized) > 1 and any(
+        token in ("all", "*") for token in normalized
+    )
+
+
+def _acquire_explicit_no_tools_lease(argv: "list[str]") -> "str | None":
+    """Establish the guard when argv selects a terminal no-tools outcome."""
+    prior = os.environ.get(_EXPLICIT_NO_TOOLS_ENV)
+    if _raw_oneshot_no_tools_preflight(argv):
+        os.environ[_EXPLICIT_NO_TOOLS_ENV] = "1"
+    return prior
+
+
+def _restore_explicit_no_tools_lease(prior: "str | None") -> None:
+    if prior is None:
+        os.environ.pop(_EXPLICIT_NO_TOOLS_ENV, None)
+    else:
+        os.environ[_EXPLICIT_NO_TOOLS_ENV] = prior
+
+
+_IMPORT_PREFLIGHT_LEASE = _acquire_explicit_no_tools_lease(sys.argv[1:])
+_IMPORT_PREFLIGHT_FRAME = sys._getframe()
+_IMPORT_PREFLIGHT_PREVIOUS_TRACE = sys.gettrace()
+_IMPORT_PREFLIGHT_PREVIOUS_LOCAL_TRACE = _IMPORT_PREFLIGHT_FRAME.f_trace
+_IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE = _IMPORT_PREFLIGHT_PREVIOUS_LOCAL_TRACE
+_IMPORT_PREFLIGHT_TRACE_ACTIVE = True
+
+
+def _finish_import_preflight_lease() -> None:
+    global _IMPORT_PREFLIGHT_TRACE_ACTIVE
+    if not _IMPORT_PREFLIGHT_TRACE_ACTIVE:
+        return
+    _IMPORT_PREFLIGHT_TRACE_ACTIVE = False
+    _restore_explicit_no_tools_lease(_IMPORT_PREFLIGHT_LEASE)
+    _IMPORT_PREFLIGHT_FRAME.f_trace = _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    sys.settrace(_IMPORT_PREFLIGHT_PREVIOUS_TRACE)
+
+
+def _import_preflight_local_trace(frame, event, arg):
+    global _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    prior_local = _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    if prior_local is not None:
+        _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE = prior_local(frame, event, arg)
+    if frame is _IMPORT_PREFLIGHT_FRAME and event == "return":
+        _finish_import_preflight_lease()
+        return _IMPORT_PREFLIGHT_CHAINED_LOCAL_TRACE
+    return _import_preflight_local_trace
+
+
+def _import_preflight_global_trace(frame, event, arg):
+    if frame is _IMPORT_PREFLIGHT_FRAME:
+        return _import_preflight_local_trace
+    if _IMPORT_PREFLIGHT_PREVIOUS_TRACE is not None:
+        return _IMPORT_PREFLIGHT_PREVIOUS_TRACE(frame, event, arg)
+    return None
+
+
+_IMPORT_PREFLIGHT_FRAME.f_trace = _import_preflight_local_trace
+sys.settrace(_import_preflight_global_trace)
+
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -2651,25 +2833,65 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 
 
 def _first_positional_argv() -> str | None:
-    """First non-flag, non-flag-value token in ``sys.argv[1:]`` (skips values of known flags).
+    """Return the first top-level positional using the live argparse surface."""
+    from hermes_cli._parser import build_top_level_parser
 
-    Not a full argparse simulation: an unknown ``--foo bar`` may classify
-    ``bar`` as positional, which at worst forces a one-time plugin discovery.
-    """
-    from hermes_cli._parser import top_level_value_flag_sets
+    parser = build_top_level_parser()[0]
+    actions = parser._option_string_actions
+    long_options = tuple(option for option in actions if option.startswith("--"))
 
-    required_value_flags, optional_value_flags = top_level_value_flag_sets()
-    value_flags = required_value_flags | optional_value_flags
+    def _resolve_long(name: str):
+        if name in actions:
+            return actions[name]
+        matches = [option for option in long_options if option.startswith(name)]
+        if len(matches) != 1:
+            return None
+        return actions[matches[0]]
+
     argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok == "--":  # everything after is positional
-            return argv[i + 1] if i + 1 < len(argv) else None
-        if not tok.startswith("-"):
-            return tok
-        # ``--flag=value`` is a single token; a known value flag consumes the next.
-        i += 2 if ("=" not in tok and tok in value_flags and i + 1 < len(argv)) else 1
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if not token.startswith("-") or token == "-":
+            return token
+
+        if token.startswith("--"):
+            name, separator, _inline = token.partition("=")
+            action = _resolve_long(name)
+            if action is None:
+                return token
+            if separator:
+                if action.nargs == 0:
+                    return token
+                index += 1
+                continue
+            if action.nargs == 0:
+                index += 1
+                continue
+            if action.nargs == "?":
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            index += 2
+            continue
+
+        body = token[1:]
+        consumed_following = False
+        for offset, char in enumerate(body):
+            action = actions.get(f"-{char}")
+            if action is None:
+                return token
+            if action.nargs == 0:
+                continue
+            if not body[offset + 1 :] and index + 1 < len(argv):
+                if action.nargs != "?" or not argv[index + 1].startswith("-"):
+                    consumed_following = True
+            break
+        index += 2 if consumed_following else 1
     return None
 
 
@@ -2752,6 +2974,21 @@ def _should_background_mcp_startup(args) -> bool:
     return not _is_tui_chat_launch(args) and args.command in {None, "chat", "rl"}
 
 
+def _oneshot_explicit_no_tools_precheck(args) -> bool:
+    """Return whether one-shot toolset validation is terminal before discovery."""
+    if not getattr(args, "oneshot", None):
+        return False
+    toolsets = getattr(args, "toolsets", None)
+    try:
+        from hermes_cli.oneshot import _precheck_explicit_toolsets
+
+        return _precheck_explicit_toolsets(toolsets) is not None
+    except Exception:
+        # An explicit value cannot be proven safe after a precheck failure.
+        # Fail closed; run_oneshot remains the authoritative error emitter.
+        return toolsets is not None
+
+
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
     # --yolo chokepoint: HERMES_YOLO_MODE must be set before any discovery
@@ -2764,6 +3001,9 @@ def _prepare_agent_startup(args) -> None:
     _apply_safe_mode(args)
     _apply_user_config_bypass(args)
     _guard_noninteractive_user_config(args)
+
+    if _oneshot_explicit_no_tools_precheck(args):
+        return
 
     if not (args.command in _AGENT_COMMANDS or _agent_subcommand_selected(args)):
         return
@@ -3349,7 +3589,16 @@ def _default_to_chat(args) -> None:
 
 
 def main():
-    """Main entry point for hermes CLI."""
+    """Run CLI dispatch under a launch-scoped explicit-no-tools lease."""
+    prior_guard = _acquire_explicit_no_tools_lease(sys.argv[1:])
+    try:
+        return _main_impl()
+    finally:
+        _restore_explicit_no_tools_lease(prior_guard)
+
+
+def _main_impl():
+    """Main argument-dispatch implementation."""
     _set_process_title()
     _advertise_agent_env()
 
