@@ -168,6 +168,10 @@ def _last_run_display(job: Dict[str, Any]) -> str:
     last_status = job["last_status"]
     if last_status == "ok":
         return color("ok", Colors.GREEN)
+    if last_status == "deferred":
+        defer = job.get("last_defer") or {}
+        retry_at = defer.get("retry_at") or job.get("next_run_at") or "?"
+        return color(f"deferred (retry at {retry_at})", Colors.YELLOW)
     if last_status == "delivery_queued":
         return color("delivery_queued: completion unverified; do not resend", Colors.YELLOW)
     if last_status == "delivery_failed":
@@ -271,9 +275,35 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
               f"{record.get('claimed_at', '?')}")
         if record.get("error"):
             print(f"    {record['error']}")
+        outcome = record.get("outcome")
+        if outcome and outcome != record.get("status"):
+            print(f"    outcome={outcome}")
+        if record.get("occurrence_key"):
+            retry_at = record.get("retry_at")
+            suffix = f"  retry_at={retry_at}" if retry_at else ""
+            print(f"    occurrence={record['occurrence_key']}{suffix}")
+        if record.get("delivery_target"):
+            print(
+                f"    delivery={record.get('delivery_status', '?')} "
+                f"target={record['delivery_target']} "
+                f"attempts={record.get('delivery_attempts', 0)}"
+            )
+            if record.get("delivery_error"):
+                print(f"      {record['delivery_error']}")
+        if record.get("detached_run_id"):
+            print(
+                f"    detached run={record['detached_run_id']} "
+                f"status={record.get('detached_status', '?')} "
+                f"lease_expires={record.get('lease_expires_at', '?')}"
+            )
 
 
-_INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "closed": Colors.GREEN}
+_INCIDENT_STATE_COLORS = {
+    "detected": Colors.RED,
+    "alerted": Colors.YELLOW,
+    "recovered": Colors.GREEN,
+    "closed": Colors.GREEN,
+}
 
 
 def cron_incidents(args) -> int:
