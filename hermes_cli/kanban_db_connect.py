@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -1144,6 +1145,23 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+def _unwind_savepoint(conn: Any, savepoint: str) -> Optional[BaseException]:
+    """Undo one savepoint, escalating cleanup failure to a full rollback."""
+    escalation: Optional[BaseException] = None
+    try:
+        conn.execute(f"ROLLBACK TO {savepoint}")
+        conn.execute(f"RELEASE {savepoint}")
+    except BaseException as cleanup_exc:  # noqa: BLE001 - boundary cleanup
+        escalation = cleanup_exc
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        except BaseException as rollback_exc:  # noqa: BLE001 - boundary cleanup
+            escalation = rollback_exc
+    return escalation
+
+
 class _UnknownTransactionState:
     """Sentinel for a connection whose transaction state cannot be trusted."""
 
@@ -1154,7 +1172,7 @@ _TXN_STATE_UNKNOWN = _UnknownTransactionState()
 
 
 def _probe_in_transaction(
-    conn: sqlite3.Connection,
+    conn: Any,
 ) -> tuple[bool | _UnknownTransactionState, Optional[BaseException]]:
     """Return an exact transaction state without trusting wrapper defaults."""
     try:
@@ -1169,8 +1187,18 @@ def _probe_in_transaction(
     )
 
 
+def _describe_transaction_state(conn: Any) -> str:
+    """Return fail-closed transaction-state prose for diagnostics."""
+    state, _ = _probe_in_transaction(conn)
+    if state is True:
+        return "still reports an open transaction"
+    if state is False:
+        return "reports no open transaction"
+    return "cannot report its transaction state"
+
+
 def _close_transaction_for_failure(
-    conn: sqlite3.Connection,
+    conn: Any,
 ) -> Optional[BaseException]:
     """Roll back and return ``None`` only when closure is proven."""
     pre_state, _ = _probe_in_transaction(conn)
@@ -1202,14 +1230,236 @@ class TransactionOutcomeUnknownError(RuntimeError):
     """Raised when transaction closure cannot be proven."""
 
 
+class ReceiptFinalizationError(RuntimeError):
+    """Raised when a durable mutation's receipt publication is interrupted."""
+
+
+LIFECYCLE_RECEIPT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class LifecycleReceipt:
+    """Versioned evidence for one committed lifecycle operation."""
+
+    operation: str
+    task_id: str
+    prior_status: Optional[str]
+    final_status: Optional[str]
+    newly_committed: bool
+    run_id: Optional[int] = None
+    event_id: Optional[int] = None
+    comment_id: Optional[int] = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+            "operation": self.operation,
+            "task_id": self.task_id,
+            "prior_status": self.prior_status,
+            "final_status": self.final_status,
+            "run_id": self.run_id,
+            "event_id": self.event_id,
+            "comment_id": self.comment_id,
+            "newly_committed": self.newly_committed,
+            "idempotent_replay": not self.newly_committed,
+        }
+
+
+class LifecycleReceiptCapture:
+    """Out-parameter that publishes evidence only after the outer commit."""
+
+    def __init__(self) -> None:
+        self._receipt: Optional[LifecycleReceipt] = None
+        self._active_connection_id: Optional[int] = None
+
+    @property
+    def receipt(self) -> Optional[LifecycleReceipt]:
+        return self._receipt
+
+    def clear(self) -> None:
+        self._receipt = None
+
+    def _bind(self, conn: Any) -> None:
+        key = id(conn)
+        if self._active_connection_id not in (None, key):
+            raise RuntimeError(
+                "lifecycle receipt capture is active on another connection"
+            )
+        self._active_connection_id = key
+        self._receipt = None
+
+    def _release(self, conn: Any) -> None:
+        if self._active_connection_id == id(conn):
+            self._active_connection_id = None
+
+    def _publish(self, conn: Any, receipt: LifecycleReceipt) -> None:
+        self._receipt = receipt
+        self._release(conn)
+
+    def _restore_unbound(self, conn: Any) -> None:
+        self._receipt = None
+        if self._active_connection_id == id(conn):
+            self._active_connection_id = None
+
+
+@dataclass
+class _ReceiptFrame:
+    owner_managed: bool
+    receipts: dict[LifecycleReceiptCapture, LifecycleReceipt] = field(
+        default_factory=dict
+    )
+    poisoned: Optional[BaseException] = None
+
+
+_RECEIPT_TXN_LOCK = threading.RLock()
+_RECEIPT_TXNS: dict[int, list[_ReceiptFrame]] = {}
+
+
+def _poison_receipt_transaction(conn: Any, cause: BaseException) -> None:
+    with _RECEIPT_TXN_LOCK:
+        for frame in _RECEIPT_TXNS.get(id(conn), ()):
+            if frame.poisoned is None:
+                frame.poisoned = cause
+
+
+def _take_receipt_poison(conn: Any) -> Optional[BaseException]:
+    with _RECEIPT_TXN_LOCK:
+        frames = _RECEIPT_TXNS.get(id(conn))
+        return frames[-1].poisoned if frames else None
+
+
+def _begin_receipt_transaction(conn: Any, *, owner_managed: bool) -> None:
+    with _RECEIPT_TXN_LOCK:
+        frames = _RECEIPT_TXNS.setdefault(id(conn), [])
+        inherited_owner = frames[-1].owner_managed if frames else owner_managed
+        frames.append(_ReceiptFrame(owner_managed=inherited_owner))
+
+
+def _stage_receipt(
+    conn: Any,
+    capture: Optional[LifecycleReceiptCapture],
+    receipt: LifecycleReceipt,
+) -> None:
+    """Stage evidence against the connection performing the mutation."""
+    if capture is None:
+        return
+    with _RECEIPT_TXN_LOCK:
+        frames = _RECEIPT_TXNS.get(id(conn))
+        if not frames or not frames[-1].owner_managed:
+            raise RuntimeError(
+                "receipt capture requires an owner-managed outer write transaction"
+            )
+        capture._bind(conn)
+        frames[-1].receipts[capture] = receipt
+
+
+def _finish_receipt_transaction(conn: Any, *, committed: bool) -> None:
+    """Merge a savepoint frame or publish one committed owner frame."""
+    publish: dict[LifecycleReceiptCapture, LifecycleReceipt] = {}
+    release: tuple[LifecycleReceiptCapture, ...] = ()
+    with _RECEIPT_TXN_LOCK:
+        key = id(conn)
+        frames = _RECEIPT_TXNS.get(key)
+        if not frames:
+            raise RuntimeError("receipt transaction tracking is not active")
+        frame = frames.pop()
+        if committed and frames:
+            frames[-1].receipts.update(frame.receipts)
+        elif committed and frame.owner_managed:
+            publish = frame.receipts
+        else:
+            parent_captures = {
+                capture for parent in frames for capture in parent.receipts
+            }
+            release = tuple(
+                capture
+                for capture in frame.receipts
+                if capture not in parent_captures
+            )
+        if not frames:
+            _RECEIPT_TXNS.pop(key, None)
+
+    release_failures: list[BaseException] = []
+    for capture in release:
+        try:
+            capture.clear()
+            capture._release(conn)
+        except BaseException as cleanup_exc:  # noqa: BLE001 - boundary cleanup
+            capture._restore_unbound(conn)
+            release_failures.append(cleanup_exc)
+    if release_failures:
+        original = sys.exc_info()[1]
+        if original is not None:
+            for cleanup_exc in release_failures:
+                original.add_note(
+                    "receipt capture cleanup was itself interrupted: "
+                    f"{cleanup_exc!r}"
+                )
+
+    published: set[LifecycleReceiptCapture] = set()
+    try:
+        for capture, receipt in publish.items():
+            capture._publish(conn, receipt)
+            published.add(capture)
+    except BaseException as exc:  # noqa: BLE001 - boundary publication
+        cleanup_failures: list[BaseException] = []
+        for capture in publish:
+            if capture not in published:
+                try:
+                    capture.clear()
+                    capture._release(conn)
+                except BaseException as cleanup_exc:  # noqa: BLE001
+                    capture._restore_unbound(conn)
+                    cleanup_failures.append(cleanup_exc)
+        error = ReceiptFinalizationError(
+            "transaction committed durably but receipt publication was "
+            "interrupted; unpublished captures were cleared -- perform an "
+            "authoritative readback for evidence"
+        )
+        for cleanup_exc in cleanup_failures:
+            error.add_note(
+                "receipt capture cleanup was itself interrupted: "
+                f"{cleanup_exc!r}"
+            )
+        raise error from exc
+
+
+def _clear_receipt_capture(
+    conn: Any,
+    capture: Optional[LifecycleReceiptCapture],
+) -> None:
+    """Clear visible and staged evidence when a capture is reused."""
+    if capture is None:
+        return
+    with _RECEIPT_TXN_LOCK:
+        if capture._active_connection_id not in (None, id(conn)):
+            raise RuntimeError(
+                "lifecycle receipt capture is active on another connection"
+            )
+        capture.clear()
+        for frame in _RECEIPT_TXNS.get(id(conn), ()):
+            frame.receipts.pop(capture, None)
+        capture._release(conn)
+
+
 @contextlib.contextmanager
-def read_txn(conn: sqlite3.Connection):
+def read_txn(conn: Any):
     """Pin a consistent multi-statement read and prove boundary closure."""
     entry_state, _ = _probe_in_transaction(conn)
     if entry_state is True:
         yield conn
         return
-    conn.execute("BEGIN")
+    try:
+        conn.execute("BEGIN")
+    except BaseException as exc:  # noqa: BLE001 - interrupt-safe boundary
+        cleanup_failure = _close_transaction_for_failure(conn)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "read transaction BEGIN failed and rollback cleanup could not "
+                f"prove closure (cleanup: {cleanup_failure!r}); the connection "
+                f"{_describe_transaction_state(conn)}"
+            ) from exc
+        raise
     try:
         yield conn
     except BaseException as body_exc:  # noqa: BLE001 - interrupt-safe boundary
@@ -1231,18 +1481,11 @@ def read_txn(conn: sqlite3.Connection):
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
-    """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one
-    concurrent writer succeeds.
-
-    Nesting is an explicit opt-in (``allow_nested=True`` → savepoint; otherwise
-    a loud ``RuntimeError``). Only composition primitives (``create_task``,
-    ``add_comment``) opt in — helpers with post-commit side effects
-    (``complete_task`` & co.) must never run under an open outer transaction,
-    since those side effects would fire while the outer txn can still roll back.
-    """
+def write_txn(conn: Any, *, allow_nested: bool = False):
+    """Run an interrupt-safe IMMEDIATE write transaction or nested savepoint."""
     _kb._assert_not_delegated_child_mutation()
-    if getattr(conn, "in_transaction", False):
+    entry_state, _ = _probe_in_transaction(conn)
+    if entry_state is True:
         if not allow_nested:
             raise RuntimeError(
                 "write_txn: already inside a transaction. Nested composition "
@@ -1252,37 +1495,107 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         conn.execute(f"SAVEPOINT {savepoint}")
+        _begin_receipt_transaction(conn, owner_managed=False)
         try:
             yield conn
-        except Exception:
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute(f"ROLLBACK TO {savepoint}")
-                conn.execute(f"RELEASE {savepoint}")
+        except BaseException:
+            escalation = _unwind_savepoint(conn, savepoint)
+            try:
+                if escalation is not None:
+                    _poison_receipt_transaction(conn, escalation)
+            finally:
+                _finish_receipt_transaction(conn, committed=False)
             raise
         else:
-            conn.execute(f"RELEASE {savepoint}")
+            try:
+                conn.execute(f"RELEASE {savepoint}")
+            except BaseException:
+                escalation = _unwind_savepoint(conn, savepoint)
+                try:
+                    if escalation is not None:
+                        _poison_receipt_transaction(conn, escalation)
+                finally:
+                    _finish_receipt_transaction(conn, committed=False)
+                raise
+            _finish_receipt_transaction(conn, committed=True)
         return
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    _begin_receipt_transaction(conn, owner_managed=True)
+    try:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    except BaseException as exc:
+        try:
+            cleanup_failure = _close_transaction_for_failure(conn)
+        finally:
+            _finish_receipt_transaction(conn, committed=False)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "BEGIN boundary failed and rollback cleanup could not prove "
+                "the transaction closed (cleanup: "
+                f"{cleanup_failure!r}); the connection "
+                f"{_describe_transaction_state(conn)}"
+            ) from exc
+        raise
     try:
         yield conn
-    except Exception:
-        # SQLite may already have auto-rolled-back (EIO, contention, corruption);
-        # don't let this secondary failure shadow the real one.
-        with contextlib.suppress(sqlite3.OperationalError):
-            conn.execute("ROLLBACK")
+    except BaseException as exc:
+        try:
+            cleanup_failure = _close_transaction_for_failure(conn)
+        finally:
+            _finish_receipt_transaction(conn, committed=False)
+        if cleanup_failure is not None:
+            raise TransactionOutcomeUnknownError(
+                "write transaction failed and rollback cleanup was itself "
+                f"interrupted (cleanup: {cleanup_failure!r}); the connection "
+                f"{_describe_transaction_state(conn)} -- the mutation must be "
+                "treated as neither committed nor rolled back until an "
+                "authoritative readback"
+            ) from exc
         raise
     else:
+        poison = _take_receipt_poison(conn)
+        if poison is not None:
+            try:
+                _close_transaction_for_failure(conn)
+            finally:
+                _finish_receipt_transaction(conn, committed=False)
+            raise TransactionOutcomeUnknownError(
+                "a nested savepoint escalation invalidated this write "
+                "transaction; COMMIT was skipped -- perform an authoritative "
+                "readback on a fresh connection"
+            ) from poison
         try:
             _execute_boundary_with_retry(conn, "COMMIT")
-        except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
-            with contextlib.suppress(sqlite3.OperationalError):
-                conn.execute("ROLLBACK")
-            raise
-        # Post-commit torn-extend check — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        except BaseException as exc:
+            commit_state, _ = _probe_in_transaction(conn)
+            if commit_state is not False:
+                try:
+                    cleanup_failure = _close_transaction_for_failure(conn)
+                finally:
+                    _finish_receipt_transaction(conn, committed=False)
+                if cleanup_failure is not None:
+                    raise TransactionOutcomeUnknownError(
+                        "COMMIT failed and rollback cleanup was itself "
+                        f"interrupted (cleanup: {cleanup_failure!r}); the "
+                        "transaction outcome cannot be proven"
+                    ) from exc
+                raise
+            _finish_receipt_transaction(conn, committed=False)
+            raise TransactionOutcomeUnknownError(
+                "COMMIT raised but the connection reports no open transaction "
+                "-- the commit may have executed durably; perform an "
+                "authoritative readback on a fresh connection"
+            ) from exc
+        try:
+            _check_file_length_invariant(conn)
+        except BaseException as exc:
+            _finish_receipt_transaction(conn, committed=False)
+            raise TransactionOutcomeUnknownError(
+                "transaction committed but post-commit durability verification "
+                "failed; the mutation may be durable -- perform an authoritative "
+                "readback on a fresh connection"
+            ) from exc
+        _finish_receipt_transaction(conn, committed=True)
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this

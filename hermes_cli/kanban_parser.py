@@ -276,6 +276,7 @@ _SPECS = [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
         _arg("--claimer", help="Explicit claim identity; matching retries are idempotent"),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [
         _TASK_ID,
@@ -286,6 +287,7 @@ _SPECS = [
              help="Only comment if the task still has this exact status."),
         _arg("--if-absent", action="store_true",
              help="Succeed without writing when this exact author and comment body already exist."),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,
@@ -314,6 +316,7 @@ _SPECS = [
             type=_positive_run_id,
             help="Only complete if this exact positive owning run is still current.",
         ),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
@@ -338,6 +341,7 @@ _SPECS = [
             type=_positive_run_id,
             help="Only block if this exact positive owning run is still current.",
         ),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -350,6 +354,7 @@ _SPECS = [
              help="Only unblock a blocked task with this exact typed block kind."),
         _arg("--author", help="Explicit author for the transactional UNBLOCK reason comment."),
         _TASK_IDS,
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,
@@ -366,6 +371,7 @@ _SPECS = [
             type=_positive_run_id,
             help="Only request review if this exact positive owning run is still current.",
         ),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),

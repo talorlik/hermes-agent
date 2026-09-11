@@ -1760,8 +1760,10 @@ def add_comment(
     *,
     expected_status: Optional[str] = None,
     if_absent: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> int:
     """Append a comment when its guard matches, optionally deduplicating retries."""
+    _clear_receipt_capture(conn, receipt_capture)
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -1789,12 +1791,39 @@ def add_comment(
                 (task_id, author.strip(), body.strip()),
             ).fetchone()
             if existing is not None:
+                _stage_receipt(
+                    conn,
+                    receipt_capture,
+                    LifecycleReceipt(
+                        operation="comment",
+                        task_id=task_id,
+                        prior_status=row["status"],
+                        final_status=row["status"],
+                        newly_committed=False,
+                        comment_id=int(existing["id"]),
+                    ),
+                )
                 return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        event_id = _append_event(
+            conn, task_id, "commented", {"author": author, "len": len(body)}
+        )
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="comment",
+                task_id=task_id,
+                prior_status=row["status"],
+                final_status=row["status"],
+                newly_committed=True,
+                event_id=event_id,
+                comment_id=int(cur.lastrowid or 0),
+            ),
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -1958,12 +1987,13 @@ def _insert_comment(
 def _append_event(
     conn: sqlite3.Connection, task_id: str, kind: str, payload: Optional[dict] = None, *,
     run_id: Optional[int] = None,
-) -> None:
-    """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
-    conn.execute(
+) -> int:
+    """Insert an event row and return its stable id inside the caller's transaction."""
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
     )
+    return int(cur.lastrowid or 0)
 
 
 def _end_run(
@@ -2245,6 +2275,7 @@ def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
     idempotent_replay: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2252,6 +2283,7 @@ def claim_task(
     already claimed (or is not in ``ready`` status). Idempotent replay accepts
     only the same explicit claimer on an intact, unexpired current run.
     """
+    _clear_receipt_capture(conn, receipt_capture)
     if idempotent_replay and (
         not isinstance(claimer, str) or not claimer.strip()
     ):
@@ -2293,6 +2325,29 @@ def claim_task(
                     and int(run_claim_expires) == int(claim_expires)
                     and current["run_ended_at"] is None
                 ):
+                    if receipt_capture is not None:
+                        replay_run_id = int(current["current_run_id"])
+                        event = conn.execute(
+                            "SELECT id FROM task_events "
+                            "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+                            "ORDER BY id ASC LIMIT 1",
+                            (task_id, replay_run_id),
+                        ).fetchone()
+                        if event is None:
+                            return None
+                        _stage_receipt(
+                            conn,
+                            receipt_capture,
+                            LifecycleReceipt(
+                                operation="claim",
+                                task_id=task_id,
+                                prior_status="running",
+                                final_status="running",
+                                newly_committed=False,
+                                run_id=replay_run_id,
+                                event_id=int(event["id"]),
+                            ),
+                        )
                     return get_task(conn, task_id)
                 return None
         # Single enforcement point: never ready -> running with an undone
@@ -2312,6 +2367,28 @@ def claim_task(
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
             return None
+        if receipt_capture is not None:
+            event = conn.execute(
+                "SELECT id FROM task_events "
+                "WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, int(run_id)),
+            ).fetchone()
+            if event is None:
+                raise RuntimeError("claimed event missing inside claim transaction")
+            _stage_receipt(
+                conn,
+                receipt_capture,
+                LifecycleReceipt(
+                    operation="claim",
+                    task_id=task_id,
+                    prior_status="ready",
+                    final_status="running",
+                    newly_committed=True,
+                    run_id=int(run_id),
+                    event_id=int(event["id"]),
+                ),
+            )
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
@@ -2687,6 +2764,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     expected_status: Optional[str] = None,
     fire_lifecycle_hook: bool = True,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2698,6 +2776,7 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    _clear_receipt_capture(conn, receipt_capture)
     now = int(time.time())
     if expected_status is not None and expected_status not in VALID_STATUSES:
         raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
@@ -2793,10 +2872,23 @@ def complete_task(
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
-        _append_event(
+        event_id = _append_event(
             conn, task_id, "completed",
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
+        )
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="complete",
+                task_id=task_id,
+                prior_status=prior_status,
+                final_status="done",
+                newly_committed=True,
+                run_id=run_id,
+                event_id=event_id,
+            ),
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
@@ -3111,12 +3203,15 @@ def block_task(
     expected_status: Optional[str] = None,
     reason_comment_author: Optional[str] = None,
     with_reason: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ):
     """Block a task when every optional lifecycle CAS guard still matches.
 
     A guarded reason comment is part of the same SQLite transaction. Stale
     guards therefore leave no run, event, comment, status, or hook side effect.
     """
+
+    _clear_receipt_capture(conn, receipt_capture)
 
     def _ret(ok: bool, why: Optional[str] = None):
         return (ok, why) if with_reason else ok
@@ -3183,14 +3278,29 @@ def block_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        event_id = _append_event(
+            conn, task_id, event_kind, payload, run_id=run_id
+        )
+        comment_id = None
         if reason and reason_comment_author:
-            add_comment(conn, task_id, reason_comment_author, f"BLOCKED: {reason}")
+            comment_id = add_comment(
+                conn, task_id, reason_comment_author, f"BLOCKED: {reason}"
+            )
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="block",
+                task_id=task_id,
+                prior_status=cur_row["status"],
+                final_status=new_status,
+                newly_committed=True,
+                run_id=run_id,
+                event_id=event_id,
+                comment_id=comment_id,
+            ),
+        )
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return _ret(True)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return _ret(True)
 
@@ -3232,6 +3342,7 @@ def request_review(
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, expected_status: Optional[str] = None,
     force: bool = False, with_reason: bool = False,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3241,6 +3352,8 @@ def request_review(
     claim is only cleared with proof of ownership (``expected_run_id``) or
     ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
     """
+
+    _clear_receipt_capture(conn, receipt_capture)
 
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
@@ -3314,7 +3427,7 @@ def request_review(
             conn, task_id, outcome="review_requested", status="review",
             summary=summary, metadata=metadata, synthesize=bool(summary or metadata),
         )
-        _append_event(
+        event_id = _append_event(
             conn,
             task_id,
             "review_requested",
@@ -3324,6 +3437,19 @@ def request_review(
                 "reviewer": reviewer,
             },
             run_id=run_id,
+        )
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="request_review",
+                task_id=task_id,
+                prior_status=trow["status"],
+                final_status="review",
+                newly_committed=True,
+                run_id=run_id,
+                event_id=event_id,
+            ),
         )
     return _ret(True)
 
@@ -3504,12 +3630,14 @@ def unblock_task(
     expected_block_kind: Optional[str] = None,
     reason: Optional[str] = None,
     reason_comment_author: Optional[str] = None,
+    receipt_capture: Optional[LifecycleReceiptCapture] = None,
 ) -> bool:
     """Resume a blocked task when its optional typed-block CAS guard matches.
 
     Guarded reason comments and durable event evidence share the status-change
     transaction, so stale observations and comment failures leave no trace.
     """
+    _clear_receipt_capture(conn, receipt_capture)
     if (
         expected_block_kind is not None
         and expected_block_kind not in VALID_UNBLOCK_EXPECTED_KINDS
@@ -3560,8 +3688,11 @@ def unblock_task(
         )
         if cur.rowcount != 1:
             return False
+        comment_id = None
         if reason and reason_comment_author:
-            add_comment(conn, task_id, reason_comment_author, f"UNBLOCK: {reason}")
+            comment_id = add_comment(
+                conn, task_id, reason_comment_author, f"UNBLOCK: {reason}"
+            )
         payload: Optional[dict] = (
             {"status": new_status, "resume_status": resume_status}
             if new_status != "ready" or resume_status != "ready"
@@ -3570,7 +3701,20 @@ def unblock_task(
         if reason:
             payload = dict(payload or {})
             payload["reason"] = reason
-        _append_event(conn, task_id, "unblocked", payload)
+        event_id = _append_event(conn, task_id, "unblocked", payload)
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="unblock",
+                task_id=task_id,
+                prior_status=current["status"] if current is not None else None,
+                final_status=new_status,
+                newly_committed=True,
+                event_id=event_id,
+                comment_id=comment_id,
+            ),
+        )
         return True
 
 
@@ -4428,7 +4572,11 @@ def build_task_snapshot(
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_connect import (  # noqa: E402
+    LifecycleReceipt,
+    LifecycleReceiptCapture,
     _INITIALIZED_PATHS,
+    _clear_receipt_capture,
+    _stage_receipt,
     init_db,
     read_txn,
     write_txn,

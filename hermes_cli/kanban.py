@@ -14,7 +14,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -711,7 +711,26 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
+def _emit_receipt(
+    capture: kbc.LifecycleReceiptCapture,
+    operation: str,
+) -> int:
+    """Print committed evidence or fail instead of fabricating a receipt."""
+    if capture.receipt is None:
+        return _err(
+            f"kanban: {operation} succeeded but no receipt evidence was captured"
+        )
+    _print_json(capture.receipt.to_json_dict())
+    return 0
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
+    receipt_capture = (
+        kbc.LifecycleReceiptCapture() if getattr(args, "json", False) else None
+    )
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
         claimer = getattr(args, "claimer", None)
         task = kb.claim_task(
@@ -720,6 +739,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             ttl_seconds=args.ttl,
             claimer=claimer,
             idempotent_replay=claimer is not None,
+            **receipt_kwargs,
         )
         if task is None:
             existing = kb.get_task(conn, args.task_id)
@@ -729,6 +749,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
+    if receipt_capture is not None:
+        return _emit_receipt(receipt_capture, "claim")
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 
@@ -743,6 +765,12 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     if_absent = bool(getattr(args, "if_absent", False))
+    receipt_capture = (
+        kbc.LifecycleReceiptCapture() if getattr(args, "json", False) else None
+    )
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
         kb.add_comment(
             conn,
@@ -751,7 +779,10 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body,
             expected_status=getattr(args, "expected_status", None),
             if_absent=if_absent,
+            **receipt_kwargs,
         )
+    if receipt_capture is not None:
+        return _emit_receipt(receipt_capture, "comment")
     verb = "ensured on" if if_absent else "added to"
     print(f"Comment {verb} {args.task_id}")
     return 0
@@ -915,6 +946,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     expected_status = getattr(args, "expected_status", None)
     explicit_run_id = getattr(args, "expected_run_id", None)
+    as_json = bool(getattr(args, "json", False))
+    if as_json and len(ids) != 1:
+        return _err("kanban: --json cannot be used with multiple task ids", 2)
     if explicit_run_id is not None and len(ids) != 1:
         return _err(
             "kanban: --expected-run-id cannot be used with multiple task ids",
@@ -935,6 +969,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if rc:
         return rc
     fail_msg: dict[str, str] = {}
+    receipt_capture = kbc.LifecycleReceiptCapture() if as_json else None
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
         def op(tid):
             gate_err = _goal_gate_error(
@@ -970,9 +1008,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     expected_run_id if len(ids) == 1 else _worker_run_id_for(tid)
                 ),
                 expected_status=expected_status,
+                **receipt_kwargs,
             )
 
-        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+        if as_json:
+            if not op(ids[0]):
+                return _err(fail_msg[ids[0]])
+        else:
+            return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+    assert receipt_capture is not None
+    return _emit_receipt(receipt_capture, "complete")
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
@@ -1009,6 +1054,9 @@ def _cmd_block(args: argparse.Namespace) -> int:
     else:
         author = _profile_author()
     ids = _bulk_ids(args)
+    as_json = bool(getattr(args, "json", False))
+    if as_json and len(ids) != 1:
+        return _err("kanban: --json cannot be used with multiple task ids", 2)
     explicit_run_id = getattr(args, "expected_run_id", None)
     if explicit_run_id is not None and len(ids) != 1:
         return _err(
@@ -1023,6 +1071,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
         return _err(f"kanban: {exc}", 2)
     suffix = f": {reason}" if reason else ""
     fail_msg: dict[str, str] = {}
+    receipt_capture = kbc.LifecycleReceiptCapture() if as_json else None
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -1038,6 +1090,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
             expected_status is None
             and explicit_author is None
             and explicit_run_id is None
+            and not as_json
         ):
             op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
                 conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
@@ -1055,10 +1108,13 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 expected_status=expected_status,
                 reason_comment_author=author if reason else None,
                 with_reason=(
-                    expected_status is not None or explicit_run_id is not None
+                    expected_status is not None
+                    or explicit_run_id is not None
+                    or as_json
                 ),
+                **receipt_kwargs,
             )
-            if expected_status is not None or explicit_run_id is not None:
+            if expected_status is not None or explicit_run_id is not None or as_json:
                 ok, refusal = cast(tuple[bool, Optional[str]], block_result)
                 fail_msg[tid] = (
                     f"refusing to block {tid}: "
@@ -1069,6 +1125,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 fail_msg[tid] = f"cannot block {tid}"
             return ok
 
+        if as_json:
+            if not transactional_op(ids[0]):
+                return _err(fail_msg[ids[0]])
+            assert receipt_capture is not None
+            return _emit_receipt(receipt_capture, "block")
         return _bulk_apply(ids, transactional_op, ok_msg, fail_msg.__getitem__)
 
 
@@ -1089,6 +1150,9 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
     if rc:
         return rc
+    as_json = bool(getattr(args, "json", False))
+    if as_json and len(ids) != 1:
+        return _err("kanban: --json cannot be used with multiple task ids", 2)
     reason = _stripped_or_none(getattr(args, "reason", None))
     explicit_author = getattr(args, "author", None)
     if explicit_author is not None:
@@ -1102,8 +1166,12 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         author = _profile_author() if reason else None
     expected_kind = getattr(args, "expected_block_kind", None)
     suffix = f": {reason}" if reason else ""
+    receipt_capture = kbc.LifecycleReceiptCapture() if as_json else None
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
-        if expected_kind is None and explicit_author is None:
+        if expected_kind is None and explicit_author is None and not as_json:
             op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
             return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                                lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
@@ -1115,6 +1183,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 expected_block_kind=expected_kind,
                 reason=reason,
                 reason_comment_author=author,
+                **receipt_kwargs,
             )
 
         def fail_msg(tid):
@@ -1128,6 +1197,15 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 f"kind {expected_kind!r}, task is {actual}"
             )
 
+        if as_json:
+            if not guarded_op(ids[0]):
+                if expected_kind is None:
+                    return _err(
+                        f"cannot unblock {ids[0]} (not blocked/scheduled?)"
+                    )
+                return _err(fail_msg(ids[0]))
+            assert receipt_capture is not None
+            return _emit_receipt(receipt_capture, "unblock")
         return _bulk_apply(
             ids, guarded_op, lambda tid: f"Unblocked {tid}{suffix}", fail_msg,
         )
@@ -1135,6 +1213,12 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
+    receipt_capture = (
+        kbc.LifecycleReceiptCapture() if getattr(args, "json", False) else None
+    )
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     try:
         expected_run_id = _expected_run_id_for(args, tid)
     except ValueError as exc:
@@ -1150,15 +1234,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             "Provide acceptance evidence matching the task.")
         if gate_err:
             return _err(gate_err)
-        ok, reason = kb.request_review(
+        review_result = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
             expected_run_id=expected_run_id,
             expected_status=getattr(args, "expected_status", None),
-            force=bool(getattr(args, "force", False)), with_reason=True)
+            force=bool(getattr(args, "force", False)), with_reason=True,
+            **receipt_kwargs)
+        ok, reason = cast(tuple[bool, Optional[str]], review_result)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
         display_summary = persisted_run.summary if persisted_run else None
+        if receipt_capture is not None:
+            return _emit_receipt(receipt_capture, "request-review")
         print(f"Requested review for {tid}" + (f": {display_summary}" if display_summary else ""))
     return 0
 
