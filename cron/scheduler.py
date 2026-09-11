@@ -2843,6 +2843,17 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    if d.success:
+        try:
+            from cron.incidents import record_recovery
+
+            record_recovery(job["id"])
+        except Exception:
+            logger.debug(
+                "Failed recording incident recovery for job %s",
+                job["id"],
+                exc_info=True,
+            )
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -2853,11 +2864,30 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         incident_acked=d.incident_acked,
         success=d.success,
     )
-    if delivery_outcome in ("delivered", "not_configured") and not d.success:
-        # Failure ping left the process (or had a configured target): mark the incident alerted.
+    if delivery_outcome == "delivered" and not d.success:
+        # Only an alert that actually left the process marks the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
-    finish_execution(
+    execution = finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    normalized_deliver = _normalize_deliver_value(
+        _delivery_lane_value(job, for_failure=not d.success)
+    )
+    if execution is not None and normalized_deliver != "local":
+        try:
+            from cron.executions import record_delivery
+
+            record_delivery(
+                execution_id,
+                target=normalized_deliver,
+                status=delivery_outcome,
+                error=d.delivery_error,
+            )
+        except Exception:
+            logger.debug(
+                "Execution delivery record failed for job %s",
+                job["id"],
+                exc_info=True,
+            )
     return True
 
 
@@ -2893,7 +2923,7 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if delivery_outcome == "delivered":
         _mark_incident_alerted(failure_incident_id)
     return delivery_error, delivery_outcome
 
