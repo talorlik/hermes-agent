@@ -274,10 +274,14 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
         return None, f"Blocked: script path contains a NUL byte: {script_path!r}"
     try:
         raw = _sched.Path(script_path).expanduser()
+        path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
     except (ValueError, RuntimeError, OSError):
-        # RuntimeError: unexpandable ``~`` (no resolvable HOME).
-        return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+        # RuntimeError: unexpandable ``~`` (no resolvable HOME). OSError:
+        # filesystem rejection such as an overlong path. Preserve the supplied
+        # value for the caller's mandatory redaction boundary.
+        return None, (
+            f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+        )
 
     # Traversal / absolute-path / symlink escape guard — MUST stay inside HERMES_HOME/scripts/.
     try:
@@ -287,10 +291,15 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
         )
-    if not path.exists():
-        return None, f"Script not found: {path}"
-    if not path.is_file():
-        return None, f"Script path is not a file: {path}"
+    try:
+        if not path.exists():
+            return None, f"Script not found: {path}"
+        if not path.is_file():
+            return None, f"Script path is not a file: {path}"
+    except OSError:
+        return None, (
+            f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+        )
     return path, None
 
 
@@ -314,6 +323,22 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
     return [python_exe, str(path)], env_overlay, None
 
 
+_CRON_SCRIPT_REDACTION_FAILURE = "[REDACTED - cron script result unavailable]"
+
+
+def _redact_job_script_result(success: bool, output: object) -> tuple[bool, str]:
+    """Force-redact one script runner result, failing safe if scrubbing breaks."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            str(output), force=True, redact_url_credentials=True
+        )
+    except Exception:
+        redacted = _CRON_SCRIPT_REDACTION_FAILURE
+    return success, redacted
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
@@ -328,13 +353,18 @@ def _run_job_script(
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396.
     """
-    path, err = _resolve_script_path(script_path)
+    try:
+        path, err = _resolve_script_path(script_path)
+    except (ValueError, RuntimeError, OSError):
+        return _redact_job_script_result(
+            False, "Blocked: Hermes scripts directory is unavailable"
+        )
     if path is None:
-        return False, err
+        return _redact_job_script_result(False, err)
     script_timeout = _get_script_timeout()
     argv, env_overlay, err = _script_argv(path)
     if argv is None:
-        return False, err
+        return _redact_job_script_result(False, err)
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -365,7 +395,9 @@ def _run_job_script(
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
+                return _redact_job_script_result(
+                    False, "Script cancelled because cron fire ownership was lost"
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)
@@ -376,7 +408,9 @@ def _run_job_script(
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
                 # signalling, so own-session grandchildren are reached too — the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return _redact_job_script_result(
+                    False, f"Script timed out after {script_timeout}s: {path}"
+                )
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
@@ -386,25 +420,16 @@ def _run_job_script(
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
 
-        # Redact secrets before ANY return path.
-        try:
-            from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
-        except Exception as e:
-            logger.warning("Failed to redact sensitive text from output: %s", e)
-            stdout = stderr = "[REDACTED - redaction failed]"
-
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
-        return True, stdout
+            return _redact_job_script_result(False, "\n".join(parts))
+        return _redact_job_script_result(True, stdout)
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        return _redact_job_script_result(False, f"Script execution failed: {exc}")
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

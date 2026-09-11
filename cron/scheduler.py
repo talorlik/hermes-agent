@@ -1928,12 +1928,54 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str) -> str:
 _RunResult = tuple[bool, str, str, Optional[str]]
 
 
+class _CronScriptFailure(str):
+    """Scheduler-owned typed marker for a fail-closed pre-script failure."""
+
+
+FAIL_CLOSED_SCRIPT_FAILURE = _CronScriptFailure(
+    "Pre-run script failed before agent start; agent and model were not invoked."
+)
+
+
+def _fail_closed_script_result(
+    job_id: str, job_name: str, script_output: str,
+) -> tuple[bool, str, str, _CronScriptFailure]:
+    """Build a bounded failure document without promoting script text to control data."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        script_error = redact_sensitive_text(
+            str(script_output or "Script failed"),
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        script_error = "[REDACTED - script failure details unavailable]"
+    if len(script_error) > 2000:
+        script_error = script_error[:1997].rstrip() + "..."
+    failure_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "**Status:** script failed before agent start\n\n"
+        f"{script_error}\n"
+    )
+    return False, failure_doc, "", FAIL_CLOSED_SCRIPT_FAILURE
+
+
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    from cron.jobs import get_job_script_failure_policy
+
+    try:
+        script_failure_policy = get_job_script_failure_policy(job)
+    except ValueError as exc:
+        return _block_and_pause_job(job_id, job_name, str(exc)), None
+
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -1971,6 +2013,13 @@ def _prepare_job_prompt(
     if script_path:
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path, cancel_event=cancel_event)
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok and script_failure_policy == "fail_closed":
+            result = _fail_closed_script_result(job_id, job_name, _script_output)
+            logger.error(
+                "Job '%s' (ID: %s): pre-run script failed closed; agent not started: %s",
+                job_name, job_id, result[3],
+            )
+            return result, None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             silent_doc = (
@@ -2534,12 +2583,28 @@ def _compose_run_delivery(
     silent_alert, incident_acked, failure_incident_id)``; ``silent_alert``: an alert-once marker
     says the operator was already told, deliver nothing."""
     err = str(error) if error else ""
+    script_failure = isinstance(error, _CronScriptFailure)
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
-    blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
-    blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
+    blocked_config_silent = not script_failure and BLOCKED_CONFIG_SILENT_MARKER in err
+    blocked_config = blocked_config_silent or (
+        not script_failure and BLOCKED_CONFIG_MARKER in err
+    )
     incident_acked = False
     failure_incident_id = None
-    if blocked_config and not success:
+    if script_failure and not success:
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(
+            job, error, output_file=output_file
+        )
+        if incident_acked:
+            deliver_content = ""
+        else:
+            deliver_content = (
+                f"⚠️ Cron '{job.get('name') or job['id']}' fail-closed "
+                "pre-run script failed. The agent and model were not invoked. "
+                "Full details saved in cron output."
+                + _failure_streak_nudge(job)
+            )
+    elif blocked_config and not success:
         # Bypass the generic failure summarizer (its auth/timeout heuristics would mislabel this).
         _pf_text = re.sub(r"\[blocked_config[^\]]*\]\s*", "", err).strip()
         deliver_content = (

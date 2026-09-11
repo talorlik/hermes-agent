@@ -425,6 +425,35 @@ NO_AGENT_WITHOUT_SCRIPT_ERROR = (
     "there is nothing for the job to run."
 )
 
+SCRIPT_FAILURE_POLICIES = frozenset({"continue", "fail_closed"})
+SCRIPT_FAILURE_POLICY_WITHOUT_SCRIPT_ERROR = (
+    "script_failure_policy='fail_closed' requires a nonblank script."
+)
+
+
+def validate_script_failure_policy(value: Any) -> str:
+    """Return a canonical policy or reject malformed explicit/stored values."""
+    if not isinstance(value, str) or value not in SCRIPT_FAILURE_POLICIES:
+        allowed = ", ".join(sorted(SCRIPT_FAILURE_POLICIES))
+        raise ValueError(
+            f"Invalid script_failure_policy {value!r}. Allowed values: {allowed}."
+        )
+    return value
+
+
+def get_job_script_failure_policy(job: Dict[str, Any]) -> str:
+    """Validate a stored policy, defaulting only a genuinely missing key."""
+    if "script_failure_policy" not in job:
+        return "continue"
+    return validate_script_failure_policy(job["script_failure_policy"])
+
+
+def _normalize_script_failure_policy(value: Any) -> str:
+    """Default an omitted create-time policy while rejecting explicit values."""
+    if value is None:
+        return "continue"
+    return validate_script_failure_policy(value)
+
 
 def job_payload_is_empty(job: Dict[str, Any]) -> bool:
     """True when a job record has nothing runnable (blank prompt, no script, no skills) AND at
@@ -457,6 +486,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized = _apply_skill_fields(job)
     job_id = normalized["id"] = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = normalized["prompt"] = _coerce_job_text(normalized.get("prompt"))
+    normalized.setdefault("script_failure_policy", "continue")
     name = _coerce_job_text(normalized.get("name")).strip()
     if not name:
         label_source = (
@@ -1581,6 +1611,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "provider": _normalize_job_optional_text,
     "base_url": _normalize_base_url,
     "script": _normalize_job_optional_text,
+    "script_failure_policy": _normalize_script_failure_policy,
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "enabled_toolsets": lambda v: _normalize_str_list(v) if v else None,
@@ -1594,6 +1625,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "script_failure_policy": validate_script_failure_policy,
 }
 
 
@@ -1646,6 +1678,7 @@ def _validate_job_mode_invariants(
     monitor_url: Optional[str],
     no_agent: bool,
     script: Optional[str],
+    script_failure_policy: str = "continue",
 ) -> None:
     """Execution-mode invariants shared by create_job and update_job (no bypass via the update
     door)."""
@@ -1660,6 +1693,8 @@ def _validate_job_mode_invariants(
             "based on source changes. Use a plain no_agent script job instead.")
     if no_agent and not script:
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
+    if script_failure_policy == "fail_closed" and not script:
+        raise ValueError(SCRIPT_FAILURE_POLICY_WITHOUT_SCRIPT_ERROR)
 
 
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
@@ -1696,6 +1731,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    script_failure_policy: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -1740,7 +1776,13 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
-    _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    _validate_job_mode_invariants(
+        f["monitor_script"],
+        f["monitor_url"],
+        f["no_agent"],
+        f["script"],
+        f["script_failure_policy"],
+    )
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -1771,6 +1813,7 @@ def create_job(
         "model_snapshot": model_snapshot,
         "base_url": f["base_url"],
         "script": f["script"],
+        "script_failure_policy": f["script_failure_policy"],
         "no_agent": f["no_agent"],
         "monitor_script": f["monitor_script"],
         "monitor_url": f["monitor_url"],
@@ -1975,12 +2018,20 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
-        if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+        if {
+            "monitor_script",
+            "monitor_url",
+            "no_agent",
+            "script",
+            "script_failure_policy",
+        }.intersection(updates):
             _validate_job_mode_invariants(
                 updated.get("monitor_script") or None,
                 updated.get("monitor_url") or None,
                 bool(updated.get("no_agent")),
-                _normalize_job_optional_text(updated.get("script")))
+                _normalize_job_optional_text(updated.get("script")),
+                get_job_script_failure_policy(updated),
+            )
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         inference_fields_changed = bool(

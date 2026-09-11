@@ -155,7 +155,8 @@ def cron_list(show_all: bool = False):
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {color(*badge)}")
         for label, value in _job_rows(job):
-            print(f"    {label + ':':<11}{value}")
+            padding = " " * max(1, 11 - len(label) - 1)
+            print(f"    {label}:{padding}{value}")
         for line in _job_warnings(job):
             print(f"    {line}")
         print()
@@ -195,6 +196,8 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
+        ("Script failure policy", job.get("script_failure_policy", "continue")
+         if job.get("script") else ""),
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
@@ -547,7 +550,8 @@ def cron_doctor() -> int:
 
 
 _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver", "failure_deliver"),
-                   ("repeat", "repeat"), ("script", "script"), ("workdir", "workdir"),
+                   ("repeat", "repeat"), ("script", "script"),
+                   ("script_failure_policy", "script_failure_policy"), ("workdir", "workdir"),
                    ("model", "model"), ("provider", "model_provider"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"))
@@ -572,6 +576,11 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
     for key, template in _JOB_DETAIL_LINES:
         if job_data.get(key):
             print(template.format(job_data[key]))
+    if job_data.get("script"):
+        print(
+            "  Script failure policy: "
+            f"{job_data.get('script_failure_policy', 'continue')}"
+        )
 
 
 def cron_create(args):
