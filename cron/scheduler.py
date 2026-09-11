@@ -43,7 +43,9 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from cron.outcomes import (
+    DETACHED,
     TRANSIENT_DEFER,
+    CronDetachedStart,
     CronPreScriptDefer,
     classify_script_result,
     job_occurrence_key,
@@ -1278,6 +1280,8 @@ def _run_no_agent_job(
     )
     if script_outcome.kind == TRANSIENT_DEFER:
         return _deferred_script_result(job_id, job_name, script_outcome, now_iso)
+    if script_outcome.kind == DETACHED:
+        return _detached_script_result(job_id, job_name, script_outcome, now_iso)
 
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
 
@@ -2002,6 +2006,37 @@ def _deferred_script_result(
     return False, doc, "", defer
 
 
+def _detached_script_result(
+    job_id: str, job_name: str, outcome, now_iso: str,
+) -> tuple[bool, str, str, CronDetachedStart]:
+    """Build a typed detached-start result for the outer execution handoff."""
+    detached = CronDetachedStart(
+        outcome.reason,
+        run_id=outcome.run_id,
+        worker=outcome.worker,
+        lease_seconds=outcome.lease_seconds,
+        occurrence_key=outcome.occurrence_key,
+    )
+    logger.info(
+        "Job '%s' (ID: %s): detached run %s started (lease %ss, worker %r)",
+        job_name,
+        job_id,
+        detached.run_id,
+        detached.lease_seconds,
+        detached.worker or None,
+    )
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        "**Status:** detached (RUN_STARTED)\n"
+        f"**Correlation ID:** {detached.run_id}\n"
+        f"**Lease:** {detached.lease_seconds}s\n\n"
+        f"{detached.reason or 'Awaiting the detached worker’s terminal report.'}\n"
+    )
+    return True, doc, "", detached
+
+
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
@@ -2060,6 +2095,13 @@ def _prepare_job_prompt(
         )
         if prerun_outcome.kind == TRANSIENT_DEFER:
             return _deferred_script_result(
+                job_id,
+                job_name,
+                prerun_outcome,
+                _hermes_now().strftime("%Y-%m-%d %H:%M:%S"),
+            ), None
+        if prerun_outcome.kind == DETACHED:
+            return _detached_script_result(
                 job_id,
                 job_name,
                 prerun_outcome,
@@ -3036,6 +3078,38 @@ def _run_one_job_body(
             _teardown_deferred()
             raise
 
+        if isinstance(error, CronDetachedStart) and success:
+            from cron.executions import register_detached_run
+
+            registered = register_detached_run(
+                execution_id,
+                run_id=error.run_id,
+                lease_seconds=error.lease_seconds,
+                worker=error.worker or None,
+                occurrence_key=error.occurrence_key or None,
+            )
+            if registered is None:
+                finish_execution(
+                    execution_id,
+                    success=False,
+                    error="Detached registration failed: execution already terminal.",
+                )
+                _teardown_deferred()
+                return True
+            mark_kwargs = {"status": "detached"}
+            if fire_owner is not None:
+                mark_kwargs["expected_fire_owner"] = fire_owner
+            marked = mark_job_run(job["id"], True, None, **mark_kwargs)
+            if fire_owner is not None and not marked:
+                logger.warning(
+                    "Job '%s': fire claim ownership lost after detached "
+                    "registration of run %s; job-record update skipped",
+                    job["id"],
+                    error.run_id,
+                )
+            _teardown_deferred()
+            return True
+
         if isinstance(error, CronPreScriptDefer) and not success:
             from cron.deferrals import record_defer, rollback_defer
             from cron.executions import defer_execution
@@ -3696,8 +3770,14 @@ def _maybe_reap_dead_owners() -> None:
         return
     _last_dead_owner_reap_at = _reap_now
     try:
-        from cron.executions import recover_interrupted_executions
+        from cron.executions import (
+            reconcile_detached_runs,
+            recover_interrupted_executions,
+        )
 
+        settled = reconcile_detached_runs()
+        if settled:
+            logger.info("Reconciled %d detached cron run(s)", len(settled))
         _reclaimed = recover_interrupted_executions()
         if _reclaimed:
             logger.warning(

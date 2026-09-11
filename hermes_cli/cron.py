@@ -766,6 +766,40 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_finalize_detached(args) -> int:
+    """Finalize a detached cron run by correlation id."""
+    from cron.executions import finalize_detached_run, find_detached_run
+
+    run_id = str(getattr(args, "run_id", "") or "")
+    success = bool(getattr(args, "success", False))
+    error = getattr(args, "error", None)
+    record = finalize_detached_run(run_id, success=success, error=error)
+    if record is not None:
+        print(
+            f"Finalized detached run {run_id}: "
+            f"{record.get('detached_status')} "
+            f"(job {record.get('job_id')}, execution {record.get('id')})"
+        )
+        return 0
+    existing = find_detached_run(run_id)
+    if existing is None:
+        print(f"No detached run found for correlation id {run_id!r}")
+        return 2
+    current = str(existing.get("detached_status") or "")
+    desired = "succeeded" if success else "failed"
+    if current == desired:
+        print(
+            f"Detached run {run_id} already finalized as {current} "
+            "(idempotent no-op)"
+        )
+        return 0
+    print(
+        f"Detached run {run_id} is already {current!r}; refusing to "
+        f"rewrite it as {desired!r}"
+    )
+    return 1
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
@@ -774,6 +808,7 @@ _CRON_SUBCOMMANDS = {
     "tick": lambda a: cron_tick(),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),
+    "finalize-detached": lambda a: cron_finalize_detached(a),
     "notepad": lambda a: cron_notepad(a),
     "create": lambda a: cron_create(a),
     "edit": lambda a: cron_edit(a),

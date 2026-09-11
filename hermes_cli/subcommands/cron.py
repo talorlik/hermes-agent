@@ -181,12 +181,31 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron incidents — durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents")
-    cron_incidents.add_argument("--state", choices=["detected", "alerted", "closed"],
+    cron_incidents.add_argument(
+        "--state", choices=["detected", "alerted", "recovered", "closed"],
         help="Filter incidents by lifecycle state")
     cron_incidents.add_argument(
         "incident_action", nargs="?", default="list", choices=["list", "ack"],
         help="Action (default: list)")
     cron_incidents.add_argument("incident_id", nargs="?", help="Incident ID to acknowledge (ack)")
+
+    cron_finalize = cron_subparsers.add_parser(
+        "finalize-detached",
+        help="Finalize a detached cron run by correlation id",
+    )
+    cron_finalize.add_argument(
+        "run_id", help="Correlation id from the RUN_STARTED directive"
+    )
+    finalize_result = cron_finalize.add_mutually_exclusive_group(required=True)
+    finalize_result.add_argument(
+        "--success", action="store_true", help="Report the run succeeded"
+    )
+    finalize_result.add_argument(
+        "--failed", action="store_true", help="Report the run failed"
+    )
+    cron_finalize.add_argument(
+        "--error", help="Failure evidence (stored redacted; used with --failed)"
+    )
 
     # notepad: per-job durable KV, injected into the job prompt each run.
     cron_notepad = cron_subparsers.add_parser(
