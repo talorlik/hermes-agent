@@ -288,7 +288,14 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
 
     See #97052.
     """
-    from hermes_cli.update_cmd import _count_commits_between, _has_upstream_remote, _no_prompt_git_kwargs, _should_skip_upstream_prompt
+    from hermes_cli.update_cmd import (
+        _capture_head_sha,
+        _count_commits_between,
+        _has_upstream_remote,
+        _no_prompt_git_kwargs,
+        _should_skip_upstream_prompt,
+        _validate_critical_files_syntax,
+    )
     if not _has_upstream_remote(git_cmd, cwd) and (
         _should_skip_upstream_prompt() or not _offer_upstream_remote(git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn)
     ):
@@ -322,8 +329,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
             f"{upstream_ahead} commit(s) behind upstream"
         )
         print("→ Merging upstream/main (updates.fork_sync_strategy: merge)...")
+        pre_merge_sha = _capture_head_sha(git_cmd, cwd)
+        sync_tag = f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         subprocess.run(
-            git_cmd + ["tag", f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"],
+            git_cmd + ["tag", sync_tag],
             cwd=cwd,
             capture_output=True,
             check=False,
@@ -352,6 +361,33 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
             )
             print(f"  Resolve manually: cd {cwd} && git merge upstream/main")
             print("  Then push your fork: git push origin main")
+            return False
+
+        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
+        if not syntax_ok:
+            rollback_ref = pre_merge_sha or sync_tag
+            print("\n  ✗ Merged code has a syntax error in a critical file:")
+            print(f"    {failing_path}")
+            if syntax_error:
+                for line in str(syntax_error).splitlines()[:6]:
+                    print(f"      {line}")
+            rollback_result = subprocess.run(
+                git_cmd + ["reset", "--hard", rollback_ref],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **_no_prompt_git_kwargs(),
+            )
+            if rollback_result.returncode == 0:
+                print(f"  ✓ Rolled back to {rollback_ref[:10]} - nothing was pushed to your fork.")
+                print("  Try the sync again once a fix lands upstream.")
+            else:
+                print("  ✗ Rollback failed. Recover manually with:")
+                print(f"    cd {cwd} && git reset --hard {rollback_ref}")
+                if rollback_result.stderr.strip():
+                    print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
             return False
 
         print("  ✓ Merged upstream/main (your commits preserved)\n→ Syncing fork...")
