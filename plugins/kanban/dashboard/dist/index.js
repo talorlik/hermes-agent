@@ -301,6 +301,26 @@
     } catch (_e) { /* ignore quota / private mode */ }
   }
 
+  // Deep-link params: /kanban?board=<slug>&task=<id>. Read once at page
+  // construction — the URL is the user's explicit intent for THIS load, so
+  // it wins over the localStorage board pin (which stays untouched: opening
+  // a shared link must not silently re-pin the recipient's own board).
+  // Blank values ("?board=&task=") count as absent so trailing empty params
+  // keep the stored-pin behavior. URLSearchParams percent-decodes values
+  // here; the fetch layer re-encodes with encodeURIComponent, so encoded
+  // slugs/ids round-trip without double-encoding or injection.
+  function readDeepLinkParams() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      return {
+        board: (params.get("board") || "").trim() || null,
+        task: (params.get("task") || "").trim() || null,
+      };
+    } catch (_e) {
+      return { board: null, task: null };
+    }
+  }
+
   function withBoard(url, board) {
     // Always append ?board=<slug> when we have one picked — including
     // "default". Omitting the param would fall through to the backend's
@@ -603,7 +623,9 @@
   function KanbanPage() {
     const { t } = useI18n();
     const kanbanDialogs = useKanbanDialogs(t);
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    // Lazy initializer: the URL is read once on mount, not on re-renders.
+    const [deepLink] = useState(readDeepLinkParams);
+    const [board, setBoard] = useState(() => deepLink.board || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -628,7 +650,10 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    // ?task= opens that task's drawer on first paint. An unknown id is fine:
+    // the drawer's own 404 handling shows the error inline and stays
+    // closable while the board renders normally behind it.
+    const [selectedTaskId, setSelectedTaskId] = useState(deepLink.task);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
