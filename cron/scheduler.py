@@ -2843,6 +2843,14 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    try:
+        from cron.deferrals import resolve_pending
+
+        resolve_pending(job["id"], "completed" if d.success else "permanent")
+    except Exception:
+        logger.debug(
+            "Failed resolving deferral for job %s", job["id"], exc_info=True
+        )
     if d.success:
         try:
             from cron.incidents import record_recovery
@@ -3027,6 +3035,52 @@ def _run_one_job_body(
             # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
             _teardown_deferred()
             raise
+
+        if isinstance(error, CronPreScriptDefer) and not success:
+            from cron.deferrals import record_defer, rollback_defer
+            from cron.executions import defer_execution
+            from cron.jobs import mark_job_deferred
+
+            obligation = record_defer(
+                job["id"],
+                error.occurrence_key,
+                reason=error.reason,
+                retry_after_seconds=error.retry_after_seconds,
+            )
+            if obligation.get("state") == "exhausted":
+                error = (
+                    "Deferred occurrence "
+                    f"{obligation.get('occurrence_key') or error.occurrence_key} "
+                    "exhausted its retry budget "
+                    f"({obligation.get('attempts')} retry): "
+                    + (error.reason or "transient contention")
+                )
+            else:
+                deferred_marked = mark_job_deferred(
+                    job["id"],
+                    obligation["retry_at"],
+                    reason=error.reason,
+                    occurrence_key=obligation["occurrence_key"],
+                    attempts=int(obligation.get("attempts") or 0),
+                    expected_fire_owner=fire_owner,
+                )
+                if not deferred_marked and fire_owner is not None:
+                    rollback_defer(obligation)
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error="Fire claim ownership lost; stale defer was discarded.",
+                    )
+                    _teardown_deferred()
+                    return True
+                defer_execution(
+                    execution_id,
+                    reason=error.reason,
+                    occurrence_key=obligation["occurrence_key"],
+                    retry_at=obligation["retry_at"],
+                )
+                _teardown_deferred()
+                return True
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()

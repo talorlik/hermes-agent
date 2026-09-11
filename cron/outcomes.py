@@ -169,7 +169,8 @@ def job_occurrence_key(job: dict) -> str:
     """
     job_id = str(job.get("id") or "")
     scheduled = str(
-        job.get("due_occurrence_at")
+        job.get("_scheduled_instant")
+        or job.get("due_occurrence_at")
         or job.get("next_run_at")
         or job.get("manual_run_at")
         or "manual"

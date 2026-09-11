@@ -2272,6 +2272,7 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     job["last_error"] = None if success else error
+    job.pop("last_defer", None)
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2371,6 +2372,63 @@ def mark_job_run(
         found = _with_job(job_id, apply, missing=_MISSING)
         if found is _MISSING:
             logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+            return False
+        return found
+
+    return _under_fire_fence(job_id, locked)
+
+
+def mark_job_deferred(
+    job_id: str,
+    retry_at: str,
+    *,
+    reason: str = "",
+    occurrence_key: str = "",
+    attempts: int = 0,
+    expected_fire_owner: Optional[str] = None,
+) -> bool:
+    """Record a transient defer without consuming the logical occurrence."""
+    def apply(jobs, _i, job):
+        if expected_fire_owner is not None:
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
+                logger.warning(
+                    "mark_job_deferred: job_id %s fire claim owner changed; "
+                    "discarding stale defer",
+                    job_id,
+                )
+                return False
+        canonical_retry_at = str(retry_at)
+        job["last_status"] = "deferred"
+        job["last_error"] = None
+        job["last_defer"] = {
+            "at": _hermes_now().isoformat(),
+            "reason": str(reason or "")[:500],
+            "occurrence_key": str(occurrence_key or ""),
+            "retry_at": canonical_retry_at,
+            "attempts": int(attempts),
+        }
+        job["fire_claim"] = None
+        if job.get("run_claim") is not None:
+            job["run_claim"] = None
+        schedule = job.get("schedule") or {}
+        if schedule.get("kind") == "once":
+            repeat = job.get("repeat") or {}
+            if int(repeat.get("completed") or 0) > 0:
+                repeat["completed"] = int(repeat["completed"]) - 1
+                job["repeat"] = repeat
+            schedule["run_at"] = canonical_retry_at
+            job["schedule"] = schedule
+        job["next_run_at"] = canonical_retry_at
+        if job.get("state") != "paused":
+            job["state"] = "scheduled"
+        save_jobs(jobs)
+        return True
+
+    def locked():
+        found = _with_job(job_id, apply, missing=_MISSING)
+        if found is _MISSING:
+            logger.warning("mark_job_deferred: job_id %s not found, skipping save", job_id)
             return False
         return found
 
