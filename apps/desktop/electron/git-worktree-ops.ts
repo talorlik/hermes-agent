@@ -207,6 +207,11 @@ async function ensureGitRepo(gitBin, dir) {
     await runGit(
       gitBin,
       [
+        // This is a synthetic bootstrap commit created by Hermes, not a user
+        // commit. Global hooks can reject its fixed message and make worktree
+        // initialization unusable, so isolate only this command.
+        '-c',
+        'core.hooksPath=',
         '-c',
         'user.email=hermes@localhost',
         '-c',
