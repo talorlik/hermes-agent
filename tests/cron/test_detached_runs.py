@@ -141,6 +141,19 @@ def test_register_detached_run_rejects_duplicate_correlation_id(ledger):
     assert ledger.latest_execution("job-second")["detached_run_id"] is None
 
 
+def test_register_detached_run_cannot_replace_existing_correlation_id(ledger):
+    execution = ledger.create_execution("job-reregister", source="builtin")
+    ledger.mark_execution_running(execution["id"])
+
+    first = ledger.register_detached_run(execution["id"], run_id="run-first")
+    assert first is not None
+    assert ledger.register_detached_run(execution["id"], run_id="run-second") is None
+    first_lookup = ledger.find_detached_run("run-first")
+    assert first_lookup is not None
+    assert first_lookup["id"] == execution["id"]
+    assert ledger.find_detached_run("run-second") is None
+
+
 def test_finalize_duplicate_correlation_id_is_side_effect_free(ledger):
     first = ledger.create_execution("job-first", source="builtin")
     second = ledger.create_execution("job-second", source="builtin")

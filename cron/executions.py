@@ -540,6 +540,7 @@ def register_detached_run(
                    occurrence_key=COALESCE(?, occurrence_key),
                    lease_expires_at=?
                WHERE id=? AND status IN ('claimed','running')
+                 AND detached_run_id IS NULL
                  AND NOT EXISTS (
                    SELECT 1 FROM executions AS other
                    WHERE other.detached_run_id=?
