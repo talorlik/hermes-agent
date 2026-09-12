@@ -987,6 +987,29 @@ class TestColdImportGuardLease:
         # Import lease restored at successful module-import completion.
         assert _single(events, "import-done")["guard"] is None
 
+    @pytest.mark.parametrize("session_flag", ["-c", "-r"])
+    def test_multiword_session_name_guards_every_startup_read(
+        self, tmp_path, session_flag
+    ):
+        proc, events = _run_cold_start(
+            tmp_path,
+            [
+                session_flag,
+                "Pokemon",
+                "Agent",
+                "Dev",
+                "-z",
+                "hi",
+                "-t",
+                "none",
+            ],
+            mode="import",
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert all(event["guard"] == "1" for event in _obs_events(events)), events
+        assert _capability_events(events) == []
+        assert _single(events, "import-done")["guard"] is None
+
     def test_import_lease_restores_arbitrary_prior_value(self, tmp_path):
         proc, events = _run_cold_start(
             tmp_path,
@@ -1304,8 +1327,6 @@ class TestRawArgvPreflightClassifier:
             ["-p", "Bad", "-z", "prompt", "-t", "none"],
             ["--version", "-z", "prompt", "-t", "none"],
             ["-V", "--oneshot=prompt", "--toolsets=none,web"],
-            ["-z", "prompt", "-t", "none", "logs"],
-            ["-z", "prompt", "-t", "none", "status"],
         ],
     )
     def test_non_guarding_argv(self, argv):
@@ -1413,6 +1434,33 @@ class TestRawArgvPreflightClassifier:
         (root / "active_profile").write_text("missing\n", encoding="utf-8")
         assert not main_mod._raw_oneshot_no_tools_preflight(
             ["-z", "prompt", "-t", "NONE"]
+        )
+
+    @pytest.mark.parametrize("session_flag", ["-c", "-r"])
+    def test_multiword_session_name_matches_authoritative_dispatch(
+        self, session_flag
+    ):
+        import hermes_cli.main as main_mod
+
+        assert main_mod._raw_oneshot_no_tools_preflight(
+            [
+                session_flag,
+                "Pokemon",
+                "Agent",
+                "Dev",
+                "-z",
+                "prompt",
+                "-t",
+                "none",
+            ]
+        )
+
+    @pytest.mark.parametrize("subcommand", ["logs", "status"])
+    def test_non_chat_subcommand_tail_keeps_exact_none_guard(self, subcommand):
+        import hermes_cli.main as main_mod
+
+        assert main_mod._raw_oneshot_no_tools_preflight(
+            ["-z", "prompt", "-t", "none", subcommand]
         )
 
     @pytest.mark.parametrize(

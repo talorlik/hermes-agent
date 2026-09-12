@@ -32,6 +32,100 @@ import sys
 # can match current argparse behavior without copying its option surface.
 _EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
 _TOOLSETS_NONE_SENTINEL_RAW = "none"
+_CLI_SUBCOMMANDS = frozenset(
+    {
+        "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud",
+        "login", "logout", "auth", "status", "cron", "doctor", "config",
+        "pairing", "skills", "tools", "mcp", "sessions", "insights", "update",
+        "uninstall", "profile", "dashboard", "serve", "desktop", "gui", "honcho",
+        "claw", "plugins", "security", "acp", "webhook", "peer", "memory", "dump",
+        "debug", "backup", "import", "completion", "logs",
+    }
+)
+_SESSION_NAME_FLAGS = frozenset({"-c", "--continue", "-r", "--resume"})
+
+
+def _coalesce_session_name_args(argv: list) -> list:
+    """Join unquoted multi-word values for continue/resume before parsing."""
+    result = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in _SESSION_NAME_FLAGS:
+            result.append(token)
+            index += 1
+            parts: list = []
+            while (
+                index < len(argv)
+                and not argv[index].startswith("-")
+                and argv[index] not in _CLI_SUBCOMMANDS
+            ):
+                parts.append(argv[index])
+                index += 1
+            if parts:
+                result.append(" ".join(parts))
+        else:
+            result.append(token)
+            index += 1
+    return result
+
+
+def _preflight_subcommand_index(argv: list[str], parser) -> int | None:
+    """Locate the first positional using the live argparse option surface."""
+    actions = parser._option_string_actions
+    long_options = tuple(option for option in actions if option.startswith("--"))
+
+    def _resolve_long(name: str):
+        if name in actions:
+            return actions[name]
+        matches = [option for option in long_options if option.startswith(name)]
+        if len(matches) != 1:
+            return None
+        return actions[matches[0]]
+
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return index + 1 if index + 1 < len(argv) else None
+        if not token.startswith("-") or token == "-":
+            return index
+        if token.startswith("--"):
+            name, separator, _inline = token.partition("=")
+            action = _resolve_long(name)
+            if action is None:
+                return index
+            if separator:
+                if action.nargs == 0:
+                    return index
+                index += 1
+                continue
+            if action.nargs == 0:
+                index += 1
+                continue
+            if action.nargs == "?":
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            index += 2
+            continue
+
+        body = token[1:]
+        consumed_following = False
+        for offset, char in enumerate(body):
+            action = actions.get(f"-{char}")
+            if action is None:
+                return index
+            if action.nargs == 0:
+                continue
+            if not body[offset + 1 :] and index + 1 < len(argv):
+                if action.nargs != "?" or not argv[index + 1].startswith("-"):
+                    consumed_following = True
+            break
+        index += 2 if consumed_following else 1
+    return None
 
 
 def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
@@ -86,7 +180,7 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
             return True
         return allow_sudo and _sudo_profile_resolves(name.strip())
 
-    cleaned = list(argv)
+    cleaned = _coalesce_session_name_args(list(argv))
     explicit_profile = False
     index = 0
     while index < len(cleaned):
@@ -156,10 +250,19 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
             if not _profile_resolves(active_name):
                 return False
 
+    parser = build_top_level_parser()[0]
+    subcommand_index = _preflight_subcommand_index(cleaned, parser)
+    if (
+        subcommand_index is not None
+        and cleaned[subcommand_index] in _CLI_SUBCOMMANDS
+        and cleaned[subcommand_index] != "chat"
+    ):
+        cleaned = cleaned[:subcommand_index]
+
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
         try:
-            args = build_top_level_parser()[0].parse_args(cleaned)
+            args = parser.parse_args(cleaned)
         except SystemExit:
             return False
 
@@ -2545,45 +2648,6 @@ def cmd_update(args):
             os._exit(_update_handoff_exit_code)
 
 
-def _coalesce_session_name_args(argv: list) -> list:
-    """Join unquoted multi-word session names after -c/--continue and -r/--resume.
-
-    ``hermes -c Pokemon Agent Dev`` → ``['-c', 'Pokemon Agent Dev']``; tokens
-    are collected until the next flag (``-*``) or known top-level subcommand.
-    """
-    _SUBCOMMANDS = {
-        "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud", "login", "logout",
-        "auth", "status", "cron", "doctor", "config", "pairing", "skills", "tools", "mcp",
-        "sessions", "insights", "update", "uninstall", "profile", "dashboard", "serve",
-        "desktop", "gui", "honcho", "claw", "plugins", "security", "acp", "webhook", "peer",
-        "memory", "dump", "debug", "backup", "import", "completion", "logs",
-    }
-    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
-
-    result = []
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token in _SESSION_FLAGS:
-            result.append(token)
-            i += 1
-            # Collect subsequent non-flag, non-subcommand tokens as one name
-            parts: list = []
-            while (
-                i < len(argv)
-                and not argv[i].startswith("-")
-                and argv[i] not in _SUBCOMMANDS
-            ):
-                parts.append(argv[i])
-                i += 1
-            if parts:
-                result.append(" ".join(parts))
-        else:
-            result.append(token)
-            i += 1
-    return result
-
-
 from hermes_cli.profile_cmd import cmd_profile
 
 
@@ -2861,63 +2925,9 @@ def _first_positional_argv() -> str | None:
     """Return the first top-level positional using the live argparse surface."""
     from hermes_cli._parser import build_top_level_parser
 
-    parser = build_top_level_parser()[0]
-    actions = parser._option_string_actions
-    long_options = tuple(option for option in actions if option.startswith("--"))
-
-    def _resolve_long(name: str):
-        if name in actions:
-            return actions[name]
-        matches = [option for option in long_options if option.startswith(name)]
-        if len(matches) != 1:
-            return None
-        return actions[matches[0]]
-
     argv = sys.argv[1:]
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--":
-            return argv[index + 1] if index + 1 < len(argv) else None
-        if not token.startswith("-") or token == "-":
-            return token
-
-        if token.startswith("--"):
-            name, separator, _inline = token.partition("=")
-            action = _resolve_long(name)
-            if action is None:
-                return token
-            if separator:
-                if action.nargs == 0:
-                    return token
-                index += 1
-                continue
-            if action.nargs == 0:
-                index += 1
-                continue
-            if action.nargs == "?":
-                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
-                    index += 2
-                else:
-                    index += 1
-                continue
-            index += 2
-            continue
-
-        body = token[1:]
-        consumed_following = False
-        for offset, char in enumerate(body):
-            action = actions.get(f"-{char}")
-            if action is None:
-                return token
-            if action.nargs == 0:
-                continue
-            if not body[offset + 1 :] and index + 1 < len(argv):
-                if action.nargs != "?" or not argv[index + 1].startswith("-"):
-                    consumed_following = True
-            break
-        index += 2 if consumed_following else 1
-    return None
+    index = _preflight_subcommand_index(argv, build_top_level_parser()[0])
+    return argv[index] if index is not None else None
 
 
 def _plugin_cli_discovery_needed() -> bool:
