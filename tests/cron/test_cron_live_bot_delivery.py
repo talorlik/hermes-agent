@@ -1,4 +1,5 @@
 """Cron admission must not become a second writer or a completed-delivery claim."""
+
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -15,8 +16,12 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
     from hermes_cli.profiles import get_profile_dir
 
     for profile, home in [("", source), ("research", get_profile_dir("research"))]:
-        owner = dict(profile_home=str(home.resolve()), session_id="bot", lease_id="lease",
-                     live_session_id="live")
+        owner = dict(
+            profile_home=str(home.resolve()),
+            session_id="bot",
+            lease_id="lease",
+            live_session_id="live",
+        )
         discovery = Mock(return_value=owner)
         monkeypatch.setattr(mailbox, "find_canonical_live_owner", discovery)
         job = dict(id="digest", name="Digest", execution_id="first-run")
@@ -41,30 +46,89 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
     subprocess_run.assert_not_called()
 
 
+def test_exact_retry_attempt_uses_fresh_bot_chat_receipt(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    owner = {
+        "profile_home": str(tmp_path.resolve()),
+        "session_id": "bot",
+        "lease_id": "lease",
+        "live_session_id": "live",
+    }
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda _home: owner)
+    base_job = {"id": "digest", "execution_id": "run"}
+
+    first = dict(base_job, _exact_delivery_attempt_id="outbox:1")
+    assert "queued" in delivery._deliver_to_bot_chat(first, "payload", "")
+    first_record = mailbox.claim_pending_delivery(tmp_path, owner)
+    assert first_record is not None
+    mailbox.complete_delivery(
+        tmp_path,
+        first_record["delivery_id"],
+        status="failed",
+        error="HTTP 429 rate limit",
+        reason="provider_rate_limit",
+    )
+
+    second = dict(base_job, _exact_delivery_attempt_id="outbox:2")
+    assert "queued" in delivery._deliver_to_bot_chat(second, "payload", "")
+    second_record = mailbox.claim_pending_delivery(tmp_path, owner)
+    assert second_record is not None
+    assert second_record["delivery_id"] != first_record["delivery_id"]
+
+
 def test_result_records_pending_until_terminal_receipt(tmp_path, monkeypatch):
     from cron import jobs
     from gateway import config
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("_HERMES_CRON_EXTERNAL_WORKER", raising=False)
-    owner = dict(profile_home=str(tmp_path.resolve()), session_id="bot", lease_id="lease",
-                 live_session_id="live")
+    owner = dict(
+        profile_home=str(tmp_path.resolve()),
+        session_id="bot",
+        lease_id="lease",
+        live_session_id="live",
+    )
     monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: owner)
     monkeypatch.setattr(delivery._sched, "load_config", lambda: {})
     monkeypatch.setattr(config, "load_gateway_config", lambda: None)
-    monkeypatch.setattr(delivery.subprocess, "run", Mock(side_effect=AssertionError("CLI")))
+    monkeypatch.setattr(
+        delivery.subprocess, "run", Mock(side_effect=AssertionError("CLI"))
+    )
     updates = []
-    monkeypatch.setattr(jobs, "update_job", lambda key, values: updates.append(values))
+    monkeypatch.setattr(
+        "cron.outbox.get_job_delivery_projection",
+        lambda _job_id: {"execution_id": "run", "revision": 3},
+    )
+    monkeypatch.setattr(
+        jobs,
+        "update_job",
+        lambda key, values, **kwargs: updates.append((values, kwargs)),
+    )
     job = dict(id="digest", execution_id="run", deliver="bot-chat")
     error = delivery._deliver_result(job, "payload")
     assert error is None
-    queued = updates[-1]["last_delivery_queued"]
+    queued = updates[-1][0]["last_delivery_queued"]
+    assert updates[-1][1] == {
+        "expected_execution_id": "run",
+        "expected_projection_revision": 3,
+    }
     assert queued and next(iter(queued.values()))["status"] == "queued"
-    assert delivery._sched._classify_delivery_outcome(
-        delivery_error=error, delivery_queued=queued, should_deliver=True, unresolved_origin=False,
-        normalized_deliver="bot-chat", incident_acked=False, success=True) == "queued"
+    assert (
+        delivery._sched._classify_delivery_outcome(
+            delivery_error=error,
+            delivery_queued=queued,
+            should_deliver=True,
+            unresolved_origin=False,
+            normalized_deliver="bot-chat",
+            incident_acked=False,
+            success=True,
+        )
+        == "queued"
+    )
     record = mailbox.claim_pending_delivery(tmp_path, owner)
     assert record is not None
-    mailbox.complete_delivery(tmp_path, record["delivery_id"], status="settled", reply="done")
+    mailbox.complete_delivery(
+        tmp_path, record["delivery_id"], status="settled", reply="done"
+    )
     assert delivery._deliver_result(job, "payload") is None
-    assert updates[-1]["last_delivery_queued"] is None
+    assert updates[-1][0]["last_delivery_queued"] is None
