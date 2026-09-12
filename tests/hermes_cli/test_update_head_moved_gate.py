@@ -17,11 +17,19 @@ from hermes_cli import main as hermes_main
 import hermes_cli.main_web_build as main_web_build
 import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
+from hermes_cli import update_cmd_fleet
 
 
-def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+_PRE_UPDATE_SHA = "a" * 40
+_POST_UPDATE_SHA = "b" * 40
+
+
+def _make_head_moved_side_effect(
+    pre_sha: str = _PRE_UPDATE_SHA,
+    post_sha: str = _POST_UPDATE_SHA,
+):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
-    calls = {"n": 0}
+    state = {"head": pre_sha}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
@@ -30,17 +38,25 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
 
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
+
         # git rev-list HEAD..origin/main --count  (behind count)
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
 
-        # git rev-parse HEAD  — first call (pre-pull) returns pre_sha,
-        # subsequent calls (post-pull) return post_sha.
+        if "merge --ff-only origin/main" in joined:
+            state["head"] = post_sha
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
         if joined.endswith("rev-parse HEAD"):
-            if calls["n"] == 0:
-                calls["n"] += 1
-                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{state['head']}\n",
+                stderr="",
+            )
 
         # Everything else (merge, checkout, etc.) succeeds quietly.
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -48,7 +64,7 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
     return side_effect
 
 
-def _make_head_pinned_side_effect(sha="abc123"):
+def _make_head_pinned_side_effect(sha: str = _PRE_UPDATE_SHA):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
 
     def side_effect(cmd, **kwargs):
@@ -56,6 +72,11 @@ def _make_head_pinned_side_effect(sha="abc123"):
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
+
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
 
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
@@ -123,6 +144,11 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(
         hermes_gateway, "supports_systemd_services", lambda: False
+    )
+    monkeypatch.setattr(
+        update_cmd_fleet,
+        "_restart_macos_launchd_gateways",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []

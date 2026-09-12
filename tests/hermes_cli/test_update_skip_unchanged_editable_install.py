@@ -34,7 +34,7 @@ def repo(tmp_path):
     (tmp_path / "agent" / "__init__.py").write_text("")
     (tmp_path / "cli.py").write_text("x = 1\n")
     subprocess.run(GIT + ["add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(GIT + ["commit", "-qm", "base"], cwd=tmp_path, check=True)
+    subprocess.run(GIT + ["commit", "-qm", "base fixture"], cwd=tmp_path, check=True)
     return tmp_path
 
 
@@ -86,7 +86,7 @@ def test_source_churn_alongside_a_pyproject_edit_still_reinstalls(repo):
     before = _head(repo)
     (repo / "cli.py").write_text("x = 3\n")
     (repo / "pyproject.toml").write_text("[project]\nname = 'hermes'\ndeps = []\n")
-    _commit(repo, "mixed")
+    _commit(repo, "mixed source and manifest")
 
     assert _editable_install_is_current(GIT, repo, before) is False
 

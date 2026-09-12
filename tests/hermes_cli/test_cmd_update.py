@@ -1,7 +1,10 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
 import hashlib
+import re
+import stat
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
@@ -15,9 +18,44 @@ from hermes_cli import update_cmd
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     """Build a side_effect function for subprocess.run that simulates git commands."""
+    head_sha = ["a" * 40]
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+
+        if list(map(str, cmd[1:])) == ["-m", "pip", "--version"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="pip 25.0\n", stderr="")
+        if list(map(str, cmd[1:])) in (
+            ["pip", "install", "--upgrade", "pip"],
+            ["-m", "pip", "install", "--upgrade", "pip"],
+        ):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if len(cmd) >= 3 and str(cmd[1]) == "-c":
+            marker = re.search(r"(__HERMES_IMPORT_HEALTH_[0-9a-f]+__)", str(cmd[2]))
+            if marker:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="\n" + marker.group(1) + "[]", stderr=""
+                )
+
+        if joined == f"git fetch origin {branch}":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        if joined == "git status --porcelain":
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        if "status --porcelain=v1 --untracked-files=all" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if joined == "git rev-parse --is-shallow-repository":
+            return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+
+        if "rev-parse --absolute-git-dir" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="/tmp/mock-repo/.git\n", stderr=""
+            )
+        if "rev-parse HEAD" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{head_sha[0]}\n", stderr=""
+            )
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -30,10 +68,18 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
         # git rev-list HEAD..origin/{branch} --count
         if "rev-list" in joined:
-            return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{commit_count}\n", stderr=""
+            )
 
-        # Fallback: return a successful CompletedProcess with empty stdout
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if joined.startswith("git diff --name-only "):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        if "merge --ff-only" in joined:
+            head_sha[0] = "b" * 40
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        raise AssertionError(f"unexpected subprocess command: {cmd}")
 
     return side_effect
 
@@ -68,13 +114,18 @@ def _patch_managed_uv(request):
     def _fake_update_managed_uv(**_kwargs):
         return None  # never actually self-update in tests
 
-    with patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv), \
-         patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv), \
-         patch("hermes_cli.managed_uv.update_managed_uv", side_effect=_fake_update_managed_uv), \
-         patch(
-             "hermes_cli.update_cmd._post_update_sqlite_runtime_status",
-             return_value=(True, None),
-         ):
+    with (
+        patch("hermes_cli.managed_uv.resolve_uv", side_effect=_fake_resolve_uv),
+        patch("hermes_cli.managed_uv.ensure_uv", side_effect=_fake_ensure_uv),
+        patch(
+            "hermes_cli.managed_uv.update_managed_uv",
+            side_effect=_fake_update_managed_uv,
+        ),
+        patch(
+            "hermes_cli.update_cmd._post_update_sqlite_runtime_status",
+            return_value=(True, None),
+        ),
+    ):
         yield
 
 
@@ -88,8 +139,6 @@ class TestCmdUpdateNpmLockfileCache:
     def _cache_file(hermes_root, project_root):
         cache_key = hashlib.sha256(str(project_root).encode()).hexdigest()[:12]
         return hermes_root / f".npm_lock_hash_{cache_key}"
-
-
 
     def test_record_npm_lockfile_hash(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
@@ -121,12 +170,6 @@ class TestCmdUpdateNpmLockfileCache:
             '{"dependencies": {"left-pad": "^1.0.0"}}'
         )
         assert hm._npm_lockfile_changed(tmp_path) is True
-
-
-
-
-
-
 
     def test_update_uses_one_shared_npm_cache_across_profiles(
         self, tmp_path, monkeypatch
@@ -202,7 +245,9 @@ class TestCmdUpdateTermuxUvBootstrap:
         # Production resolve_uv only checks $HERMES_HOME/bin/uv; model an empty
         # managed dir so the PATH probe is what surfaces the packaged uv.
         monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
-        monkeypatch.setattr("shutil.which", lambda name: pkg_uv if name == "uv" else None)
+        monkeypatch.setattr(
+            "shutil.which", lambda name: pkg_uv if name == "uv" else None
+        )
 
         uv_bin = update_cmd._ensure_uv_for_termux(["/termux/python", "-m", "pip"])
 
@@ -266,9 +311,6 @@ class TestUpdateManagedPythonEnvIsolation:
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
 
-
-
-
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_on_fork_checks_upstream_when_origin_up_to_date(
@@ -285,19 +327,38 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+        with (
+            patch.object(
+                hm,
+                "_get_origin_url",
+                return_value="https://github.com/example/hermes-agent.git",
+            ),
+            patch.object(
+                update_cmd,
+                "_sync_with_upstream_observed",
+                return_value=update_cmd.UpstreamSyncOutcome(
+                    phase="prepare",
+                    status="noop",
+                    pre_sha="a" * 40,
+                    post_sha="a" * 40,
+                    clean=True,
+                    operation_state="none",
+                    recovery_ref="a" * 40,
+                    error="",
+                ),
+            ) as sync_mock,
+        ):
             cmd_update(mock_args)
 
         expected_git_cmd = (
-            ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
+            ["git", "-c", "windows.appendAtomically=false"]
+            if hm._is_windows()
+            else ["git"]
         )
         sync_mock.assert_called_once_with(
             expected_git_cmd,
             PROJECT_ROOT,
+            phase="prepare",
             assume_yes=False,
             input_fn=None,
         )
@@ -320,19 +381,30 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(
-            update_cmd, "_has_upstream_remote", return_value=False
-        ), patch.object(
-            update_cmd, "_should_skip_upstream_prompt", return_value=False
-        ), patch.object(
-            update_cmd, "_add_upstream_remote"
-        ) as add_remote, patch.object(
-            update_cmd, "_mark_skip_upstream_prompt"
-        ) as mark_skip, patch("builtins.input") as stdin_input:
+        with (
+            patch.object(
+                hm,
+                "_get_origin_url",
+                return_value="https://github.com/example/hermes-agent.git",
+            ),
+            patch.object(
+                update_cmd,
+                "_observe_upstream_remote",
+                return_value=update_cmd.GitCommandObservation(
+                    state="absent",
+                    returncode=2,
+                    stdout="",
+                    stderr="No such remote",
+                    exception="",
+                ),
+            ),
+            patch.object(
+                update_cmd, "_should_skip_upstream_prompt", return_value=False
+            ),
+            patch.object(update_cmd, "_add_upstream_remote_observed") as add_remote,
+            patch.object(update_cmd, "_mark_skip_upstream_prompt") as mark_skip,
+            patch("builtins.input") as stdin_input,
+        ):
             cmd_update(SimpleNamespace(yes=True))
 
         stdin_input.assert_not_called()
@@ -370,37 +442,51 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed"), patch.object(
-            update_cmd,
-            "_venv_core_imports_healthy",
-            side_effect=[
-                (False, "broken before repair"),
-                (health_after_repair, "broken after repair"),
-            ],
-        ), patch.object(
-            hm, "_install_python_dependencies_with_optional_fallback"
-        ), patch.object(
-            hm, "_refresh_active_lazy_features"
-        ), patch.object(
-            hm, "_restore_active_tool_dependencies"
-        ), patch.object(
-            update_cmd, "_write_update_incomplete_marker"
-        ), patch.object(
-            hm, "_clear_update_incomplete_marker"
-        ), patch.object(
-            update_cmd,
-            "_post_update_sqlite_runtime_status",
-            return_value=runtime_status,
-        ) as runtime_check, patch.object(
-            update_cmd, "_write_gateway_update_exit_code"
-        ) as write_gateway_exit, patch(
-            "hermes_cli.update_receipt.finalize_update_receipt"
-        ) as finalize_receipt, patch(
-            "hermes_cli.update_receipt.finalize_pending_update_receipt"
+        with (
+            patch.object(
+                hm,
+                "_get_origin_url",
+                return_value="https://github.com/example/hermes-agent.git",
+            ),
+            patch.object(
+                update_cmd,
+                "_sync_with_upstream_observed",
+                return_value=update_cmd.UpstreamSyncOutcome(
+                    phase="prepare",
+                    status="noop",
+                    pre_sha="a" * 40,
+                    post_sha="a" * 40,
+                    clean=True,
+                    operation_state="none",
+                    recovery_ref="a" * 40,
+                    error="",
+                ),
+            ),
+            patch.object(
+                update_cmd,
+                "_venv_core_imports_healthy",
+                side_effect=[
+                    (False, "broken before repair"),
+                    (health_after_repair, "broken after repair"),
+                ],
+            ),
+            patch.object(hm, "_install_python_dependencies_with_optional_fallback"),
+            patch.object(hm, "_refresh_active_lazy_features"),
+            patch.object(hm, "_restore_active_tool_dependencies"),
+            patch.object(update_cmd, "_write_update_incomplete_marker"),
+            patch.object(hm, "_clear_update_incomplete_marker"),
+            patch.object(
+                update_cmd,
+                "_post_update_sqlite_runtime_status",
+                return_value=runtime_status,
+            ) as runtime_check,
+            patch.object(
+                update_cmd, "_write_gateway_update_exit_code"
+            ) as write_gateway_exit,
+            patch(
+                "hermes_cli.update_receipt.finalize_update_receipt"
+            ) as finalize_receipt,
+            patch("hermes_cli.update_receipt.finalize_pending_update_receipt"),
         ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(mock_args)
@@ -424,20 +510,38 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed"), patch.object(
-            update_cmd,
-            "_repair_node_deps_on_current_checkout",
-            return_value=False,
-        ), patch.object(
-            update_cmd, "_write_gateway_update_exit_code"
-        ) as write_gateway_exit, patch(
-            "hermes_cli.update_receipt.finalize_update_receipt"
-        ) as finalize_receipt, patch(
-            "hermes_cli.update_receipt.finalize_pending_update_receipt"
+        with (
+            patch.object(
+                hm,
+                "_get_origin_url",
+                return_value="https://github.com/example/hermes-agent.git",
+            ),
+            patch.object(
+                update_cmd,
+                "_sync_with_upstream_observed",
+                return_value=update_cmd.UpstreamSyncOutcome(
+                    phase="prepare",
+                    status="noop",
+                    pre_sha="a" * 40,
+                    post_sha="a" * 40,
+                    clean=True,
+                    operation_state="none",
+                    recovery_ref="a" * 40,
+                    error="",
+                ),
+            ),
+            patch.object(
+                update_cmd,
+                "_repair_node_deps_on_current_checkout",
+                return_value=False,
+            ),
+            patch.object(
+                update_cmd, "_write_gateway_update_exit_code"
+            ) as write_gateway_exit,
+            patch(
+                "hermes_cli.update_receipt.finalize_update_receipt"
+            ) as finalize_receipt,
+            patch("hermes_cli.update_receipt.finalize_pending_update_receipt"),
         ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(mock_args)
@@ -445,6 +549,7 @@ class TestCmdUpdateBranchFallback:
         assert exit_info.value.code == 1
         write_gateway_exit.assert_called_once_with(False)
         finalize_receipt.assert_called_once_with("partial")
+
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_fork_upstream_sync_that_moves_head_runs_post_update_steps(
@@ -458,54 +563,74 @@ class TestCmdUpdateBranchFallback:
             branch="main", verify_ok=True, commit_count="0"
         )
 
-        # The first two reads bracket the upstream sync (aaaaaaa -> bbbbbbb),
-        # which moves HEAD and pushes the synchronized commit to origin. The
-        # next two bracket the normal origin pull. That pull is correctly a
-        # no-op because the sync already made HEAD and origin/main identical.
-        shas = iter(["aaaaaaa", "bbbbbbb", "bbbbbbb", "bbbbbbb"])
+        # The upstream sync collaborator is mocked as already having moved
+        # HEAD from aaaaaaa to bbbbbbb. Every subsequent checkout proof must
+        # therefore observe bbbbbbb; the normal origin pull is a no-op because
+        # the sync also pushed that commit to origin/main.
+        shas = iter(["b" * 40, "b" * 40, "b" * 40, "b" * 40])
 
-        with patch.object(
-            hm,
-            "_get_origin_url",
-            return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(
-            update_cmd,
-            "_capture_head_sha",
-            side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
-        ), patch(
-            # The full post-update path runs the fleet version check, which
-            # reads the REAL machine's profile gateway_state.json files —
-            # live gateways on a dev box read as STALE vs this checkout and
-            # exit 1. Pin an empty fleet: this test asserts the post-update
-            # path RUNS, not the fleet's health.
-            "hermes_cli.update_receipt.collect_fleet_versions",
-            return_value=[],
-        ), patch(
-            # Same isolation for the restart phase: without these, the real
-            # machine's live gateways enter the restart discovery, the
-            # mocked-subprocess restart phase can't verify replacements, and
-            # the fail-closed contract (#78574) exits 1 (locally the
-            # live-system guard blocks the os.kill outright).
-            "hermes_cli.gateway.find_gateway_pids",
-            return_value=[],
-        ), patch(
-            "hermes_cli.gateway.find_profile_gateway_processes",
-            return_value=[],
-        ), patch(
-            "hermes_cli.gateway._get_service_pids",
-            return_value=set(),
-        ), patch.object(
-            hm, "_sync_with_upstream_if_needed"
-        ), patch.object(
-            hm,
-            "_reload_updated_runtime_modules",
-            # Reaching the reload step IS the proof the post-update path ran
-            # (the bug returned from "Already up to date!" before it). Abort
-            # the pipeline right here: everything past this point (skills
-            # sync, desktop rebuild, gateway restart, fleet check) would run
-            # for real against the host machine.
-            side_effect=SystemExit(0),
-        ) as post_update_step:
+        with (
+            patch.object(
+                hm,
+                "_get_origin_url",
+                return_value="https://github.com/example/hermes-agent.git",
+            ),
+            patch.object(
+                update_cmd,
+                "_capture_head_sha",
+                side_effect=lambda *_args, **_kwargs: next(shas, "ccccccc"),
+            ),
+            patch(
+                # The full post-update path runs the fleet version check, which
+                # reads the REAL machine's profile gateway_state.json files —
+                # live gateways on a dev box read as STALE vs this checkout and
+                # exit 1. Pin an empty fleet: this test asserts the post-update
+                # path RUNS, not the fleet's health.
+                "hermes_cli.update_receipt.collect_fleet_versions",
+                return_value=[],
+            ),
+            patch(
+                # Same isolation for the restart phase: without these, the real
+                # machine's live gateways enter the restart discovery, the
+                # mocked-subprocess restart phase can't verify replacements, and
+                # the fail-closed contract (#78574) exits 1 (locally the
+                # live-system guard blocks the os.kill outright).
+                "hermes_cli.gateway.find_gateway_pids",
+                return_value=[],
+            ),
+            patch(
+                "hermes_cli.gateway.find_profile_gateway_processes",
+                return_value=[],
+            ),
+            patch(
+                "hermes_cli.gateway._get_service_pids",
+                return_value=set(),
+            ),
+            patch.object(
+                update_cmd,
+                "_sync_with_upstream_observed",
+                return_value=update_cmd.UpstreamSyncOutcome(
+                    phase="prepare",
+                    status="updated",
+                    pre_sha="a" * 40,
+                    post_sha="b" * 40,
+                    clean=True,
+                    operation_state="none",
+                    recovery_ref="refs/tags/pre-upstream-sync-test",
+                    error="",
+                ),
+            ),
+            patch.object(
+                hm,
+                "_reload_updated_runtime_modules",
+                # Reaching the reload step IS the proof the post-update path ran
+                # (the bug returned from "Already up to date!" before it). Abort
+                # the pipeline with the updater's structured test sentinel:
+                # an ordinary SystemExit is intentionally treated as an
+                # outcome-unknown mutation fault by the transaction contract.
+                side_effect=update_cmd._HandledUpdateExit(0),
+            ) as post_update_step,
+        ):
             with pytest.raises(SystemExit) as exit_info:
                 cmd_update(mock_args)
 
@@ -514,23 +639,29 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Already up to date!" not in captured.out
 
-    def test_update_non_interactive_runs_safe_config_migrations(self, mock_args, capsys):
+    def test_update_non_interactive_runs_safe_config_migrations(
+        self, mock_args, capsys
+    ):
         """Dashboard/web updates apply non-interactive migrations before restart."""
-        with patch("shutil.which", return_value=None), patch(
-            "subprocess.run"
-        ) as mock_run, patch("builtins.input") as mock_input, patch(
-            "hermes_cli.config.get_missing_env_vars", return_value=["MISSING_KEY"]
-        ), patch(
-            "hermes_cli.config.get_missing_config_fields",
-            return_value=[{"key": "new.option", "default": True}],
-        ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
-        ), patch(
-            "hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2)
-        ), patch(
-            "hermes_cli.update_cmd._run_migrate_config_fresh",
-            return_value={"env_added": [], "config_added": ["new.option"]},
-        ) as migrate_config, patch("hermes_cli.main.sys") as mock_sys:
+        with (
+            patch("shutil.which", return_value=None),
+            patch("subprocess.run") as mock_run,
+            patch("builtins.input") as mock_input,
+            patch(
+                "hermes_cli.config.get_missing_env_vars", return_value=["MISSING_KEY"]
+            ),
+            patch(
+                "hermes_cli.config.get_missing_config_fields",
+                return_value=[{"key": "new.option", "default": True}],
+            ),
+            patch("hermes_cli.update_cmd._reload_config_modules"),
+            patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2)),
+            patch(
+                "hermes_cli.update_cmd._run_migrate_config_fresh",
+                return_value={"env_added": [], "config_added": ["new.option"]},
+            ) as migrate_config,
+            patch("hermes_cli.main.sys") as mock_sys,
+        ):
             mock_sys.stdin.isatty.return_value = False
             mock_sys.stdout.isatty.return_value = False
             mock_run.side_effect = _make_run_side_effect(
@@ -546,6 +677,782 @@ class TestCmdUpdateBranchFallback:
             assert "API keys require manual entry" in captured.out
 
 
+class TestUpstreamSyncTransaction:
+    SHA_A = "a" * 40
+    SHA_B = "b" * 40
+    STASH = "c" * 40
+
+    def test_failed_sync_on_unchanged_clean_head_restores_stash_and_stops(self):
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="prepare",
+            status="failed",
+            pre_sha=self.SHA_A,
+            post_sha=self.SHA_A,
+            clean=True,
+            operation_state="none",
+            recovery_ref=self.SHA_A,
+            error="targeted tests failed",
+        )
+        with (
+            patch("hermes_cli.main._restore_stashed_changes") as restore,
+            patch.object(update_cmd, "_write_sync_quarantine") as quarantine,
+            patch.object(update_cmd, "_record_update_step") as record,
+            patch.object(update_cmd, "_resume_windows_gateways_after_update") as resume,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._enforce_upstream_sync_outcome(
+                    outcome,
+                    ["git"],
+                    self.STASH,
+                    prompt_for_restore=False,
+                    input_fn=None,
+                    windows_gateway_resume=[123],
+                )
+
+        assert exc_info.value.code == 1
+        restore.assert_called_once_with(
+            ["git"], PROJECT_ROOT, self.STASH, prompt_user=False, input_fn=None
+        )
+        quarantine.assert_not_called()
+        record.assert_called_once()
+        resume.assert_called_once_with([123])
+
+    def test_failed_stash_restore_quarantines_without_claiming_restored(self, capsys):
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="prepare",
+            status="failed",
+            pre_sha=self.SHA_A,
+            post_sha=self.SHA_A,
+            clean=True,
+            operation_state="none",
+            recovery_ref=self.SHA_A,
+            error="upstream fetch failed",
+        )
+
+        with (
+            patch("hermes_cli.main._restore_stashed_changes", return_value=False),
+            patch.object(update_cmd, "_capture_head_sha", return_value=self.SHA_A),
+            patch.object(
+                update_cmd,
+                "_capture_checkout_proof",
+                return_value=(None, "unknown", "stash restore state unknown"),
+            ),
+            patch.object(
+                update_cmd,
+                "_write_sync_quarantine",
+                return_value=PROJECT_ROOT / ".update-quarantine.json",
+            ) as quarantine,
+            patch.object(update_cmd, "_record_update_step"),
+            patch.object(update_cmd, "_resume_windows_gateways_after_update") as resume,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._enforce_upstream_sync_outcome(
+                    outcome,
+                    ["git"],
+                    self.STASH,
+                    prompt_for_restore=True,
+                    input_fn=None,
+                    windows_gateway_resume=[123],
+                )
+
+        assert exc_info.value.code == 1
+        evidence = quarantine.call_args.args[0]
+        assert evidence["status"] == "stash_restore_failed"
+        assert evidence["stash_object"] == self.STASH
+        assert evidence["clean"] is None
+        assert evidence["operation_state"] == "unknown"
+        assert "stash restore failed" in evidence["error"]
+        assert "local changes were restored" not in capsys.readouterr().out.lower()
+        resume.assert_called_once_with([123])
+
+    def test_moved_head_failure_quarantines_exact_evidence_and_preserves_stash(
+        self, capsys
+    ):
+        import json
+        import stat
+        from hermes_cli import update_receipt
+
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="post_origin_pull",
+            status="failed",
+            pre_sha=self.SHA_A,
+            post_sha=self.SHA_B,
+            clean=True,
+            operation_state="none",
+            recovery_ref="refs/tags/pre-upstream-sync-20260912-120000",
+            error="targeted tests failed",
+        )
+
+        with (
+            patch("hermes_cli.main._restore_stashed_changes") as restore,
+            patch.object(
+                update_cmd, "_rollback_fork_sync_candidate", return_value=False
+            ) as rollback,
+            patch.object(update_cmd, "_capture_head_sha", return_value=self.SHA_B),
+            patch.object(
+                update_cmd,
+                "_capture_checkout_proof",
+                return_value=(True, "none", None),
+            ),
+            patch.object(update_cmd, "_record_update_step") as record,
+            patch.object(update_cmd, "_resume_windows_gateways_after_update") as resume,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._enforce_upstream_sync_outcome(
+                    outcome,
+                    ["git"],
+                    self.STASH,
+                    prompt_for_restore=False,
+                    input_fn=None,
+                    windows_gateway_resume=[123],
+                )
+
+        assert exc_info.value.code == 1
+        project_root = update_cmd._m().PROJECT_ROOT
+        marker = update_receipt.update_quarantine_path(project_root)
+        assert json.loads(marker.read_text(encoding="utf-8")) == {
+            "schema": 1,
+            "phase": "post_origin_pull",
+            "status": "failed",
+            "invocation_pre_sha": None,
+            "post_origin_sha": None,
+            "origin_advanced": False,
+            "pre_sha": self.SHA_A,
+            "post_sha": self.SHA_B,
+            "clean": True,
+            "operation_state": "none",
+            "recovery_ref": "refs/tags/pre-upstream-sync-20260912-120000",
+            "error": "targeted tests failed",
+            "local_integration_completed": False,
+            "stash_object": self.STASH,
+            "root_fault": "targeted tests failed",
+            "rollback": {
+                "attempted": True,
+                "succeeded": False,
+                "post_sha": self.SHA_B,
+                "clean": True,
+                "operation_state": "none",
+            },
+            "cleanup_failures": ["rollback postcondition was not proven"],
+            "recovery_steps": [
+                {
+                    "action": "inspect_checkout",
+                    "argv": ["git", "-C", str(project_root), "status"],
+                },
+                {
+                    "action": "verify_head",
+                    "argv": ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+                },
+                {
+                    "action": "reset_to_recovery_ref",
+                    "argv": [
+                        "git",
+                        "-C",
+                        str(project_root),
+                        "reset",
+                        "--hard",
+                        outcome.recovery_ref,
+                    ],
+                },
+                {
+                    "action": "apply_stash",
+                    "argv": [
+                        "git",
+                        "-C",
+                        str(project_root),
+                        "stash",
+                        "apply",
+                        self.STASH,
+                    ],
+                },
+                {
+                    "action": "remove_quarantine_after_recovery",
+                    "path": str(marker),
+                },
+            ],
+        }
+        assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+        restore.assert_not_called()
+        rollback.assert_called_once_with(["git"], project_root, outcome.recovery_ref)
+        record.assert_called_once()
+        assert record.call_args.args[0:2] == ("upstream_sync", False)
+        recorded = json.loads(record.call_args.args[2])
+        persisted = json.loads(marker.read_text(encoding="utf-8"))
+        assert recorded == {key: persisted[key] for key in recorded}
+        resume.assert_called_once_with([123])
+        output = capsys.readouterr().out
+        assert outcome.recovery_ref in output
+        assert self.STASH in output
+        assert str(marker) in output
+
+    def test_failed_sync_restore_exception_quarantines_and_resumes_windows(self):
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="prepare",
+            status="failed",
+            pre_sha=self.SHA_A,
+            post_sha=self.SHA_A,
+            clean=True,
+            operation_state="none",
+            recovery_ref=self.SHA_A,
+            error="upstream fetch failed",
+        )
+
+        with (
+            patch(
+                "hermes_cli.main._restore_stashed_changes",
+                side_effect=RuntimeError("stash restore failed"),
+            ),
+            patch.object(update_cmd, "_capture_head_sha", return_value=self.SHA_A),
+            patch.object(
+                update_cmd,
+                "_capture_checkout_proof",
+                return_value=(None, "unknown", "restore state unknown"),
+            ),
+            patch.object(
+                update_cmd,
+                "_write_sync_quarantine",
+                return_value=PROJECT_ROOT / ".update-quarantine.json",
+            ) as quarantine,
+            patch.object(update_cmd, "_record_update_step"),
+            patch.object(update_cmd, "_resume_windows_gateways_after_update") as resume,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._enforce_upstream_sync_outcome(
+                    outcome,
+                    ["git"],
+                    self.STASH,
+                    prompt_for_restore=False,
+                    input_fn=None,
+                    windows_gateway_resume=[123],
+                )
+
+        assert exc_info.value.code == 1
+        evidence = quarantine.call_args.args[0]
+        assert evidence["status"] == "stash_restore_failed"
+        assert "stash restore failed" in evidence["error"]
+        assert evidence["stash_object"] == self.STASH
+        resume.assert_called_once_with([123])
+
+    def test_origin_ahead_defers_real_stash_settlement_until_after_sync(self):
+        events: list[str] = []
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="post_origin_pull",
+            status="noop",
+            pre_sha=self.SHA_B,
+            post_sha=self.SHA_B,
+            clean=True,
+            operation_state="none",
+            recovery_ref=self.SHA_B,
+            error="",
+        )
+        plan = update_cmd._CheckoutPlan(
+            auto_stash_ref=self.STASH,
+            commit_count=2,
+            in_place_update=False,
+            parked_branch_switched=False,
+            prompt_for_restore=False,
+            switch_block_reason=None,
+            upstream_checked=True,
+            upstream_sync_moved_head=False,
+        )
+        opts = SimpleNamespace(
+            assume_yes=False,
+            gw_input_fn=None,
+            discard_local_changes=False,
+            keep_stash=False,
+        )
+
+        def strict_git_run(_git_cmd, args, *_args, **_kwargs):
+            if args == ["merge", "--ff-only", "origin/main"]:
+                events.append("origin_pull")
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            raise AssertionError(f"unexpected Git command: {args}")
+
+        with (
+            patch.object(update_cmd, "_capture_head_sha", return_value=self.SHA_A),
+            patch.object(update_cmd, "_git_run", side_effect=strict_git_run),
+            patch.object(update_cmd, "_rollback_if_pulled_syntax_error"),
+            patch.object(
+                update_cmd,
+                "_sync_with_upstream_observed",
+                side_effect=lambda *_a, **_k: events.append("sync") or outcome,
+            ) as sync,
+            patch.object(
+                update_cmd,
+                "_enforce_upstream_sync_outcome",
+                side_effect=lambda *_a, **_k: events.append("enforce"),
+            ),
+            patch(
+                "hermes_cli.main._restore_stashed_changes",
+                side_effect=lambda *_a, **_k: events.append("restore") or True,
+            ),
+        ):
+            update_cmd._pull_sync_and_settle_stash(
+                ["git"],
+                "main",
+                plan,
+                opts,
+                is_fork=True,
+                windows_gateway_resume=None,
+            )
+
+        assert events == ["origin_pull", "sync", "enforce", "restore"]
+        sync.assert_called_once()
+
+    def test_origin_ahead_syncs_once_before_stash_restore(self):
+        events: list[str] = []
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="post_origin_pull",
+            status="noop",
+            pre_sha=self.SHA_B,
+            post_sha=self.SHA_B,
+            clean=True,
+            operation_state="none",
+            recovery_ref=self.SHA_B,
+            error="",
+        )
+        plan = update_cmd._CheckoutPlan(
+            auto_stash_ref=self.STASH,
+            commit_count=2,
+            in_place_update=False,
+            parked_branch_switched=False,
+            prompt_for_restore=False,
+            switch_block_reason=None,
+            upstream_checked=True,
+            upstream_sync_moved_head=False,
+        )
+        opts = SimpleNamespace(
+            assume_yes=False,
+            gw_input_fn=None,
+            discard_local_changes=False,
+            keep_stash=False,
+        )
+        with (
+            patch.object(
+                update_cmd,
+                "_pull_updates",
+                side_effect=lambda *_a, **_k: events.append("pull") or self.SHA_A,
+            ),
+            patch.object(
+                update_cmd,
+                "_sync_with_upstream_observed",
+                side_effect=lambda *_a, **_k: events.append("sync") or outcome,
+            ) as sync,
+            patch.object(
+                update_cmd,
+                "_enforce_upstream_sync_outcome",
+                side_effect=lambda *_a, **_k: events.append("enforce"),
+            ),
+            patch(
+                "hermes_cli.main._restore_stashed_changes",
+                side_effect=lambda *_a, **_k: events.append("restore") or True,
+            ),
+        ):
+            update_cmd._pull_sync_and_settle_stash(
+                ["git"],
+                "main",
+                plan,
+                opts,
+                is_fork=True,
+                windows_gateway_resume=None,
+            )
+
+        assert events == ["pull", "sync", "enforce", "restore"]
+        sync.assert_called_once()
+
+    def test_missing_origin_branch_with_autostash_restores_without_nameerror(self):
+        from hermes_cli import main as hm
+
+        def strict_git_run(_git_cmd, args, *_args, **_kwargs):
+            if args == ["checkout", "missing"]:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="missing")
+            if args == ["checkout", "-B", "missing", "origin/missing"]:
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="missing")
+            raise AssertionError(f"unexpected Git command: {args}")
+
+        with (
+            patch.object(
+                update_cmd,
+                "_apply_parked_branch_guard",
+                return_value=(False, False, None),
+            ),
+            patch.object(
+                hm,
+                "_stash_local_changes_if_needed",
+                return_value=self.STASH,
+            ),
+            patch.object(update_cmd, "_git_run", side_effect=strict_git_run),
+            patch.object(hm, "_restore_stashed_changes") as restore,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._prepare_checkout_for_update(
+                    ["git"],
+                    "missing",
+                    "main",
+                    is_fork=True,
+                    assume_yes=False,
+                    gateway_mode=False,
+                    gw_input_fn=None,
+                    switch_branch=False,
+                    _windows_gateway_resume=None,
+                )
+
+        assert exc_info.value.code == 1
+        restore.assert_called_once_with(
+            ["git"], PROJECT_ROOT, self.STASH, prompt_user=False, input_fn=None
+        )
+
+    def test_in_place_feature_update_never_runs_upstream_sync(self):
+        plan = update_cmd._CheckoutPlan(
+            auto_stash_ref=self.STASH,
+            commit_count=2,
+            in_place_update=True,
+            parked_branch_switched=False,
+            prompt_for_restore=False,
+            switch_block_reason="unmerged:1",
+            upstream_checked=True,
+            upstream_sync_moved_head=False,
+        )
+        opts = SimpleNamespace(
+            assume_yes=False,
+            gw_input_fn=None,
+            discard_local_changes=False,
+            keep_stash=False,
+        )
+        with (
+            patch.object(update_cmd, "_pull_updates", return_value=self.SHA_A),
+            patch.object(update_cmd, "_sync_with_upstream_observed") as sync,
+            patch(
+                "hermes_cli.main._restore_stashed_changes", return_value=True
+            ) as restore,
+        ):
+            update_cmd._pull_sync_and_settle_stash(
+                ["git"],
+                "main",
+                plan,
+                opts,
+                is_fork=True,
+                windows_gateway_resume=None,
+            )
+
+        sync.assert_not_called()
+        restore.assert_called_once()
+
+    def test_zero_commit_in_place_feature_update_skips_prepare_sync(self):
+        from hermes_cli import main as hm
+
+        def strict_git_run(_git_cmd, args, *_args, **_kwargs):
+            if args == ["rev-list", "HEAD..origin/main", "--count"]:
+                return subprocess.CompletedProcess(args, 0, stdout="0\n", stderr="")
+            raise AssertionError(f"unexpected Git command: {args}")
+
+        with (
+            patch.object(
+                update_cmd,
+                "_apply_parked_branch_guard",
+                return_value=(False, True, "unmerged:1"),
+            ),
+            patch.object(hm, "_stash_local_changes_if_needed", return_value=None),
+            patch.object(update_cmd, "_git_run", side_effect=strict_git_run),
+            patch.object(update_cmd, "_is_shallow_checkout", return_value=False),
+            patch.object(update_cmd, "_sync_with_upstream_observed") as sync,
+        ):
+            plan = update_cmd._prepare_checkout_for_update(
+                ["git"],
+                "main",
+                "feature/work",
+                is_fork=True,
+                assume_yes=False,
+                gateway_mode=False,
+                gw_input_fn=None,
+                switch_branch=False,
+                _windows_gateway_resume=None,
+            )
+
+        assert plan.in_place_update is True
+        assert plan.commit_count == 0
+        assert plan.upstream_sync_outcome is None
+        sync.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "failed",
+                "a" * 40,
+                "b" * 40,
+                True,
+                "none",
+                "refs/tags/pre-upstream-sync-test",
+                "sync failed",
+            ),
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "rollback_failed",
+                "a" * 40,
+                "a" * 40,
+                True,
+                "none",
+                "a" * 40,
+                "rollback failed",
+            ),
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "failed",
+                None,
+                "a" * 40,
+                True,
+                "none",
+                None,
+                "missing pre SHA",
+            ),
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "failed",
+                "a" * 40,
+                "a" * 40,
+                False,
+                "none",
+                "a" * 40,
+                "dirty checkout",
+            ),
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "failed",
+                "a" * 40,
+                "a" * 40,
+                True,
+                "revert",
+                "a" * 40,
+                "active operation",
+            ),
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "updated",
+                "a" * 40,
+                "b" * 40,
+                True,
+                "none",
+                "refs/tags/pre-upstream-sync-test",
+                "push failed",
+            ),
+            update_cmd.UpstreamSyncOutcome(
+                "prepare",
+                "failed",
+                "a" * 40,
+                "a" * 40,
+                True,
+                "none",
+                "a" * 40,
+                "remote add failed",
+            ),
+        ],
+        ids=[
+            "moved-head",
+            "rollback",
+            "missing-sha",
+            "dirty",
+            "operation",
+            "push",
+            "remote-add",
+        ],
+    )
+    def test_prepare_failure_blocks_every_dangerous_late_stage(self, outcome):
+        from hermes_cli import gitlock
+        from hermes_cli import main as hm
+
+        plan = update_cmd._CheckoutPlan(
+            auto_stash_ref=None,
+            commit_count=0,
+            in_place_update=False,
+            parked_branch_switched=False,
+            prompt_for_restore=False,
+            switch_block_reason=None,
+            upstream_checked=True,
+            upstream_sync_moved_head=False,
+            upstream_sync_outcome=outcome,
+        )
+        opts = update_cmd._UpdateOptions(
+            active_lazy_features=[],
+            active_tool_dependencies=[],
+            pre_update_version="0.0.0",
+            gw_input_fn=None,
+            assume_yes=False,
+            keep_stash=False,
+            switch_branch=False,
+            discard_local_changes=False,
+        )
+        dangerous_names = (
+            "_sync_python_dependencies_after_pull",
+            "_update_node_dependencies",
+            "_check_and_apply_config_migration",
+            "_run_post_update_maintenance",
+            "_write_fleet_restart_pending_marker",
+            "_restart_gateway_fleet_after_update",
+            "_verify_fleet_after_update",
+        )
+        dangerous = [patch.object(update_cmd, name) for name in dangerous_names]
+        started = [item.start() for item in dangerous]
+        try:
+            with (
+                patch.object(update_cmd, "_resolve_update_options", return_value=opts),
+                patch.object(
+                    update_cmd, "_begin_update_receipt_and_plan", return_value=None
+                ),
+                patch.object(update_cmd, "_refuse_existing_sync_quarantine"),
+                patch.object(hm, "_run_pre_update_backup", return_value=None),
+                patch.object(
+                    hm, "_pause_windows_gateways_for_update", return_value=[123]
+                ),
+                patch.object(update_cmd, "_desktop_app_present", return_value=False),
+                patch.object(
+                    update_cmd,
+                    "_prepare_git_command",
+                    return_value=(False, ["git"], True),
+                ),
+                patch.object(hm, "_resolve_update_branch", return_value="main"),
+                patch.object(
+                    update_cmd,
+                    "_git_run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, stdout="", stderr=""
+                    ),
+                ),
+                patch.object(update_cmd, "_current_branch_name", return_value="main"),
+                patch.object(
+                    update_cmd, "_prepare_checkout_for_update", return_value=plan
+                ),
+                patch.object(
+                    update_cmd,
+                    "_write_sync_quarantine",
+                    return_value=PROJECT_ROOT / ".update-quarantine.json",
+                ),
+                patch.object(update_cmd, "_resume_windows_gateways_after_update"),
+                patch.object(gitlock, "clear_stale_git_locks", return_value=[]),
+                patch.object(gitlock, "clear_stale_tmp_packs", return_value=0),
+                patch.object(gitlock, "prune_stale_shallow_grafts", return_value=0),
+                patch.object(hm, "_warn_orphaned_update_autostashes"),
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    update_cmd._cmd_update_impl(SimpleNamespace(), gateway_mode=False)
+            assert exc_info.value.code == 1
+            for mock in started:
+                mock.assert_not_called()
+        finally:
+            for item in reversed(dangerous):
+                item.stop()
+
+    def test_windows_zip_install_without_git_reaches_zip_updater(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        opts = SimpleNamespace(gw_input_fn=None, assume_yes=True)
+        args = SimpleNamespace(force_venv=True)
+        zip_calls = []
+        resumed = []
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_is_windows", lambda: True)
+        monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *a: opts)
+        monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda *a: None)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda *a: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: [123])
+        monkeypatch.setattr(
+            hm,
+            "_resume_windows_gateways_after_update",
+            lambda value: resumed.append(value),
+        )
+        monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda *a: False)
+        monkeypatch.setattr(
+            update_cmd,
+            "_prepare_git_command",
+            lambda: (True, None, False),
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_update_via_zip",
+            lambda *a, **k: zip_calls.append((a, k)) or True,
+        )
+
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+        assert len(zip_calls) == 1
+        assert resumed == [[123]]
+
+    def test_windows_dangling_git_symlink_fails_before_zip(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / ".git").symlink_to(
+            tmp_path / "missing-git-dir", target_is_directory=True
+        )
+        opts = SimpleNamespace(gw_input_fn=None, assume_yes=True)
+        args = SimpleNamespace(force_venv=True)
+        pauses = []
+        zip_updates = []
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_is_windows", lambda: True)
+        monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *a: opts)
+        monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda *a: None)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda *a: pauses.append("backup"))
+        monkeypatch.setattr(
+            hm,
+            "_pause_windows_gateways_for_update",
+            lambda: pauses.append("pause") or [],
+        )
+        monkeypatch.setattr(
+            hm, "_resume_windows_gateways_after_update", lambda *_args: None
+        )
+        monkeypatch.setattr(update_cmd, "_desktop_app_present", lambda *a: False)
+        monkeypatch.setattr(
+            update_cmd, "_prepare_git_command", lambda: (True, None, False)
+        )
+        monkeypatch.setattr(
+            update_cmd,
+            "_update_via_zip",
+            lambda *a, **k: zip_updates.append((a, k)) or True,
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+        assert exc_info.value.code == 2
+        assert pauses == []
+        assert zip_updates == []
+
+    def test_existing_quarantine_blocks_before_git_mutation(self):
+        from hermes_cli import main as hm, update_receipt
+
+        marker = update_receipt.update_quarantine_path(update_cmd._m().PROJECT_ROOT)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"phase":"prepare","status":"failed"}', encoding="utf-8")
+        opts = SimpleNamespace(gw_input_fn=None, assume_yes=False)
+        with (
+            patch.object(update_cmd, "_resolve_update_options", return_value=opts),
+            patch.object(
+                update_cmd, "_begin_update_receipt_and_plan", return_value=None
+            ),
+            patch.object(
+                hm,
+                "_run_pre_update_backup",
+                side_effect=AssertionError("backup mutation reached"),
+            ) as backup,
+            patch.object(
+                update_cmd,
+                "_prepare_git_command",
+                side_effect=AssertionError("git mutation reached"),
+            ) as git_prepare,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                update_cmd._cmd_update_impl(SimpleNamespace(), gateway_mode=False)
+
+        assert exc_info.value.code == 2
+        backup.assert_not_called()
+        git_prepare.assert_not_called()
+
+
 class TestCmdUpdateMigrationPrompt:
     """The config-migration prompt names what changed and skips the prompt
     entirely when only the config format version moved.
@@ -556,24 +1463,23 @@ class TestCmdUpdateMigrationPrompt:
     yes looked like a no-op.
     """
 
-    def test_version_bump_only_applies_silently_without_prompt(
-        self, mock_args, capsys
-    ):
+    def test_version_bump_only_applies_silently_without_prompt(self, mock_args, capsys):
         """Only the version moved → apply non-interactively, never prompt."""
-        with patch("shutil.which", return_value=None), patch(
-            "subprocess.run"
-        ) as mock_run, patch("builtins.input") as mock_input, patch(
-            "hermes_cli.config.get_missing_env_vars", return_value=[]
-        ), patch(
-            "hermes_cli.config.get_missing_config_fields", return_value=[]
-        ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
-        ), patch(
-            "hermes_cli.update_cmd._run_config_check_fresh", return_value=(5, 24)
-        ), patch(
-            "hermes_cli.update_cmd._run_migrate_config_fresh",
-            return_value={"env_added": [], "config_added": [], "warnings": []},
-        ) as mock_migrate:
+        with (
+            patch("shutil.which", return_value=None),
+            patch("subprocess.run") as mock_run,
+            patch("builtins.input") as mock_input,
+            patch("hermes_cli.config.get_missing_env_vars", return_value=[]),
+            patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
+            patch("hermes_cli.update_cmd._reload_config_modules"),
+            patch(
+                "hermes_cli.update_cmd._run_config_check_fresh", return_value=(5, 24)
+            ),
+            patch(
+                "hermes_cli.update_cmd._run_migrate_config_fresh",
+                return_value={"env_added": [], "config_added": [], "warnings": []},
+            ) as mock_migrate,
+        ):
             mock_run.side_effect = _make_run_side_effect(
                 branch="main", verify_ok=True, commit_count="1"
             )
@@ -588,9 +1494,7 @@ class TestCmdUpdateMigrationPrompt:
             # The misleading question must NOT appear for a pure version bump.
             assert "configure them now" not in out.lower()
 
-    def test_version_bump_only_surfaces_migration_resets(
-        self, mock_args, capsys
-    ):
+    def test_version_bump_only_surfaces_migration_resets(self, mock_args, capsys):
         """A quiet version-bump migration that RESETS a user setting must say so.
 
         Regression for #86656: the v33→v34 personality reset ran with
@@ -599,23 +1503,24 @@ class TestCmdUpdateMigrationPrompt:
         display.personality. Migration-step mutations (config_added) and
         warnings must be re-surfaced even in the silent branch.
         """
-        with patch("shutil.which", return_value=None), patch(
-            "subprocess.run"
-        ) as mock_run, patch("builtins.input") as mock_input, patch(
-            "hermes_cli.config.get_missing_env_vars", return_value=[]
-        ), patch(
-            "hermes_cli.config.get_missing_config_fields", return_value=[]
-        ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
-        ), patch(
-            "hermes_cli.update_cmd._run_config_check_fresh", return_value=(33, 34)
-        ), patch(
-            "hermes_cli.update_cmd._run_migrate_config_fresh",
-            return_value={
-                "env_added": [],
-                "config_added": ["display.personality=none (one-time reset)"],
-                "warnings": ["Disabled suspicious MCP server 'evil'"],
-            },
+        with (
+            patch("shutil.which", return_value=None),
+            patch("subprocess.run") as mock_run,
+            patch("builtins.input") as mock_input,
+            patch("hermes_cli.config.get_missing_env_vars", return_value=[]),
+            patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
+            patch("hermes_cli.update_cmd._reload_config_modules"),
+            patch(
+                "hermes_cli.update_cmd._run_config_check_fresh", return_value=(33, 34)
+            ),
+            patch(
+                "hermes_cli.update_cmd._run_migrate_config_fresh",
+                return_value={
+                    "env_added": [],
+                    "config_added": ["display.personality=none (one-time reset)"],
+                    "warnings": ["Disabled suspicious MCP server 'evil'"],
+                },
+            ),
         ):
             mock_run.side_effect = _make_run_side_effect(
                 branch="main", verify_ok=True, commit_count="1"
@@ -631,30 +1536,35 @@ class TestCmdUpdateMigrationPrompt:
             assert "display.personality=none (one-time reset)" in out
             assert "Disabled suspicious MCP server 'evil'" in out
 
-    def test_new_options_are_listed_by_name_before_prompt(
-        self, mock_args, capsys
-    ):
+    def test_new_options_are_listed_by_name_before_prompt(self, mock_args, capsys):
         """New env/config keys are printed by name so the user can decide."""
         env_items = [
             {"name": "FOO_API_KEY", "description": "Foo service API key"},
         ]
         cfg_items = [
-            {"key": "display.new_widget", "description": "New config option: display.new_widget"},
+            {
+                "key": "display.new_widget",
+                "description": "New config option: display.new_widget",
+            },
         ]
-        with patch("shutil.which", return_value=None), patch(
-            "subprocess.run"
-        ) as mock_run, patch("builtins.input", return_value="n"), patch(
-            "hermes_cli.config.get_missing_env_vars", return_value=env_items
-        ), patch(
-            "hermes_cli.config.get_missing_config_fields", return_value=cfg_items
-        ), patch(
-            "hermes_cli.update_cmd._reload_config_modules"
-        ), patch(
-            "hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 24)
-        ), patch(
-            "hermes_cli.update_cmd._run_migrate_config_fresh",
-            return_value={"env_added": [], "config_added": [], "warnings": []},
-        ), patch("hermes_cli.main.sys") as mock_sys:
+        with (
+            patch("shutil.which", return_value=None),
+            patch("subprocess.run") as mock_run,
+            patch("builtins.input", return_value="n"),
+            patch("hermes_cli.config.get_missing_env_vars", return_value=env_items),
+            patch(
+                "hermes_cli.config.get_missing_config_fields", return_value=cfg_items
+            ),
+            patch("hermes_cli.update_cmd._reload_config_modules"),
+            patch(
+                "hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 24)
+            ),
+            patch(
+                "hermes_cli.update_cmd._run_migrate_config_fresh",
+                return_value={"env_added": [], "config_added": [], "warnings": []},
+            ),
+            patch("hermes_cli.main.sys") as mock_sys,
+        ):
             mock_sys.stdin.isatty.return_value = True
             mock_sys.stdout.isatty.return_value = True
             mock_run.side_effect = _make_run_side_effect(
@@ -783,7 +1693,15 @@ class TestCmdUpdateBranchFlag:
     target without monkey-patching the implementation.
     """
 
-    def _branch_side_effect(self, current_branch, target_branch, *, checkout_fails=False, track_fails=False, commit_count="0"):
+    def _branch_side_effect(
+        self,
+        current_branch,
+        target_branch,
+        *,
+        checkout_fails=False,
+        track_fails=False,
+        commit_count="0",
+    ):
         """Mock side-effect that knows about checkout/track behavior.
 
         - ``current_branch``  what ``git rev-parse --abbrev-ref HEAD`` returns
@@ -794,25 +1712,57 @@ class TestCmdUpdateBranchFlag:
                               (simulates branch absent on origin too)
         - ``commit_count``    rev-list count returned (0 = up-to-date, >0 = behind)
         """
+        head_sha = ["a" * 40]
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{current_branch}\n", stderr=""
+                )
+            if "rev-parse --absolute-git-dir" in joined:
+                git_dir = update_cmd._m().PROJECT_ROOT / ".git"
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{git_dir}\n", stderr=""
+                )
+            if "rev-parse HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{head_sha[0]}\n", stderr=""
+                )
+            if "status --porcelain=v1 --untracked-files=all" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
             if "checkout" in joined and "-B" in joined:
                 rc = 128 if track_fails else 0
-                err = f"fatal: '{target_branch}' did not match any file(s) known to git\n" if track_fails else ""
+                err = (
+                    f"fatal: '{target_branch}' did not match any file(s) known to git\n"
+                    if track_fails
+                    else ""
+                )
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
-            if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
+            if (
+                "checkout" in joined
+                and "-B" not in joined
+                and "rev-parse" not in joined
+            ):
                 rc = 128 if checkout_fails else 0
-                err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
+                err = (
+                    f"error: pathspec '{target_branch}' did not match\n"
+                    if checkout_fails
+                    else ""
+                )
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{commit_count}\n", stderr=""
+                )
+
+            if "merge --ff-only" in joined:
+                head_sha[0] = "b" * 40
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -820,7 +1770,9 @@ class TestCmdUpdateBranchFlag:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_branch_flag_pulls_against_named_branch(self, mock_run, _mock_which, capsys):
+    def test_branch_flag_pulls_against_named_branch(
+        self, mock_run, _mock_which, capsys
+    ):
         """--branch bb/gui makes rev-list and pull target origin/bb/gui."""
         mock_run.side_effect = self._branch_side_effect(
             current_branch="bb/gui", target_branch="bb/gui", commit_count="3"
@@ -829,7 +1781,9 @@ class TestCmdUpdateBranchFlag:
 
         cmd_update(args)
 
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        commands = [
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
+        ]
 
         # rev-list must compare against origin/bb/gui, not origin/main
         rev_list_cmds = [c for c in commands if "rev-list" in c]
@@ -838,12 +1792,15 @@ class TestCmdUpdateBranchFlag:
 
         # the ff-only merge must target origin/bb/gui
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
-        assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
-
+        assert any(
+            "origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds
+        ), merge_cmds
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
-    def test_branch_flag_fails_when_branch_missing_everywhere(self, mock_run, _mock_which, capsys):
+    def test_branch_flag_fails_when_branch_missing_everywhere(
+        self, mock_run, _mock_which, capsys
+    ):
         """If branch doesn't exist locally OR on origin, exit non-zero with clear error."""
         mock_run.side_effect = self._branch_side_effect(
             current_branch="main",
@@ -898,7 +1855,11 @@ class TestCmdUpdateCheckBranchFlag:
 
             if "fetch" in joined and "upstream" in joined:
                 rc = 0 if upstream_fetch_ok else 128
-                err = "" if upstream_fetch_ok else "fatal: 'upstream' does not appear to be a git repository\n"
+                err = (
+                    ""
+                    if upstream_fetch_ok
+                    else "fatal: 'upstream' does not appear to be a git repository\n"
+                )
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "fetch" in joined and "origin" in joined:
@@ -909,7 +1870,9 @@ class TestCmdUpdateCheckBranchFlag:
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
 
             if "rev-list" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit_count}\n", stderr="")
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{commit_count}\n", stderr=""
+                )
 
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -928,7 +1891,9 @@ class TestCmdUpdateCheckBranchFlag:
 
         cmd_update(args)
 
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        commands = [
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
+        ]
         # Non-main branch skips upstream probe entirely.
         assert not any("fetch" in c and "upstream" in c for c in commands), commands
         # Verify and rev-list both target origin/bb/gui.
@@ -966,7 +1931,9 @@ class TestCmdUpdateCheckBranchFlag:
         assert "not found" in out
 
         # rev-list must never have been called once verify failed.
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        commands = [
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
+        ]
         assert not any("rev-list" in c for c in commands), commands
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
@@ -982,7 +1949,9 @@ class TestCmdUpdateCheckBranchFlag:
 
         cmd_update(args)
 
-        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        commands = [
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
+        ]
         # Should have tried upstream first.
         assert any("fetch" in c and "upstream" in c for c in commands), commands
         # Compare ref is upstream/main (upstream fetch succeeded).
@@ -1040,17 +2009,14 @@ termux = ["rich>=14"]
     monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
     assert main_install_repair._load_installable_optional_extras(group="all") == ["mcp"]
-    assert main_install_repair._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+    assert main_install_repair._load_installable_optional_extras(
+        group="termux-all"
+    ) == ["termux", "mcp"]
 
 
 class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
-
-
-
-
-
 
     def test_node_failure_returns_failed_labels_and_warns(
         self, tmp_path, monkeypatch, capsys
@@ -1090,17 +2056,21 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(
             hm.shutil,
             "which",
-            lambda command, path=None: windows_npm if command == "npm" else "/usr/bin/uv",
+            lambda command, path=None: (
+                windows_npm if command == "npm" else "/usr/bin/uv"
+            ),
         )
         monkeypatch.setenv("PATH", "/mnt/c/Program Files/nodejs")
 
-        with patch("subprocess.run") as mock_run, \
-             patch.object(main_web_build, "_web_ui_build_needed", return_value=True), \
-             patch.object(hm, "_desktop_packaged_executable", return_value=None), \
-             patch.object(hm, "_desktop_dist_exists", return_value=True), \
-             patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install, \
-             patch.object(main_web_build, "_run_with_idle_timeout") as mock_idle_build, \
-             patch.object(hm, "_run_logged_subprocess") as mock_desktop_build:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch.object(main_web_build, "_web_ui_build_needed", return_value=True),
+            patch.object(hm, "_desktop_packaged_executable", return_value=None),
+            patch.object(hm, "_desktop_dist_exists", return_value=True),
+            patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install,
+            patch.object(main_web_build, "_run_with_idle_timeout") as mock_idle_build,
+            patch.object(hm, "_run_logged_subprocess") as mock_desktop_build,
+        ):
             mock_run.side_effect = _make_run_side_effect(
                 branch="main", verify_ok=True, commit_count="1"
             )
@@ -1131,7 +2101,9 @@ class TestNodeRuntimeNpmResolution:
             patch.object(hm, "_desktop_dist_exists", return_value=False),
             patch.object(hm, "_resolve_node_runtime_npm", return_value="npm.cmd"),
             patch.object(hm, "_desktop_build_needed", return_value=True),
-            patch.object(hm, "_run_logged_subprocess", return_value=build_ok) as desktop_build,
+            patch.object(
+                hm, "_run_logged_subprocess", return_value=build_ok
+            ) as desktop_build,
         ):
             had_desktop_app_before_update = update_cmd._desktop_app_present(desktop_dir)
             assert not update_cmd._desktop_app_present(desktop_dir)
@@ -1147,7 +2119,9 @@ class TestNodeRuntimeNpmResolution:
             env=ANY,
         )
 
-    def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
+    def test_git_failure_zip_fallback_rebuilds_missing_desktop(
+        self, tmp_path, monkeypatch
+    ):
         """The Windows ZIP fallback keeps Desktop intact when replacing ``apps/``.
 
         Contract updated for the #70337/#87331 release-dir graft: the built
@@ -1200,11 +2174,17 @@ class TestNodeRuntimeNpmResolution:
         monkeypatch.setattr(hm, "_run_logged_subprocess", rebuild_desktop)
         monkeypatch.setattr(hm, "_clear_bytecode_cache", lambda *_args: 0)
         monkeypatch.setattr(hm, "_record_bytecode_fingerprint", lambda: None)
-        monkeypatch.setattr(hm, "_refresh_bootstrap_cache_scripts", lambda _branch: None)
         monkeypatch.setattr(
-            hm, "_install_python_dependencies_with_optional_fallback", lambda *_args, **_kwargs: None
+            hm, "_refresh_bootstrap_cache_scripts", lambda _branch: None
         )
-        monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: None)
+        monkeypatch.setattr(
+            hm,
+            "_install_python_dependencies_with_optional_fallback",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            hm, "_refresh_active_memory_provider_dependencies", lambda: None
+        )
         monkeypatch.setattr(hm, "_build_web_ui", lambda *_args: None)
         monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
         monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
@@ -1215,9 +2195,15 @@ class TestNodeRuntimeNpmResolution:
         )
         monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
         monkeypatch.setattr(update_cmd, "_print_curator_first_run_notice", lambda: None)
-        monkeypatch.setattr(update_cmd, "_print_curator_recent_run_notice", lambda: None)
-        monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda _failures: None)
-        monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: tmp_path / "hermes-home")
+        monkeypatch.setattr(
+            update_cmd, "_print_curator_recent_run_notice", lambda: None
+        )
+        monkeypatch.setattr(
+            update_cmd, "_finish_dashboard_update_cleanup", lambda _failures: None
+        )
+        monkeypatch.setattr(
+            update_cmd, "get_hermes_home", lambda: tmp_path / "hermes-home"
+        )
 
         with (
             patch("hermes_cli.config.load_config", return_value={}),
@@ -1235,7 +2221,9 @@ class TestNodeRuntimeNpmResolution:
                     "relocated": [],
                 },
             ),
-            patch("hermes_cli.model_catalog.seed_cache_from_checkout", return_value=False),
+            patch(
+                "hermes_cli.model_catalog.seed_cache_from_checkout", return_value=False
+            ),
         ):
             update_cmd._cmd_update_impl(
                 SimpleNamespace(yes=True, force=True, force_venv=True, branch=None),
@@ -1270,7 +2258,9 @@ class TestUpdateNodeDependencies:
         """The npx cache warm-up is covered by its own dedicated test below;
         stub it out everywhere else so it doesn't add a spurious npm/npx
         call to the workspace-install assertions in this class."""
-        with patch("tools.browser_tool_install.warm_agent_browser_npx_cache", return_value=True):
+        with patch(
+            "tools.browser_tool_install.warm_agent_browser_npx_cache", return_value=True
+        ):
             yield
 
     def _npm_calls(self, mock_run):
@@ -1309,7 +2299,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.Popen")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_install_names_ui_tui_and_web_workspaces(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_install_names_ui_tui_and_web_workspaces(
+        self, _which, mock_popen, tmp_path, monkeypatch
+    ):
         """Regression for #43564: install ui-tui + web directly. apps/desktop
         must never appear, so its Electron postinstall is never triggered.
         """
@@ -1369,7 +2361,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.Popen")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_install_preserves_standard_flags(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_install_preserves_standard_flags(
+        self, _which, mock_popen, tmp_path, monkeypatch
+    ):
         """--no-fund, --no-audit, --progress=false must survive."""
         from hermes_cli import main as hm
 
@@ -1390,7 +2384,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.run")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_skips_install_when_deps_up_to_date(self, _which, mock_run, tmp_path, monkeypatch):
+    def test_skips_install_when_deps_up_to_date(
+        self, _which, mock_run, tmp_path, monkeypatch
+    ):
         """When _npm_lockfile_changed reports no change, npm must not be called."""
         from hermes_cli import main as hm
 
@@ -1407,7 +2403,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.Popen")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_runs_install_when_lockfile_changed(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_runs_install_when_lockfile_changed(
+        self, _which, mock_popen, tmp_path, monkeypatch
+    ):
         """When _npm_lockfile_changed reports a change, npm must run."""
         from hermes_cli import main as hm
 
@@ -1421,11 +2419,15 @@ class TestUpdateNodeDependencies:
         update_cmd._update_node_dependencies()
 
         calls = self._popen_npm_calls(popen_calls)
-        assert len(calls) == 1, f"expected npm to run when lockfile changed; got: {calls}"
+        assert len(calls) == 1, (
+            f"expected npm to run when lockfile changed; got: {calls}"
+        )
 
     @patch("subprocess.Popen")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_records_lockfile_hash_only_on_success(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_records_lockfile_hash_only_on_success(
+        self, _which, mock_popen, tmp_path, monkeypatch
+    ):
         """A failed install must not record the lockfile hash (so the next
         run retries instead of wrongly believing deps are up to date)."""
         from hermes_cli import main as hm
@@ -1438,8 +2440,15 @@ class TestUpdateNodeDependencies:
         # _update_node_dependencies lives in update_cmd_deps and calls its own module-level
         # _record_npm_lockfile_hash, so that binding is the real seam (update_cmd's is dead).
         from hermes_cli import update_cmd_deps
-        monkeypatch.setattr(update_cmd_deps, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
-        mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
+
+        monkeypatch.setattr(
+            update_cmd_deps,
+            "_record_npm_lockfile_hash",
+            lambda root: recorded.append(root),
+        )
+        mock_popen.side_effect = self._make_popen(
+            [], returncode=1, stderr_lines=["npm ERR!\n"]
+        )
 
         update_cmd._update_node_dependencies()
 
@@ -1458,7 +2467,9 @@ class TestUpdateNodeDependencies:
         (tmp_path / "package-lock.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
         monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda root: True)
-        mock_popen.side_effect = self._make_popen([], returncode=1, stderr_lines=["npm ERR!\n"])
+        mock_popen.side_effect = self._make_popen(
+            [], returncode=1, stderr_lines=["npm ERR!\n"]
+        )
 
         with patch(
             "tools.browser_tool_install.warm_agent_browser_npx_cache", return_value=True
@@ -1469,7 +2480,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.run")
     @patch("shutil.which", return_value=None)
-    def test_returns_silently_when_npm_not_found(self, _which, mock_run, tmp_path, monkeypatch):
+    def test_returns_silently_when_npm_not_found(
+        self, _which, mock_run, tmp_path, monkeypatch
+    ):
         """No npm on PATH → return without calling subprocess."""
         from hermes_cli import main as hm
 
@@ -1482,7 +2495,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.run")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_returns_silently_when_package_json_absent(self, _which, mock_run, tmp_path, monkeypatch):
+    def test_returns_silently_when_package_json_absent(
+        self, _which, mock_run, tmp_path, monkeypatch
+    ):
         """No package.json → return without calling npm."""
         from hermes_cli import main as hm
 
@@ -1494,7 +2509,9 @@ class TestUpdateNodeDependencies:
 
     @patch("subprocess.Popen")
     @patch("shutil.which", return_value="/usr/bin/npm")
-    def test_install_runs_from_project_root(self, _which, mock_popen, tmp_path, monkeypatch):
+    def test_install_runs_from_project_root(
+        self, _which, mock_popen, tmp_path, monkeypatch
+    ):
         """npm install must execute from PROJECT_ROOT, not a workspace subdir."""
         from hermes_cli import main as hm
 
@@ -1571,9 +2588,7 @@ class TestGitTrampolineSelfHeal:
                 "hermes_cli.update_cmd.subprocess.run",
                 side_effect=self._fake_run_trampoline,
             ),
-            patch(
-                "hermes_cli.update_cmd._locate_real_git", return_value=real
-            ),
+            patch("hermes_cli.update_cmd._locate_real_git", return_value=real),
         ):
             result = update_cmd._ensure_non_trampoline_git(git_cmd)
         assert result == [str(real), "-c", "windows.appendAtomically=false"]
@@ -1609,7 +2624,9 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         run.assert_not_called()
 
-    def test_portable_git_candidates_check_shared_root_first(self, tmp_path, monkeypatch):
+    def test_portable_git_candidates_check_shared_root_first(
+        self, tmp_path, monkeypatch
+    ):
         # Profile-scoped layout: HERMES_HOME = <root>/profiles/foo, but the
         # PortableGit tree lives under the SHARED root (monerostar review on
         # #88136). The candidate list must check get_default_hermes_root()
@@ -1629,3 +2646,1087 @@ class TestGitTrampolineSelfHeal:
         assert candidates[1] == (
             profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
         )
+
+
+def test_sync_recovery_steps_are_platform_independent_argv(tmp_path, monkeypatch):
+    from hermes_cli import update_cmd, update_receipt
+
+    project_root = tmp_path / "repo with spaces & metacharacters"
+    (project_root / ".git").mkdir(parents=True)
+    monkeypatch.setattr(
+        update_cmd, "_m", lambda: SimpleNamespace(PROJECT_ROOT=project_root)
+    )
+    outcome = update_cmd.UpstreamSyncOutcome(
+        phase="prepare",
+        status="rollback_failed",
+        pre_sha="a" * 40,
+        post_sha="b" * 40,
+        clean=False,
+        operation_state="merge",
+        recovery_ref="refs/tags/pre-upstream-sync-20260912-120000",
+        error="rollback failed",
+    )
+
+    evidence = update_cmd._sync_outcome_evidence(outcome, "c" * 40)
+
+    assert "recovery_commands" not in evidence
+    assert evidence["recovery_steps"] == [
+        {
+            "action": "inspect_checkout",
+            "argv": ["git", "-C", str(project_root), "status"],
+        },
+        {
+            "action": "verify_head",
+            "argv": ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+        },
+        {
+            "action": "reset_to_recovery_ref",
+            "argv": [
+                "git",
+                "-C",
+                str(project_root),
+                "reset",
+                "--hard",
+                outcome.recovery_ref,
+            ],
+        },
+        {
+            "action": "apply_stash",
+            "argv": ["git", "-C", str(project_root), "stash", "apply", "c" * 40],
+        },
+        {
+            "action": "remove_quarantine_after_recovery",
+            "path": str(project_root / ".git" / update_receipt.UPDATE_QUARANTINE_FILE),
+        },
+    ]
+
+
+def test_sync_quarantine_marker_is_atomic_checkout_scoped_and_mode_0600(tmp_path):
+    from hermes_cli import update_receipt
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    evidence = {"phase": "prepare", "pre_sha": "a" * 40}
+
+    path = update_receipt.write_sync_quarantine(evidence, checkout)
+
+    assert path == checkout / ".git" / ".update-quarantine.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert update_receipt.read_sync_quarantine(checkout) == {"schema": 1, **evidence}
+    assert list((checkout / ".git").glob(".*.tmp")) == []
+
+
+@pytest.mark.parametrize("mode", ["restore", "discard"])
+def test_stash_settlement_failure_quarantines_before_continuing(mode):
+    stash = "c" * 40
+    sha = "a" * 40
+    plan = SimpleNamespace(auto_stash_ref=stash, prompt_for_restore=False)
+    opts = SimpleNamespace(
+        discard_local_changes=mode == "discard",
+        keep_stash=False,
+    )
+    target = (
+        "_discard_stashed_changes" if mode == "discard" else "_restore_stashed_changes"
+    )
+    with (
+        patch.object(update_cmd, target, return_value=False),
+        patch.object(update_cmd, "_capture_head_sha", return_value=sha),
+        patch.object(
+            update_cmd,
+            "_capture_checkout_proof",
+            return_value=(True, "none", ""),
+        ),
+        patch.object(
+            update_cmd,
+            "_write_sync_quarantine",
+            return_value=PROJECT_ROOT / ".update-quarantine.json",
+        ) as quarantine,
+        patch.object(update_cmd, "_record_update_step"),
+        patch.object(update_cmd, "_resume_windows_gateways_after_update") as resume,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            update_cmd._settle_update_stash(
+                ["git"],
+                plan,
+                opts,
+                input_fn=None,
+                windows_gateway_resume=[123],
+                phase="post_origin_pull",
+            )
+
+    assert exc_info.value.code == 1
+    evidence = quarantine.call_args.args[0]
+    assert evidence["status"] == "stash_settlement_failed"
+    assert mode in evidence["error"]
+    assert evidence["stash_object"] == stash
+    resume.assert_called_once_with([123])
+
+
+def test_stash_settlement_failure_preserves_transaction_evidence(monkeypatch, tmp_path):
+    original = "a" * 40
+    advanced = "b" * 40
+    stash = "c" * 40
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object=stash,
+        input_fn=None,
+        windows_gateway_resume={"pid": 123},
+        invocation_pre_sha=original,
+        post_origin_sha=advanced,
+    )
+    transaction.stamp("POST_ORIGIN", head=advanced, origin_advanced=True)
+    plan = SimpleNamespace(auto_stash_ref=stash, prompt_for_restore=False)
+    opts = SimpleNamespace(discard_local_changes=False, keep_stash=False)
+    monkeypatch.setattr(
+        update_cmd._m(), "_restore_stashed_changes", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: advanced)
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_rollback_fork_sync_candidate", lambda *args: False
+    )
+    quarantines = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantines.append(evidence) or tmp_path / "quarantine.json",
+    )
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(
+        update_cmd, "_resume_windows_gateways_after_update", lambda token: None
+    )
+
+    with pytest.raises(update_cmd._HandledUpdateExit):
+        update_cmd._settle_update_stash(
+            ["git"],
+            plan,
+            opts,
+            input_fn=None,
+            windows_gateway_resume={"pid": 123},
+            phase="post_origin_pull",
+            transaction=transaction,
+        )
+
+    evidence = quarantines[0]
+    assert evidence["invocation_pre_sha"] == original
+    assert evidence["post_origin_sha"] == advanced
+    assert evidence["root_fault"] == "operation returned an unverified result"
+    assert evidence["ledger"] == transaction.ledger
+    assert any(
+        event
+        == {
+            "phase": "STASH",
+            "disposition": "restore_failed",
+            "error": "operation returned an unverified result",
+        }
+        for event in transaction.ledger
+    )
+
+
+def test_transaction_defers_stash_settlement_until_post_apply_proof(monkeypatch):
+    original = "a" * 40
+    advanced = "b" * 40
+    stash = "c" * 40
+    plan = SimpleNamespace(
+        auto_stash_ref=stash,
+        prompt_for_restore=False,
+        in_place_update=False,
+        upstream_sync_outcome=None,
+    )
+    opts = SimpleNamespace(
+        assume_yes=True,
+        gw_input_fn=None,
+        discard_local_changes=False,
+        keep_stash=False,
+    )
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object=stash,
+        input_fn=None,
+        windows_gateway_resume=None,
+        invocation_pre_sha=original,
+    )
+    monkeypatch.setattr(update_cmd, "_pull_updates", lambda *args, **kwargs: original)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: advanced)
+    monkeypatch.setattr(
+        update_cmd, "_write_fleet_restart_pending_marker", lambda **kwargs: None
+    )
+    restore_calls = []
+    monkeypatch.setattr(
+        update_cmd._m(),
+        "_restore_stashed_changes",
+        lambda *args, **kwargs: restore_calls.append((args, kwargs)) or True,
+    )
+
+    update_cmd._pull_sync_and_settle_stash(
+        ["git"],
+        "main",
+        plan,
+        opts,
+        is_fork=False,
+        windows_gateway_resume=None,
+        transaction=transaction,
+    )
+
+    assert restore_calls == []
+    assert not any(event["phase"] == "STASH" for event in transaction.ledger)
+
+
+def test_corrupt_sync_quarantine_blocks_before_mutation(capsys):
+    from hermes_cli import update_receipt
+
+    marker = update_receipt.update_quarantine_path(update_cmd._m().PROJECT_ROOT)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{not-json", encoding="utf-8")
+
+    with patch.object(update_cmd, "_record_update_step") as record:
+        with pytest.raises(SystemExit) as exc_info:
+            update_cmd._refuse_existing_sync_quarantine()
+
+    assert exc_info.value.code == 2
+    assert record.call_args.args[0:2] == ("upstream_sync_quarantine", False)
+    assert "unreadable quarantine marker" in record.call_args.args[2]
+    output = capsys.readouterr().out
+    assert f"Remove the marker only after recovery: {marker}" in output
+
+
+def test_sync_quarantine_is_shared_by_profiles_using_the_same_checkout(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import update_receipt
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    common_dir = tmp_path / "git-state"
+    git_dir = common_dir / "worktrees" / "checkout"
+    git_dir.mkdir(parents=True)
+    (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    (checkout / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    first_profile = tmp_path / "home" / "profiles" / "first"
+    second_profile = tmp_path / "home" / "profiles" / "second"
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: first_profile)
+
+    marker = update_receipt.write_sync_quarantine(
+        {"phase": "prepare", "pre_sha": "a" * 40}, checkout
+    )
+
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: second_profile)
+    assert update_receipt.read_sync_quarantine(checkout) == {
+        "schema": 1,
+        "phase": "prepare",
+        "pre_sha": "a" * 40,
+    }
+    assert marker == common_dir / update_receipt.UPDATE_QUARANTINE_FILE
+    assert not first_profile.exists()
+    assert not second_profile.exists()
+
+
+def test_sync_quarantine_uses_git_common_dir_for_linked_worktree(tmp_path):
+    from hermes_cli import update_receipt
+
+    primary = tmp_path / "primary"
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(primary)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(primary), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(primary), "config", "user.name", "Hermes Test"], check=True
+    )
+    (primary / "tracked").write_text("initial\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(primary), "add", "tracked"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(primary),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(primary), "worktree", "add", "-b", "linked", str(linked)],
+        check=True,
+        capture_output=True,
+    )
+    common = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+
+    primary_marker = update_receipt.update_quarantine_path(primary)
+    linked_marker = update_receipt.update_quarantine_path(linked)
+
+    assert (
+        primary_marker
+        == linked_marker
+        == common / update_receipt.UPDATE_QUARANTINE_FILE
+    )
+
+
+def test_sync_quarantine_uses_bare_repository_common_dir(tmp_path, monkeypatch):
+    from hermes_cli import update_receipt
+
+    bare = tmp_path / "bare.git"
+    (bare / "objects").mkdir(parents=True)
+    (bare / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    monkeypatch.setattr(
+        update_receipt.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 128, "", "not a worktree"
+        ),
+    )
+
+    assert update_receipt.update_quarantine_path(bare) == (
+        bare / update_receipt.UPDATE_QUARANTINE_FILE
+    )
+
+
+def test_sync_quarantine_cleans_temp_after_interrupted_atomic_write(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import update_receipt
+
+    checkout = tmp_path / "checkout"
+    git_dir = checkout / ".git"
+    git_dir.mkdir(parents=True)
+    marker = git_dir / update_receipt.UPDATE_QUARANTINE_FILE
+
+    def interrupt_replace(*args, **kwargs):
+        raise KeyboardInterrupt("interrupted rename")
+
+    monkeypatch.setattr(update_receipt.os, "replace", interrupt_replace)
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted rename"):
+        update_receipt.write_sync_quarantine({"phase": "PROOF"}, checkout)
+
+    assert not marker.exists()
+    assert list(git_dir.glob(".*.tmp")) == []
+
+
+def test_sync_quarantine_missing_linked_commondir_fails_closed(tmp_path, monkeypatch):
+    from hermes_cli import update_receipt
+
+    checkout = tmp_path / "checkout"
+    git_dir = tmp_path / "common" / "worktrees" / "checkout"
+    checkout.mkdir()
+    git_dir.mkdir(parents=True)
+    (checkout / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        update_receipt.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 128, "", "invalid"
+        ),
+    )
+
+    with pytest.raises(
+        update_receipt.UpdateQuarantineResolutionError, match="commondir"
+    ):
+        update_receipt.update_quarantine_path(checkout)
+
+    evidence = update_receipt.read_sync_quarantine(checkout)
+    assert evidence is not None
+    assert evidence["error"].startswith("cannot resolve updater quarantine marker")
+
+
+def test_unresolvable_quarantine_owner_blocks_before_update(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli import update_receipt
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").write_text("not-a-gitdir-pointer\n", encoding="utf-8")
+    monkeypatch.setattr(
+        update_receipt.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 128, "", "invalid"
+        ),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_m", lambda: SimpleNamespace(PROJECT_ROOT=checkout)
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._refuse_existing_sync_quarantine()
+
+    assert exc_info.value.code == 2
+    assert "cannot resolve" in capsys.readouterr().out.lower()
+    with pytest.raises(update_receipt.UpdateQuarantineResolutionError):
+        update_receipt.write_sync_quarantine({"phase": "pre_invocation"}, checkout)
+
+
+@pytest.mark.parametrize(
+    ("action", "facade_name"),
+    [
+        ("restore", "_restore_stashed_changes"),
+        ("discard", "_discard_stashed_changes"),
+        ("park", "_park_stashed_changes"),
+    ],
+)
+def test_stash_settlement_uses_main_facade(action, facade_name, monkeypatch):
+    from hermes_cli import main as hm
+
+    calls = []
+
+    def facade(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+
+    def bypassed(*args, **kwargs):
+        raise AssertionError("module-local stash helper bypassed the facade seam")
+
+    monkeypatch.setattr(hm, facade_name, facade)
+    monkeypatch.setattr(update_cmd, facade_name, bypassed)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: "a" * 40)
+    plan = SimpleNamespace(auto_stash_ref="c" * 40, prompt_for_restore=False)
+    opts = SimpleNamespace(
+        discard_local_changes=action == "discard",
+        keep_stash=action == "park",
+    )
+
+    update_cmd._settle_update_stash(
+        ["git"],
+        plan,
+        opts,
+        input_fn=None,
+        windows_gateway_resume=None,
+        phase="post_origin_pull",
+    )
+
+    assert len(calls) == 1
+
+
+def test_safe_failure_recovery_uses_main_restore_facade(monkeypatch):
+    from hermes_cli import main as hm
+
+    original = "a" * 40
+    stash = "c" * 40
+    calls = []
+
+    def facade(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+
+    def bypassed(*args, **kwargs):
+        raise AssertionError("module-local recovery helper bypassed the facade seam")
+
+    monkeypatch.setattr(hm, "_restore_stashed_changes", facade)
+    monkeypatch.setattr(update_cmd, "_restore_stashed_changes", bypassed)
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(
+        update_cmd, "_resume_windows_gateways_after_update", lambda token: None
+    )
+    outcome = update_cmd.UpstreamSyncOutcome(
+        phase="prepare",
+        status="failed",
+        pre_sha=original,
+        post_sha=original,
+        clean=True,
+        operation_state="none",
+        recovery_ref=original,
+        error="upstream fetch failed",
+    )
+
+    with pytest.raises(update_cmd._HandledUpdateExit) as exc_info:
+        update_cmd._enforce_upstream_sync_outcome(
+            outcome,
+            ["git"],
+            stash,
+            prompt_for_restore=False,
+            input_fn=None,
+            windows_gateway_resume=None,
+            invocation_pre_sha=original,
+            post_origin_sha=original,
+        )
+
+    assert exc_info.value.code == 1
+    assert len(calls) == 1
+
+
+def test_restart_obligation_is_written_before_post_origin_upstream_sync(monkeypatch):
+    original = "a" * 40
+    advanced = "b" * 40
+    events = []
+    plan = SimpleNamespace(
+        auto_stash_ref=None,
+        prompt_for_restore=False,
+        in_place_update=False,
+        upstream_sync_outcome=None,
+    )
+    opts = SimpleNamespace(
+        assume_yes=True,
+        gw_input_fn=None,
+        discard_local_changes=False,
+        keep_stash=False,
+    )
+    outcome = update_cmd.UpstreamSyncOutcome(
+        phase="post_origin_pull",
+        status="noop",
+        pre_sha=advanced,
+        post_sha=advanced,
+        clean=True,
+        operation_state="none",
+        recovery_ref=advanced,
+        error="",
+    )
+
+    monkeypatch.setattr(update_cmd, "_pull_updates", lambda *args, **kwargs: original)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: advanced)
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_fleet_restart_pending_marker",
+        lambda **kwargs: events.append(("restart", kwargs["expected_sha"])),
+    )
+
+    def sync(*args, **kwargs):
+        assert events == [("restart", advanced)]
+        events.append(("sync", kwargs["phase"]))
+        return outcome
+
+    monkeypatch.setattr(update_cmd, "_sync_with_upstream_observed", sync)
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object=None,
+        input_fn=None,
+        windows_gateway_resume=None,
+        invocation_pre_sha=original,
+    )
+
+    update_cmd._pull_sync_and_settle_stash(
+        ["git"],
+        "main",
+        plan,
+        opts,
+        is_fork=True,
+        windows_gateway_resume=None,
+        transaction=transaction,
+    )
+
+    assert events == [("restart", advanced), ("sync", "post_origin_pull")]
+    assert transaction.post_origin_sha == advanced
+
+
+def test_origin_advanced_failure_is_unsafe_against_invocation_head(
+    monkeypatch, tmp_path
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    plan = SimpleNamespace(
+        auto_stash_ref=None,
+        prompt_for_restore=False,
+        in_place_update=False,
+        upstream_sync_outcome=None,
+    )
+    opts = SimpleNamespace(
+        assume_yes=True,
+        gw_input_fn=None,
+        discard_local_changes=False,
+        keep_stash=True,
+    )
+    outcome = update_cmd.UpstreamSyncOutcome(
+        phase="post_origin_pull",
+        status="failed",
+        pre_sha=advanced,
+        post_sha=advanced,
+        clean=True,
+        operation_state="none",
+        recovery_ref=advanced,
+        error="upstream unavailable",
+    )
+    monkeypatch.setattr(update_cmd, "_pull_updates", lambda *args, **kwargs: original)
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: advanced)
+    monkeypatch.setattr(
+        update_cmd, "_sync_with_upstream_observed", lambda *args, **kwargs: outcome
+    )
+    monkeypatch.setattr(
+        update_cmd, "_write_fleet_restart_pending_marker", lambda **kwargs: None
+    )
+    quarantine = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantine.append(evidence) or tmp_path / "quarantine.json",
+    )
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(
+        update_cmd, "_resume_windows_gateways_after_update", lambda token: None
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._pull_sync_and_settle_stash(
+            ["git"],
+            "main",
+            plan,
+            opts,
+            is_fork=True,
+            windows_gateway_resume=[123],
+        )
+
+    assert exc_info.value.code == 1
+    assert quarantine
+    assert quarantine[0]["invocation_pre_sha"] == original
+    assert quarantine[0]["post_origin_sha"] == advanced
+
+
+def test_outcome_unknown_cleanup_rolls_back_quarantines_preserves_stash_and_resumes(
+    monkeypatch, tmp_path
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    stash = "c" * 40
+    outcome = update_cmd.UpstreamSyncOutcome(
+        phase="post_origin_pull",
+        status="outcome_unknown",
+        pre_sha=original,
+        post_sha=advanced,
+        clean=True,
+        operation_state="none",
+        recovery_ref=original,
+        error="KeyboardInterrupt: operator interrupted validation",
+    )
+    rollback_calls = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_rollback_fork_sync_candidate",
+        lambda git_cmd, cwd, ref: rollback_calls.append(ref) or True,
+    )
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: original)
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    quarantines = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantines.append(evidence) or tmp_path / "quarantine.json",
+    )
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    resumes = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_resume_windows_gateways_after_update",
+        lambda token: resumes.append(token),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._enforce_upstream_sync_outcome(
+            outcome,
+            ["git"],
+            stash,
+            prompt_for_restore=False,
+            input_fn=None,
+            windows_gateway_resume=[123],
+            invocation_pre_sha=original,
+            post_origin_sha=advanced,
+        )
+
+    assert exc_info.value.code == 1
+    assert rollback_calls == [original]
+    assert resumes == [[123]]
+    evidence = quarantines[0]
+    assert evidence["root_fault"] == outcome.error
+    assert evidence["stash_object"] == stash
+    assert evidence["rollback"] == {
+        "attempted": True,
+        "succeeded": True,
+        "post_sha": original,
+        "clean": True,
+        "operation_state": "none",
+    }
+    assert all(
+        isinstance(step.get("argv", []), list)
+        and all(isinstance(arg, str) for arg in step.get("argv", []))
+        for step in evidence["recovery_steps"]
+    )
+
+
+def test_incomplete_post_state_proof_quarantines_without_unsafe_rollback(
+    monkeypatch, tmp_path
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    outcome = update_cmd.UpstreamSyncOutcome(
+        phase="post_origin_pull",
+        status="outcome_unknown",
+        pre_sha=original,
+        post_sha=advanced,
+        clean=None,
+        operation_state="none",
+        recovery_ref=original,
+        error="checkout proof unavailable",
+    )
+    rollback_calls = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_rollback_fork_sync_candidate",
+        lambda *args: rollback_calls.append(args) or True,
+    )
+    quarantines = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantines.append(evidence) or tmp_path / "quarantine.json",
+    )
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(
+        update_cmd, "_resume_windows_gateways_after_update", lambda token: None
+    )
+
+    with pytest.raises(update_cmd._HandledUpdateExit):
+        update_cmd._enforce_upstream_sync_outcome(
+            outcome,
+            ["git"],
+            None,
+            prompt_for_restore=False,
+            input_fn=None,
+            windows_gateway_resume=None,
+            invocation_pre_sha=original,
+            post_origin_sha=advanced,
+        )
+
+    assert rollback_calls == []
+    assert quarantines[0]["rollback"]["attempted"] is False
+    assert quarantines[0]["status"] == "outcome_unknown"
+
+
+def test_recovery_instruction_resolution_interrupt_does_not_abort_cleanup(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import update_receipt
+
+    original = "a" * 40
+    advanced = "b" * 40
+    observed_heads = iter([original, advanced, original])
+    monkeypatch.setattr(
+        update_cmd, "_capture_head_sha", lambda *args: next(observed_heads)
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_write_fleet_restart_pending_marker", lambda **kwargs: None
+    )
+    monkeypatch.setattr(update_cmd, "_rollback_fork_sync_candidate", lambda *args: True)
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+
+    def interrupt_resolution(_checkout_root):
+        raise KeyboardInterrupt("instruction path interrupted")
+
+    monkeypatch.setattr(update_receipt, "update_quarantine_path", interrupt_resolution)
+    quarantines = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantines.append(evidence) or tmp_path / "quarantine.json",
+    )
+    resumes = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_resume_windows_gateways_after_update",
+        lambda token: resumes.append(token),
+    )
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object="c" * 40,
+        input_fn=None,
+        windows_gateway_resume={"pid": 123},
+    )
+    root_interrupt = KeyboardInterrupt("root interrupted")
+
+    with pytest.raises(KeyboardInterrupt, match="root interrupted") as exc_info:
+        with transaction:
+            transaction.mark_post_origin(advanced)
+            raise root_interrupt
+
+    assert exc_info.value is root_interrupt
+    assert quarantines[0]["root_fault"] == "KeyboardInterrupt: root interrupted"
+    cleanup_events = [
+        event for event in transaction.ledger if event["phase"] == "CLEANUP_FAILURE"
+    ]
+    assert any(
+        "instruction path interrupted" in str(event["error"])
+        for event in cleanup_events
+    )
+    assert resumes == [{"pid": 123}]
+
+
+def test_second_interrupt_during_quarantine_is_appended_without_masking_root_fault(
+    monkeypatch,
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    observed_heads = iter([original, advanced, original])
+    monkeypatch.setattr(
+        update_cmd, "_capture_head_sha", lambda *args: next(observed_heads)
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_write_fleet_restart_pending_marker", lambda **kwargs: None
+    )
+    monkeypatch.setattr(update_cmd, "_rollback_fork_sync_candidate", lambda *args: True)
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+
+    def interrupt_quarantine(evidence):
+        raise KeyboardInterrupt("cleanup interrupted")
+
+    monkeypatch.setattr(update_cmd, "_write_sync_quarantine", interrupt_quarantine)
+    resumes = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_resume_windows_gateways_after_update",
+        lambda token: resumes.append(token),
+    )
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object="c" * 40,
+        input_fn=None,
+        windows_gateway_resume={"pid": 123},
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="root interrupted"):
+        with transaction:
+            transaction.mark_post_origin(advanced)
+            raise KeyboardInterrupt("root interrupted")
+
+    fault_events = [event for event in transaction.ledger if event["phase"] == "FAULT"]
+    assert fault_events == [
+        {"phase": "FAULT", "error": "KeyboardInterrupt: root interrupted"}
+    ]
+    cleanup_events = [
+        event for event in transaction.ledger if event["phase"] == "CLEANUP_FAILURE"
+    ]
+    assert any("cleanup interrupted" in str(event["error"]) for event in cleanup_events)
+    assert all(
+        "root interrupted" not in str(event["error"]) for event in cleanup_events
+    )
+    assert resumes == [{"pid": 123}]
+
+
+def test_recovery_bookkeeping_baseexception_does_not_skip_quarantine_or_resume(
+    monkeypatch, tmp_path
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    observed_heads = iter([original, advanced, original])
+    monkeypatch.setattr(
+        update_cmd, "_capture_head_sha", lambda *args: next(observed_heads)
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_write_fleet_restart_pending_marker", lambda **kwargs: None
+    )
+    monkeypatch.setattr(update_cmd, "_rollback_fork_sync_candidate", lambda *args: True)
+
+    def interrupt_bookkeeping(*_args):
+        raise KeyboardInterrupt("bookkeeping interrupted")
+
+    monkeypatch.setattr(update_cmd, "_record_update_step", interrupt_bookkeeping)
+    quarantines = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantines.append(evidence) or tmp_path / "quarantine.json",
+    )
+    resumes = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_resume_windows_gateways_after_update",
+        lambda token: resumes.append(token),
+    )
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object="c" * 40,
+        input_fn=None,
+        windows_gateway_resume={"pid": 123},
+    )
+
+    with pytest.raises(update_cmd._HandledUpdateExit):
+        with transaction:
+            transaction.mark_post_origin(advanced)
+            raise RuntimeError("root failure")
+
+    assert quarantines[0]["root_fault"] == "RuntimeError: root failure"
+    assert any(
+        "bookkeeping interrupted" in str(detail)
+        for detail in quarantines[0]["cleanup_failures"]
+    )
+    assert resumes == [{"pid": 123}]
+
+
+def test_update_transaction_converts_unstructured_system_exit_to_quarantine(
+    monkeypatch, tmp_path
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    observed_heads = iter([original, advanced, original])
+    monkeypatch.setattr(
+        update_cmd, "_capture_head_sha", lambda *args: next(observed_heads)
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_write_fleet_restart_pending_marker", lambda **kwargs: None
+    )
+    monkeypatch.setattr(update_cmd, "_rollback_fork_sync_candidate", lambda *args: True)
+    quarantines = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: quarantines.append(evidence) or tmp_path / "quarantine.json",
+    )
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    resumes = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_resume_windows_gateways_after_update",
+        lambda token: resumes.append(token),
+    )
+
+    transaction = update_cmd.UpdateTransaction(
+        ["git"],
+        stash_object="c" * 40,
+        input_fn=None,
+        windows_gateway_resume=[123],
+    )
+    root_exit = SystemExit(7)
+    with pytest.raises(SystemExit) as exc_info:
+        with transaction:
+            raise root_exit
+
+    assert exc_info.value is root_exit
+    assert exc_info.value.code == 7
+    assert quarantines[0]["root_fault"] == "SystemExit: 7"
+    assert quarantines[0]["status"] == "outcome_unknown"
+    assert {"phase": "FAULT", "error": "SystemExit: 7"} in transaction.ledger
+    assert resumes == [[123]]
+
+
+@pytest.mark.parametrize("terminal", ["success", "safe_failure", "unsafe"])
+def test_windows_resume_runs_for_each_terminal_sync_outcome(
+    terminal, monkeypatch, tmp_path
+):
+    original = "a" * 40
+    advanced = "b" * 40
+    if terminal == "success":
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="post_origin_pull",
+            status="noop",
+            pre_sha=original,
+            post_sha=original,
+            clean=True,
+            operation_state="none",
+            recovery_ref=original,
+            error="",
+        )
+    elif terminal == "safe_failure":
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="post_origin_pull",
+            status="failed",
+            pre_sha=original,
+            post_sha=original,
+            clean=True,
+            operation_state="none",
+            recovery_ref=original,
+            error="validation failed",
+        )
+    else:
+        outcome = update_cmd.UpstreamSyncOutcome(
+            phase="post_origin_pull",
+            status="outcome_unknown",
+            pre_sha=original,
+            post_sha=advanced,
+            clean=True,
+            operation_state="none",
+            recovery_ref=original,
+            error="KeyboardInterrupt: interrupted",
+        )
+
+    monkeypatch.setattr(update_cmd, "_capture_head_sha", lambda *args: original)
+    monkeypatch.setattr(
+        update_cmd,
+        "_capture_checkout_proof",
+        lambda *args: (True, "none", ""),
+    )
+    monkeypatch.setattr(update_cmd, "_rollback_fork_sync_candidate", lambda *args: True)
+    monkeypatch.setattr(
+        update_cmd,
+        "_write_sync_quarantine",
+        lambda evidence: tmp_path / "quarantine.json",
+    )
+    monkeypatch.setattr(update_cmd, "_record_update_step", lambda *args: None)
+    monkeypatch.setattr(
+        update_cmd._m(), "_restore_stashed_changes", lambda *args, **kwargs: True
+    )
+    resumes = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_resume_windows_gateways_after_update",
+        lambda token: resumes.append(token),
+    )
+
+    if terminal == "success":
+        transaction = update_cmd.UpdateTransaction(
+            ["git"],
+            stash_object=None,
+            input_fn=None,
+            windows_gateway_resume=[123],
+        )
+        with transaction:
+            transaction.stamp("PROOF", terminal=True)
+    else:
+        with pytest.raises(update_cmd._HandledUpdateExit):
+            update_cmd._enforce_upstream_sync_outcome(
+                outcome,
+                ["git"],
+                None,
+                prompt_for_restore=False,
+                input_fn=None,
+                windows_gateway_resume=[123],
+                invocation_pre_sha=original,
+                post_origin_sha=outcome.post_sha,
+            )
+
+    assert resumes == [[123]]

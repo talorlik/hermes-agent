@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from contextlib import suppress
@@ -20,6 +21,149 @@ logger = logging.getLogger(__name__)
 
 _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 COMMAND_BOUNDARY_STOP_REASON = "completed at command boundary"
+
+
+UPDATE_QUARANTINE_FILE = ".update-quarantine.json"
+
+
+class UpdateQuarantineResolutionError(RuntimeError):
+    """Raised when a checkout's repository-common quarantine owner is unprovable."""
+
+
+def _metadata_path(parent: Path, raw: str, *, label: str) -> Path:
+    value = raw.strip()
+    if not value or "\x00" in value:
+        raise UpdateQuarantineResolutionError(f"invalid {label}")
+    path = Path(value)
+    return (path if path.is_absolute() else parent / path).resolve()
+
+
+def _read_metadata_path(path: Path, *, parent: Path, label: str) -> Path:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise UpdateQuarantineResolutionError(f"unreadable {label}: {exc}") from exc
+    return _metadata_path(parent, raw, label=label)
+
+
+def _common_dir_from_metadata(checkout_root: Path) -> Path:
+    git_entry = checkout_root / ".git"
+    if git_entry.is_dir():
+        commondir = git_entry / "commondir"
+        if commondir.exists():
+            common = _read_metadata_path(
+                commondir, parent=git_entry, label="Git commondir"
+            )
+            if not common.is_dir():
+                raise UpdateQuarantineResolutionError(
+                    "Git commondir is not a directory"
+                )
+            return common
+        return git_entry.resolve()
+
+    if git_entry.is_file():
+        try:
+            pointer = git_entry.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise UpdateQuarantineResolutionError(
+                f"unreadable .git pointer: {exc}"
+            ) from exc
+        prefix = "gitdir:"
+        if not pointer.startswith(prefix):
+            raise UpdateQuarantineResolutionError("invalid .git pointer")
+        git_dir = _metadata_path(
+            checkout_root, pointer.removeprefix(prefix), label=".git pointer"
+        )
+        if not git_dir.is_dir():
+            raise UpdateQuarantineResolutionError(
+                ".git pointer target is not a directory"
+            )
+        commondir = git_dir / "commondir"
+        if commondir.exists():
+            common = _read_metadata_path(
+                commondir, parent=git_dir, label="Git commondir"
+            )
+            if not common.is_dir():
+                raise UpdateQuarantineResolutionError(
+                    "Git commondir is not a directory"
+                )
+            return common
+        if (git_dir / "HEAD").is_file() and (git_dir / "objects").is_dir():
+            return git_dir
+        raise UpdateQuarantineResolutionError(
+            "linked-worktree Git metadata has no resolvable commondir"
+        )
+
+    if (checkout_root / "HEAD").is_file() and (checkout_root / "objects").is_dir():
+        return checkout_root.resolve()
+    raise UpdateQuarantineResolutionError(
+        "checkout Git common directory is unresolvable"
+    )
+
+
+def update_quarantine_path(checkout_root: Path) -> Path:
+    """Return a marker path shared by every profile using this checkout."""
+    checkout_root = Path(checkout_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout_root), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            check=False,
+        )
+        common_text = result.stdout.strip()
+        if result.returncode == 0 and common_text and "\n" not in common_text:
+            common = _metadata_path(
+                checkout_root, common_text, label="git --git-common-dir output"
+            )
+            if common.is_dir():
+                return common / UPDATE_QUARANTINE_FILE
+    except (Exception, UnicodeError):
+        pass
+    return _common_dir_from_metadata(checkout_root) / UPDATE_QUARANTINE_FILE
+
+
+def write_sync_quarantine(evidence: dict[str, Any], checkout_root: Path) -> Path:
+    """Atomically persist mode-0600 synchronization quarantine evidence."""
+    path = update_quarantine_path(checkout_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"schema": 1, **evidence}, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink()
+        raise
+    return path
+
+
+def read_sync_quarantine(checkout_root: Path) -> dict[str, Any] | None:
+    """Read an existing quarantine marker, returning opaque evidence on corruption."""
+    try:
+        path = update_quarantine_path(checkout_root)
+    except UpdateQuarantineResolutionError as exc:
+        return {"error": f"cannot resolve updater quarantine marker: {exc}"}
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            payload
+            if isinstance(payload, dict)
+            else {"error": "invalid marker payload"}
+        )
+    except Exception as exc:
+        return {"error": f"unreadable quarantine marker: {exc}"}
+
 
 # ``hermes update`` is a single-threaded CLI command; a module singleton lets the 7k-line updater
 # record steps from any depth without threading a handle through every helper.
@@ -39,7 +183,9 @@ def _code_identity(refresh: bool = False) -> dict[str, Any]:
     return {}
 
 
-def _str_records(entries: Any, keys: tuple[str, ...], *, pid: bool = False) -> list[dict[str, Any]]:
+def _str_records(
+    entries: Any, keys: tuple[str, ...], *, pid: bool = False
+) -> list[dict[str, Any]]:
     """Dict entries reduced to stringified ``keys`` (plus an int ``pid`` first when requested)."""
     records = []
     for entry in entries:
@@ -56,29 +202,53 @@ class UpdateReceipt:
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {
-            "schema": 1, "started_at": _utc_now_iso(), "finished_at": None,
-            "argv": list(sys.argv), "pid": os.getpid(),
+            "schema": 1,
+            "started_at": _utc_now_iso(),
+            "finished_at": None,
+            "argv": list(sys.argv),
+            "pid": os.getpid(),
             "outcome": "running",  # running | success | partial | failed
-            "pre_update": _code_identity(), "post_update": {},
-            "steps": [], "skips": [], "gateway_restart": {}, "fleet": [],
+            "pre_update": _code_identity(),
+            "post_update": {},
+            "steps": [],
+            "skips": [],
+            "gateway_restart": {},
+            "fleet": [],
         }
 
     def step(self, name: str, ok: bool, detail: str = "") -> None:
-        self.data["steps"].append({"name": name, "ok": bool(ok), "detail": detail, "at": _utc_now_iso()})
+        self.data["steps"].append({
+            "name": name,
+            "ok": bool(ok),
+            "detail": detail,
+            "at": _utc_now_iso(),
+        })
 
     def skip(self, name: str, reason: str) -> None:
-        self.data["skips"].append({"name": name, "reason": reason, "at": _utc_now_iso()})
+        self.data["skips"].append({
+            "name": name,
+            "reason": reason,
+            "at": _utc_now_iso(),
+        })
 
     def gateway_restart_result(
-        self, *, restarted_services: list | None = None, relaunched_profiles: list | None = None,
-        externally_supervised_profiles: list | None = None, killed_pids: list | None = None,
-        failed_units: list | None = None, incomplete: bool = False, phase_error: str = "",
+        self,
+        *,
+        restarted_services: list | None = None,
+        relaunched_profiles: list | None = None,
+        externally_supervised_profiles: list | None = None,
+        killed_pids: list | None = None,
+        failed_units: list | None = None,
+        incomplete: bool = False,
+        phase_error: str = "",
         fresh_recovery: dict[str, Any] | None = None,
     ) -> None:
         result: dict[str, Any] = {
             "restarted_services": list(restarted_services or []),
             "relaunched_profiles": list(relaunched_profiles or []),
-            "externally_supervised_profiles": list(externally_supervised_profiles or []),
+            "externally_supervised_profiles": list(
+                externally_supervised_profiles or []
+            ),
             "killed_pids": [int(p) for p in (killed_pids or [])],
             "failed_units": [str(u) for u in (failed_units or [])],
             "incomplete": bool(incomplete),
@@ -94,7 +264,8 @@ class UpdateReceipt:
                 for key in ("requested", "verified", "relaunch_attempted", "failed")
             }
             persisted["skipped"] = _str_records(
-                fresh_recovery.get("skipped", []), ("profile", "kind", "supervisor", "reason")
+                fresh_recovery.get("skipped", []),
+                ("profile", "kind", "supervisor", "reason"),
             )
             # ``hermes serve`` hosts tui_gateway and is not a gateway profile, so neither the
             # per-profile buckets above nor the fleet-version matrix can describe it. Persist its
@@ -102,10 +273,13 @@ class UpdateReceipt:
             # receipt keeps claiming a clean recovery the operator's box contradicts.
             serve_units = fresh_recovery.get("serve_units") or {}
             persisted["serve_units"] = {
-                key: [str(unit) for unit in (serve_units.get(key) or [])] for key in ("verified", "failed")
+                key: [str(unit) for unit in (serve_units.get(key) or [])]
+                for key in ("verified", "failed")
             }
             persisted["stale_runtimes"] = _str_records(
-                fresh_recovery.get("stale_runtimes", []), ("kind", "profile", "supervisor"), pid=True
+                fresh_recovery.get("stale_runtimes", []),
+                ("kind", "profile", "supervisor"),
+                pid=True,
             )
             result["fresh_recovery"] = persisted
         self.data["gateway_restart"] = result
@@ -156,7 +330,9 @@ def record_gateway_restart(**kwargs: Any) -> None:
     _record("gateway_restart_result", "gateway restart result", **kwargs)
 
 
-def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason: str = "") -> Optional[Path]:
+def finalize_update_receipt(
+    outcome: str, fleet: list | None = None, stop_reason: str = ""
+) -> Optional[Path]:
     """Finalize + persist the receipt (``success``/``partial``/``failed``/``refused``); path or None.
 
     Exactly-once by construction: the module singleton is popped first, so a second call (e.g. the
@@ -187,7 +363,9 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
         return None
 
 
-def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason: str = "") -> Optional[Path]:
+def finalize_pending_update_receipt(
+    exit_code: Optional[int] = None, stop_reason: str = ""
+) -> Optional[Path]:
     """Command-boundary safety net: persist a still-open receipt, if any. Never raises.
 
     ``hermes update`` has many early ``sys.exit`` paths (preflight refusals, venv-holder refusal,
@@ -200,7 +378,13 @@ def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason
     """
     if _current is None:
         return None
-    outcome = "success" if exit_code in (0, None) else "refused" if exit_code == 2 else "failed"
+    outcome = (
+        "success"
+        if exit_code in (0, None)
+        else "refused"
+        if exit_code == 2
+        else "failed"
+    )
     if exit_code is not None:
         with suppress(Exception):
             _current.data["exit_code"] = int(exit_code)
@@ -210,7 +394,9 @@ def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason
 def _prune_old_receipts(directory: Path) -> None:
     with suppress(Exception):
         receipts = (p for p in directory.glob("update_*.json") if p.is_file())
-        for stale in sorted(receipts, key=lambda p: p.stat().st_mtime, reverse=True)[_RECEIPT_KEEP:]:
+        for stale in sorted(receipts, key=lambda p: p.stat().st_mtime, reverse=True)[
+            _RECEIPT_KEEP:
+        ]:
             with suppress(OSError):
                 stale.unlink()
 
@@ -227,7 +413,11 @@ def read_latest_receipt() -> Optional[dict[str, Any]]:
 
 def _profile_homes() -> list[tuple[str, Path]]:
     """``(profile, home)`` for the default home plus every valid named profile dir, sorted."""
-    from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root, _PROFILE_ID_RE
+    from hermes_cli.profiles import (
+        _get_default_hermes_home,
+        _get_profiles_root,
+        _PROFILE_ID_RE,
+    )
 
     homes: list[tuple[str, Path]] = []
     default_home = _get_default_hermes_home()
@@ -238,7 +428,9 @@ def _profile_homes() -> list[tuple[str, Path]]:
         homes.extend(
             (entry.name, entry)
             for entry in sorted(root.iterdir())
-            if entry.is_dir() and entry.name != "default" and _PROFILE_ID_RE.match(entry.name)
+            if entry.is_dir()
+            and entry.name != "default"
+            and _PROFILE_ID_RE.match(entry.name)
         )
     return homes
 
@@ -264,13 +456,21 @@ def _socket_identity(home: Path) -> Optional[tuple[int, dict]]:
 
 
 def _fleet_row(
-    profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any, state: str = "unknown"
+    profile: str,
+    pid: int,
+    code_sha: Any,
+    code_version: Any,
+    expected_sha: Any,
+    state: str = "unknown",
 ) -> dict[str, Any]:
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
     return {
-        "profile": profile, "pid": pid, "code_sha": str(code_sha) if code_sha else None,
-        "code_version": code_version, "state": state,
+        "profile": profile,
+        "pid": pid,
+        "code_sha": str(code_sha) if code_sha else None,
+        "code_version": code_version,
+        "state": state,
     }
 
 
@@ -278,7 +478,9 @@ def _fleet_row(
 _NOT_EXPECTED_STATES = {"stopped", "startup_failed"}
 
 
-def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> list[dict[str, Any]]:
+def collect_fleet_versions(
+    *, pre_restart_pids: Optional[list[int]] = None
+) -> list[dict[str, Any]]:
     """Snapshot every profile's gateway code identity vs. the current tree.
 
     Rollout safety: ``down`` requires membership in ``pre_restart_pids`` — a stale state file from a
@@ -303,7 +505,13 @@ def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> l
             sock = _socket_identity(home)
             if sock is not None:
                 pid, identity = sock
-                row = _fleet_row(profile, pid, identity.get("code_sha"), identity.get("code_version"), expected_sha)
+                row = _fleet_row(
+                    profile,
+                    pid,
+                    identity.get("code_sha"),
+                    identity.get("code_version"),
+                    expected_sha,
+                )
                 results.append({**row, "source": "socket"})
                 continue
             record = read_runtime_status(home / "gateway_state.json")
@@ -315,7 +523,13 @@ def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> l
                 continue
             if runtime_status_pid_is_live(record):
                 results.append(
-                    _fleet_row(profile, pid, record.get("code_sha"), record.get("code_version"), expected_sha)
+                    _fleet_row(
+                        profile,
+                        pid,
+                        record.get("code_sha"),
+                        record.get("code_version"),
+                        expected_sha,
+                    )
                 )
                 continue
             # Dead PID (or a live PID recycled by an unrelated process during the update's own
@@ -327,8 +541,22 @@ def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> l
             # could still mislabel B as down — inherent to the snapshot's data model.
             # See #93258.
             gw_state = record.get("gateway_state")
-            if pid in _pre_restart and isinstance(gw_state, str) and gw_state and gw_state not in _NOT_EXPECTED_STATES:
-                results.append(_fleet_row(profile, pid, None, record.get("code_version"), None, state="down"))
+            if (
+                pid in _pre_restart
+                and isinstance(gw_state, str)
+                and gw_state
+                and gw_state not in _NOT_EXPECTED_STATES
+            ):
+                results.append(
+                    _fleet_row(
+                        profile,
+                        pid,
+                        None,
+                        record.get("code_version"),
+                        None,
+                        state="down",
+                    )
+                )
     except Exception as exc:
         logger.debug("Fleet version probe failed: %s", exc)
     return results
@@ -359,16 +587,22 @@ def print_fleet_version_matrix(fleet: list[dict[str, Any]]) -> bool:
     for entry in fleet:
         sha = entry.get("code_sha")
         states.add(entry.get("state"))
-        print(_FLEET_ROW_LINES.get(entry.get("state"), _FLEET_ROW_UNKNOWN).format(
-            profile=entry.get("profile"), pid=entry.get("pid"), short=sha[:8] if isinstance(sha, str) and sha else "?",
-        ))
+        print(
+            _FLEET_ROW_LINES.get(entry.get("state"), _FLEET_ROW_UNKNOWN).format(
+                profile=entry.get("profile"),
+                pid=entry.get("pid"),
+                short=sha[:8] if isinstance(sha, str) and sha else "?",
+            )
+        )
     any_stale, any_down = "stale" in states, "down" in states
     if any_stale or any_down:
         print()
         if any_stale:
             print("  ⚠ Stale gateways keep serving pre-update code until restarted:")
         if any_down:
-            print("  ⚠ Down gateways stopped serving messaging entirely — restart them:")
+            print(
+                "  ⚠ Down gateways stopped serving messaging entirely — restart them:"
+            )
         print("      hermes gateway restart                # active profile")
         print("      hermes -p <profile> gateway restart   # named profile")
     return any_stale or any_down

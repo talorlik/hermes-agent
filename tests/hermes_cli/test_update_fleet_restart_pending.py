@@ -31,9 +31,16 @@ from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
 from hermes_constants import get_hermes_home
 
 
-def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+_PRE_UPDATE_SHA = "a" * 40
+_POST_UPDATE_SHA = "b" * 40
+
+
+def _make_head_moved_side_effect(
+    pre_sha: str = _PRE_UPDATE_SHA,
+    post_sha: str = _POST_UPDATE_SHA,
+):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
-    calls = {"n": 0}
+    state = {"head": pre_sha}
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
@@ -41,21 +48,31 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
 
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
+
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
 
+        if "merge --ff-only origin/main" in joined:
+            state["head"] = post_sha
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
         if joined.endswith("rev-parse HEAD"):
-            if calls["n"] == 0:
-                calls["n"] += 1
-                return SimpleNamespace(returncode=0, stdout=f"{pre_sha}\n", stderr="")
-            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{state['head']}\n",
+                stderr="",
+            )
 
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect
 
 
-def _make_up_to_date_side_effect(sha="abc123"):
+def _make_up_to_date_side_effect(sha: str = _PRE_UPDATE_SHA):
     """Simulate git commands where origin is already at HEAD."""
 
     def side_effect(cmd, **kwargs):
@@ -63,6 +80,11 @@ def _make_up_to_date_side_effect(sha="abc123"):
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
 
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
@@ -164,7 +186,7 @@ def test_marker_round_trip_under_hermes_home():
     assert path.name == "fleet_restart_pending"
     assert not path.exists()
 
-    update_cmd._write_fleet_restart_pending_marker(expected_sha="abc123")
+    assert update_cmd._write_fleet_restart_pending_marker(expected_sha="abc123") is True
     assert path.is_file()
     body = path.read_text(encoding="utf-8")
     assert "started=" in body
@@ -354,6 +376,7 @@ def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
         (scope, cmd, SimpleNamespace(returncode=0, stdout=""))
         for scope, cmd in update_cmd_fleet._SYSTEMD_SCOPES
     ])
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: False)
     assert update_cmd._run_pending_fleet_restart() is True
     assert "Pending fleet restart completed" in capsys.readouterr().out
 
@@ -373,8 +396,9 @@ def test_marker_written_after_pull_cleared_after_successful_restart(
     orig = update_cmd._write_fleet_restart_pending_marker
 
     def _spy(*, expected_sha=""):
-        orig(expected_sha=expected_sha)
+        written = orig(expected_sha=expected_sha)
         wrote.append(update_cmd._fleet_restart_pending_marker_path().is_file())
+        return written
 
     monkeypatch.setattr(update_cmd, "_write_fleet_restart_pending_marker", _spy)
 
@@ -384,6 +408,28 @@ def test_marker_written_after_pull_cleared_after_successful_restart(
     assert not update_cmd._fleet_restart_pending_marker_path().exists()
     out = capsys.readouterr().out
     assert "✓ Code updated!" in out
+
+
+def test_successful_update_settles_deferred_stash_once(monkeypatch, tmp_path):
+    args = _update_args()
+    stash_ref = "c" * 40
+    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *args, **kwargs: stash_ref,
+    )
+    restore_calls = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *args, **kwargs: restore_calls.append((args, kwargs)) or True,
+    )
+
+    hermes_main.cmd_update(args)
+
+    assert len(restore_calls) == 1
+
 
 
 def test_clean_update_warns_about_surviving_pre_update_serve_runtime(
@@ -493,7 +539,7 @@ def test_interrupt_between_pull_and_restart_leaves_marker(
 
     marker = update_cmd._fleet_restart_pending_marker_path()
     assert marker.is_file()
-    assert "expected_sha=def456" in marker.read_text(encoding="utf-8")
+    assert f"expected_sha={_POST_UPDATE_SHA}" in marker.read_text(encoding="utf-8")
 
 
 def test_already_up_to_date_runs_pending_restart_when_marker_present(

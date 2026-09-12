@@ -45,20 +45,22 @@ def _fleet_restart_pending_marker_path() -> Path:
     return get_hermes_home() / _FLEET_RESTART_PENDING_NAME
 
 
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "") -> None:
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "") -> bool:
     """Drop the pull→restart obligation breadcrumb. Never raises."""
     from hermes_cli.update_cmd import _m
     path = _fleet_restart_pending_marker_path()
     if _m()._pytest_owns_live_checkout(path.parent):
         logger.debug("Skipping fleet-restart-pending marker under pytest (live checkout)")
-        return
+        return False
     try:
         lines = [f"started={_time.time()}", f"pid={os.getpid()}"]
         if expected_sha:
             lines.append(f"expected_sha={expected_sha}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return True
     except OSError as exc:
         logger.debug("Could not write fleet-restart-pending marker: %s", exc)
+        return False
 
 
 def _clear_fleet_restart_pending_marker() -> None:

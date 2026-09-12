@@ -246,16 +246,12 @@ def _update_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _run_guard(detect_side_effect, orphan_return):
+def _run_guard(detect_side_effect, orphan_return, tmp_path):
     """Drive _cmd_update_impl to the venv-holder guard (harness mirrors
     test_update_venv_health.py)."""
 
     class _PastGuard(Exception):
         pass
-
-    class _RootSentinel:
-        def __truediv__(self, _other):
-            raise _PastGuard
 
     killed: list[list[int]] = []
 
@@ -274,7 +270,9 @@ def _run_guard(detect_side_effect, orphan_return):
     ), patch.object(
         cli_main, "_stop_process_trees", side_effect=killed.append
     ), patch.object(
-        cli_main, "PROJECT_ROOT", _RootSentinel()
+        cli_main, "PROJECT_ROOT", tmp_path
+    ), patch.object(
+        update_cmd, "_desktop_app_present", side_effect=_PastGuard
     ), patch(
         "time.sleep"
     ):
@@ -287,30 +285,30 @@ def _run_guard(detect_side_effect, orphan_return):
     return "returned", killed
 
 
-def test_guard_reaps_orphan_backend_and_proceeds():
+def test_guard_reaps_orphan_backend_and_proceeds(tmp_path):
     holders = _holders()
     # 1st scan: backend present; 2nd (post-reap) scan: clear.
     result, killed = _run_guard(
-        detect_side_effect=[holders, []], orphan_return=[200]
+        detect_side_effect=[holders, []], orphan_return=[200], tmp_path=tmp_path
     )
     assert result == "past_guard"
     assert killed == [[200]]
 
 
-def test_guard_still_refuses_when_not_orphaned():
+def test_guard_still_refuses_when_not_orphaned(tmp_path):
     holders = _holders()
     result, killed = _run_guard(
-        detect_side_effect=[holders, holders], orphan_return=None
+        detect_side_effect=[holders, holders], orphan_return=None, tmp_path=tmp_path
     )
     assert result == "exit_2"
     assert killed == []
 
 
-def test_guard_refuses_when_reap_does_not_clear_holders():
+def test_guard_refuses_when_reap_does_not_clear_holders(tmp_path):
     holders = _holders()
     # Reap runs but a holder survives (unkillable child) → refuse.
     result, killed = _run_guard(
-        detect_side_effect=[holders, holders], orphan_return=[200]
+        detect_side_effect=[holders, holders], orphan_return=[200], tmp_path=tmp_path
     )
     assert result == "exit_2"
     assert killed == [[200]]
