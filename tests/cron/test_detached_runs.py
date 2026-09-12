@@ -17,8 +17,65 @@ Contract under test (recurring-automation P1/P2, requirement 6):
 from __future__ import annotations
 
 import sqlite3
+from multiprocessing import Event, get_context
+from pathlib import Path
 
 import pytest
+
+
+def _finalize_after_selection(
+    db_path: str,
+    run_id: str,
+    success: bool,
+    error: str | None,
+    selected: Event,
+    finalized: Event,
+) -> None:
+    assert selected.wait(timeout=10)
+    import cron.executions as executions
+
+    executions.EXECUTIONS_FILE = Path(db_path)
+    try:
+        assert (
+            executions.finalize_detached_run(run_id, success=success, error=error)
+            is not None
+        )
+    finally:
+        finalized.set()
+
+
+def _intercept_reconcile_selection(ledger, monkeypatch, callback):
+    class _Cursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def fetchall(self):
+            rows = self._cursor.fetchall()
+            callback(rows)
+            return rows
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _Connection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = super().execute(sql, parameters)
+            if (
+                "SELECT * FROM executions" in sql
+                and "detached_status IN ('started','succeeded','failed')" in sql
+            ):
+                return _Cursor(cursor)
+            return cursor
+
+    monkeypatch.setattr(
+        ledger,
+        "_connect",
+        lambda: sqlite3.connect(
+            ledger.EXECUTIONS_FILE,
+            timeout=5,
+            factory=_Connection,
+        ),
+    )
 
 
 @pytest.fixture
@@ -126,6 +183,73 @@ def test_expired_lease_without_report_reconciles_as_lost_failure(ledger):
     assert I.count_incidents() == 1
 
 
+@pytest.mark.parametrize(
+    ("success", "worker_error", "terminal_status", "incident_count"),
+    [
+        (True, None, "completed", 0),
+        (False, "worker evidence", "failed", 1),
+    ],
+)
+def test_worker_report_racing_expired_reconciliation_wins_when_committed_first(
+    ledger,
+    monkeypatch,
+    success,
+    worker_error,
+    terminal_status,
+    incident_count,
+):
+    from cron import incidents as I
+
+    row = ledger.create_execution("job-race", source="builtin")
+    ledger.mark_execution_running(row["id"])
+    registered = ledger.register_detached_run(
+        row["id"], run_id="corr-race", lease_seconds=-1
+    )
+
+    ctx = get_context("spawn")
+    selected = ctx.Event()
+    finalized = ctx.Event()
+    worker = ctx.Process(
+        target=_finalize_after_selection,
+        args=(
+            str(ledger.EXECUTIONS_FILE),
+            registered["detached_run_id"],
+            success,
+            worker_error,
+            selected,
+            finalized,
+        ),
+    )
+
+    def _wait_for_worker_report(_rows):
+        selected.set()
+        assert finalized.wait(timeout=10)
+
+    _intercept_reconcile_selection(ledger, monkeypatch, _wait_for_worker_report)
+
+    worker.start()
+    raced = ledger.reconcile_detached_runs()
+    worker.join(timeout=10)
+    assert worker.exitcode == 0
+    assert raced == []
+
+    reported = ledger.latest_execution("job-race")
+    assert reported["status"] == "running"
+    assert reported["detached_status"] == ("succeeded" if success else "failed")
+    if worker_error:
+        assert reported["error"] == worker_error
+    assert I.count_incidents() == 0
+
+    reconciled = ledger.reconcile_detached_runs()
+    assert [record["id"] for record in reconciled] == [row["id"]]
+    final = ledger.latest_execution("job-race")
+    assert final["status"] == terminal_status
+    assert final["detached_status"] != "lost"
+    if worker_error:
+        assert final["error"] == worker_error
+    assert I.count_incidents() == incident_count
+
+
 def test_unknown_run_id_finalize_is_a_noop(ledger):
     assert ledger.finalize_detached_run("no-such-run", success=True) is None
 
@@ -154,6 +278,56 @@ def test_register_detached_run_cannot_replace_existing_correlation_id(ledger):
     assert ledger.find_detached_run("run-second") is None
 
 
+def test_reconcile_duplicate_inserted_after_selection_is_side_effect_free(
+    ledger, monkeypatch
+):
+    from cron import incidents as I
+
+    selected = ledger.create_execution("job-selected", source="builtin")
+    duplicate = ledger.create_execution("job-duplicate", source="builtin")
+    ledger.mark_execution_running(selected["id"])
+    ledger.mark_execution_running(duplicate["id"])
+    ledger.register_detached_run(
+        selected["id"], run_id="corr-late-duplicate", lease_seconds=-1
+    )
+    injected = False
+
+    def _insert_duplicate(rows):
+        nonlocal injected
+        if injected:
+            return
+        conn = sqlite3.connect(ledger.EXECUTIONS_FILE)
+        try:
+            conn.execute(
+                "UPDATE executions SET detached_run_id=?, "
+                "detached_status='started', lease_expires_at=? WHERE id=?",
+                (
+                    "corr-late-duplicate",
+                    rows[0]["lease_expires_at"],
+                    duplicate["id"],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        injected = True
+
+    _intercept_reconcile_selection(ledger, monkeypatch, _insert_duplicate)
+
+    assert ledger.reconcile_detached_runs() == []
+    first_sweep = ledger.list_executions(limit=10)
+    correlated = [
+        row for row in first_sweep if row["detached_run_id"] == "corr-late-duplicate"
+    ]
+    assert len(correlated) == 2
+    assert {row["status"] for row in correlated} == {"running"}
+    assert {row["detached_status"] for row in correlated} == {"started"}
+    assert I.count_incidents() == 0
+
+    assert ledger.reconcile_detached_runs() == []
+    assert I.count_incidents() == 0
+
+
 def test_finalize_duplicate_correlation_id_is_side_effect_free(ledger):
     first = ledger.create_execution("job-first", source="builtin")
     second = ledger.create_execution("job-second", source="builtin")
@@ -174,6 +348,93 @@ def test_finalize_duplicate_correlation_id_is_side_effect_free(ledger):
     assert ledger.finalize_detached_run("corr-corrupt", success=True) is None
     rows = ledger.list_executions(limit=10)
     duplicates = [row for row in rows if row["detached_run_id"] == "corr-corrupt"]
+    assert len(duplicates) == 2
+    assert {row["detached_status"] for row in duplicates} == {"started"}
+
+
+def test_finalize_mixed_status_duplicate_is_side_effect_free(ledger):
+    first = ledger.create_execution("job-finalized", source="builtin")
+    second = ledger.create_execution("job-started", source="builtin")
+    ledger.mark_execution_running(first["id"])
+    ledger.mark_execution_running(second["id"])
+    conn = sqlite3.connect(ledger.EXECUTIONS_FILE)
+    try:
+        conn.execute(
+            "UPDATE executions SET detached_run_id='corr-mixed', "
+            "detached_status='succeeded' WHERE id=?",
+            (first["id"],),
+        )
+        conn.execute(
+            "UPDATE executions SET detached_run_id='corr-mixed', "
+            "detached_status='started' WHERE id=?",
+            (second["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert ledger.finalize_detached_run("corr-mixed", success=False) is None
+    rows = ledger.list_executions(limit=10)
+    duplicates = [row for row in rows if row["detached_run_id"] == "corr-mixed"]
+    assert {row["detached_status"] for row in duplicates} == {
+        "started",
+        "succeeded",
+    }
+
+
+def test_finalize_duplicate_inserted_after_selection_is_side_effect_free(
+    ledger, monkeypatch
+):
+    selected = ledger.create_execution("job-selected", source="builtin")
+    duplicate = ledger.create_execution("job-duplicate", source="builtin")
+    ledger.mark_execution_running(selected["id"])
+    ledger.mark_execution_running(duplicate["id"])
+    ledger.register_detached_run(selected["id"], run_id="corr-finalize-late")
+    injected = False
+
+    class _Cursor:
+        def __init__(self, cursor, connection):
+            self._cursor = cursor
+            self._connection = connection
+
+        def fetchall(self):
+            nonlocal injected
+            rows = self._cursor.fetchall()
+            if not injected:
+                self._connection.execute(
+                    "UPDATE executions SET detached_run_id=?, "
+                    "detached_status='started' WHERE id=?",
+                    ("corr-finalize-late", duplicate["id"]),
+                )
+                injected = True
+            return rows
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+    class _Connection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = super().execute(sql, parameters)
+            if (
+                "SELECT id, detached_status FROM executions" in sql
+                and "detached_run_id=?" in sql
+            ):
+                return _Cursor(cursor, self)
+            return cursor
+
+    monkeypatch.setattr(
+        ledger,
+        "_connect",
+        lambda: sqlite3.connect(
+            ledger.EXECUTIONS_FILE,
+            timeout=5,
+            factory=_Connection,
+        ),
+    )
+
+    assert ledger.finalize_detached_run("corr-finalize-late", success=True) is None
+    rows = ledger.list_executions(limit=10)
+    duplicates = [row for row in rows if row["detached_run_id"] == "corr-finalize-late"]
     assert len(duplicates) == 2
     assert {row["detached_status"] for row in duplicates} == {"started"}
 

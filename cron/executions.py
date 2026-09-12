@@ -580,18 +580,23 @@ def finalize_detached_run(
         )
     with _transaction() as conn:
         matches = conn.execute(
-            "SELECT id FROM executions WHERE detached_run_id=? "
-            "AND detached_status='started' ORDER BY id LIMIT 2",
+            "SELECT id, detached_status FROM executions WHERE detached_run_id=? "
+            "ORDER BY id LIMIT 2",
             (str(run_id),),
         ).fetchall()
-        if len(matches) != 1:
+        if len(matches) != 1 or str(matches[0]["detached_status"]) != "started":
             return None
         execution_id = str(matches[0]["id"])
         cur = conn.execute(
             """UPDATE executions
                SET detached_status=?, error=COALESCE(?, error)
-               WHERE id=? AND detached_run_id=? AND detached_status='started'""",
-            (detached_status, detail, execution_id, str(run_id)),
+               WHERE id=? AND detached_run_id=? AND detached_status='started'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM executions AS other
+                   WHERE other.detached_run_id=?
+                     AND other.id<>executions.id
+                 )""",
+            (detached_status, detail, execution_id, str(run_id), str(run_id)),
         )
         if cur.rowcount != 1:
             return None
@@ -653,31 +658,56 @@ def reconcile_detached_runs() -> List[Dict[str, Any]]:
                     expired = True  # unparseable lease cannot vouch for the run
                 if not expired:
                     continue
-                conn.execute(
+                cur = conn.execute(
                     """UPDATE executions
                        SET status='failed', outcome='failed', finished_at=?,
                            detached_status='lost', error=?
-                       WHERE id=? AND status IN ('claimed','running')""",
+                       WHERE id=? AND detached_status=? AND detached_run_id=?
+                         AND status=?
+                         AND NOT EXISTS (
+                           SELECT 1 FROM executions AS other
+                           WHERE other.detached_run_id=?
+                             AND other.id<>executions.id
+                         )""",
                     (now_iso,
                      "Detached run lease expired with no terminal report; "
                      "the worker is presumed dead.",
-                     row["id"]),
+                     row["id"], detached_status, row["detached_run_id"],
+                     row["status"], row["detached_run_id"]),
                 )
             elif detached_status == "succeeded":
-                conn.execute(
+                cur = conn.execute(
                     """UPDATE executions
                        SET status='completed', outcome='completed',
                            finished_at=?, error=NULL
-                       WHERE id=? AND status IN ('claimed','running')""",
-                    (now_iso, row["id"]),
+                       WHERE id=? AND detached_status=? AND detached_run_id=?
+                         AND status=?
+                         AND NOT EXISTS (
+                           SELECT 1 FROM executions AS other
+                           WHERE other.detached_run_id=?
+                             AND other.id<>executions.id
+                         )""",
+                    (now_iso, row["id"], detached_status,
+                     row["detached_run_id"], row["status"],
+                     row["detached_run_id"]),
                 )
             else:  # failed
-                conn.execute(
+                cur = conn.execute(
                     """UPDATE executions
                        SET status='failed', outcome='failed', finished_at=?
-                       WHERE id=? AND status IN ('claimed','running')""",
-                    (now_iso, row["id"]),
+                       WHERE id=? AND detached_status=? AND detached_run_id=?
+                         AND status=?
+                         AND NOT EXISTS (
+                           SELECT 1 FROM executions AS other
+                           WHERE other.detached_run_id=?
+                             AND other.id<>executions.id
+                         )""",
+                    (now_iso, row["id"], detached_status,
+                     row["detached_run_id"], row["status"],
+                     row["detached_run_id"]),
                 )
+            if cur.rowcount != 1:
+                continue
             record = _record(conn.execute(
                 "SELECT * FROM executions WHERE id=?", (row["id"],)
             ).fetchone())
