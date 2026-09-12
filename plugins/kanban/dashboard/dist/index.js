@@ -716,16 +716,18 @@
             setBoard(data.current);
             return;
           }
-          // If the stored slug isn't in the list any longer (board was
-          // deleted in the CLI while dashboard was open), fall back to
-          // default so the UI doesn't hang on a 404.
+          // If the selected slug isn't in the list any longer, fall back to
+          // an existing saved board or default so the UI doesn't hang on a
+          // 404. A deep-link fallback is transient: opening a shared link must
+          // never overwrite the recipient's dashboard pin.
           if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
-            setBoard("default");
-            writeSelectedBoard("default");
+            const savedExists = storedBoard && boards.find(function (b) { return b.slug === storedBoard; });
+            setBoard(deepLink.board && savedExists ? storedBoard : "default");
+            if (!deepLink.board) writeSelectedBoard("default");
           }
         })
         .catch(function () { /* non-fatal */ });
-    }, [board]);
+    }, [board, deepLink.board]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
 

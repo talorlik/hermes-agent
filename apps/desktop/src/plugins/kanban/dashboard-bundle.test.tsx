@@ -177,6 +177,23 @@ describe('shipped Kanban dashboard deep links', () => {
     expect(window.localStorage.getItem('hermes.kanban.selectedBoard')).toBe('saved-board')
   })
 
+  it('keeps the saved board when a deep link names a missing board', async () => {
+    window.localStorage.setItem('hermes.kanban.selectedBoard', 'saved-board')
+    window.history.replaceState({}, '', '/kanban?board=missing-board')
+    const fetchJSON = createFetch()
+    const Page = loadDashboard(fetchJSON)
+
+    render(<Page />)
+
+    await screen.findByText('Board remains usable')
+    await waitFor(() => {
+      expect(
+        requested(fetchJSON, '/board').some(url => url.includes('board=saved-board'))
+      ).toBe(true)
+    })
+    expect(window.localStorage.getItem('hermes.kanban.selectedBoard')).toBe('saved-board')
+  })
+
   it('uses a board-only link without opening a task drawer', async () => {
     window.history.replaceState({}, '', '/kanban?board=ops%20board')
     const fetchJSON = createFetch()
