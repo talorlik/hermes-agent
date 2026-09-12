@@ -10,9 +10,12 @@ a hard failure.
 Mapping methodology
 -------------------
 Both refs resolve once to immutable OIDs. Fork-only commits are
-`git rev-list <upstream-oid>..<fork-oid>`. A merge is exempt only when it has
-exactly two parents in fork/upstream order and its committed tree equals the
-clean `git merge-tree --write-tree` result; every other commit is mapped work.
+`git rev-list <upstream-oid>..<fork-oid>`. A merge is exempt as upstream sync
+only when it has exactly two parents in fork/upstream order and its committed
+tree equals the clean `git merge-tree --write-tree` result. G-FORK-LEDGER may
+also authorize zero-tree history-reconciliation merges and their retired
+second-parent-only ancestry; the remaining commits are mapped work. These
+work, sync, and retired-history sets must form an exact disjoint partition.
 
 A Commits field may contain full SHAs, non-empty `<sha>..<sha>` ranges, the token
 `none` (path ownership only, no commit claim), and the token `self`. `self`
@@ -54,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -82,21 +86,24 @@ class CheckerError(RuntimeError):
     """Environment/setup failure: the check could not be evaluated at all."""
 
 
-def _git_bytes(repo: Path, *args: str) -> bytes:
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    joined = " ".join(args)
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
+        return subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(repo), *args],
             capture_output=True,
+            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
         )
     except OSError as exc:
-        raise CheckerError(
-            f"git {' '.join(args)} could not be executed: {exc}"
-        ) from exc
+        raise CheckerError(f"git {joined} could not be executed: {exc}") from exc
+
+
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    proc = _run_git(repo, *args)
     if proc.returncode != 0:
-        raise CheckerError(
-            f"git {' '.join(args)} failed (exit {proc.returncode}): "
-            f"{proc.stderr.decode('utf-8', errors='replace').strip()}"
-        )
+        joined = " ".join(args)
+        detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise CheckerError(f"git {joined} failed (exit {proc.returncode}): {detail}")
     return proc.stdout
 
 
@@ -250,13 +257,17 @@ def parse_path_precedence(
 
 
 def audit_commit_tokens(entry: LedgerEntry) -> tuple[bool, bool]:
-    """Allow only SHAs, ranges, `self`, and sole token `none`."""
+    """Allow only unique canonical SHA syntax, ranges, self, or sole none."""
     spec = entry.fields.get("Commits", "")
     tokens = [token for token in _SPEC_SPLIT.split(spec) if token]
     has_self = False
     has_none = False
     has_sha = False
+    seen: set[str] = set()
     for token in tokens:
+        if token in seen:
+            entry.problems.append(f"duplicate commit declaration: {token}")
+        seen.add(token)
         if token == "self":
             has_self = True
         elif token == "none":
@@ -277,13 +288,7 @@ def audit_commit_tokens(entry: LedgerEntry) -> tuple[bool, bool]:
 
 
 def _read_ledger_from_ref(repo: Path, fork_oid: str, ledger_rel: str) -> str:
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "show", f"{fork_oid}:{ledger_rel}"],
-            capture_output=True,
-        )
-    except OSError as exc:
-        raise CheckerError(f"git show could not be executed: {exc}") from exc
+    proc = _run_git(repo, "show", f"{fork_oid}:{ledger_rel}")
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", errors="replace").strip()
         raise CheckerError(
@@ -365,72 +370,73 @@ def commit_changed_paths(repo: Path, sha: str) -> set[str]:
 
 def _run_claim_git(repo: Path, *args: str) -> tuple[int, str]:
     """Run claim-resolution Git; preserve invalid-object status for the ledger."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True,
-        )
-    except OSError as exc:
-        raise CheckerError(
-            f"git {' '.join(args)} could not be executed: {exc}"
-        ) from exc
+    proc = _run_git(repo, *args)
     return proc.returncode, proc.stdout.decode(
         "utf-8", errors="surrogateescape"
     ).strip()
 
 
+def _is_canonical_commit_object(repo: Path, oid: str) -> bool:
+    returncode, object_type = _run_claim_git(repo, "cat-file", "-t", oid)
+    if returncode != 0 or object_type != "commit":
+        return False
+    returncode, resolved = _run_claim_git(
+        repo, "rev-parse", "--verify", "--end-of-options", f"{oid}^{{commit}}"
+    )
+    return returncode == 0 and resolved == oid
+
+
 def resolve_entry_commits(repo: Path, entry: LedgerEntry) -> set[str]:
-    """Expand validated full-SHA claims; invalid or empty claims fail closed."""
+    """Expand canonical commit-object claims and reject declaration overlap."""
     spec = entry.fields.get("Commits", "")
     shas: set[str] = set()
     for token in (part for part in _SPEC_SPLIT.split(spec) if part):
         range_match = _FULL_SHA_RANGE.fullmatch(token)
         if range_match:
             a, b = range_match.group("a"), range_match.group("b")
+            invalid = [
+                oid for oid in (a, b) if not _is_canonical_commit_object(repo, oid)
+            ]
+            if invalid:
+                for oid in invalid:
+                    entry.problems.append(
+                        f"range endpoint is not a canonical commit object: {oid}"
+                    )
+                continue
             returncode, output = _run_claim_git(repo, "rev-list", f"{a}..{b}")
             if returncode != 0:
                 entry.problems.append(f"unresolvable commit range: {token}")
                 continue
-            expanded = output.split()
+            expanded = set(output.split())
             if not expanded:
                 entry.problems.append(f"empty commit range: {token}")
                 continue
+            for sha in sorted(shas & expanded):
+                entry.problems.append(
+                    f"duplicate canonical commit declaration after expansion: {sha}"
+                )
             shas.update(expanded)
             continue
         if not _FULL_SHA.fullmatch(token):
             continue
-        returncode, output = _run_claim_git(repo, "rev-parse", f"{token}^{{commit}}")
-        if returncode != 0:
-            entry.problems.append(f"unresolvable commit: {token}")
+        if not _is_canonical_commit_object(repo, token):
+            entry.problems.append(f"not a canonical commit object: {token}")
             continue
-        shas.add(output)
+        if token in shas:
+            entry.problems.append(f"duplicate canonical commit declaration: {token}")
+        shas.add(token)
     return shas
 
 
 def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
-    try:
-        proc = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "merge-base",
-                "--is-ancestor",
-                ancestor,
-                descendant,
-            ],
-            capture_output=True,
-        )
-    except OSError as exc:
-        raise CheckerError(f"git merge-base could not be executed: {exc}") from exc
+    proc = _run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
     if proc.returncode == 0:
         return True
     if proc.returncode == 1:
         return False
+    detail = proc.stderr.decode("utf-8", errors="replace").strip()
     raise CheckerError(
-        "git merge-base --is-ancestor failed "
-        f"(exit {proc.returncode}): "
-        f"{proc.stderr.decode('utf-8', errors='replace').strip()}"
+        f"git merge-base --is-ancestor failed (exit {proc.returncode}): {detail}"
     )
 
 
@@ -444,31 +450,211 @@ def _is_clean_upstream_sync(
         return False
     if _is_ancestor(repo, first_parent, upstream_oid):
         return False
-    try:
-        proc = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo),
-                "merge-tree",
-                "--write-tree",
-                first_parent,
-                upstream_parent,
-            ],
-            capture_output=True,
-        )
-    except OSError as exc:
-        raise CheckerError(f"git merge-tree could not be executed: {exc}") from exc
+    proc = _run_git(repo, "merge-tree", "--write-tree", first_parent, upstream_parent)
     if proc.returncode == 1:
         return False
     if proc.returncode != 0:
-        raise CheckerError(
-            f"git merge-tree failed (exit {proc.returncode}): "
-            f"{proc.stderr.decode('utf-8', errors='replace').strip()}"
-        )
+        detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise CheckerError(f"git merge-tree failed (exit {proc.returncode}): {detail}")
     expected_tree = proc.stdout.decode("ascii", errors="strict").splitlines()[0]
     actual_tree = _git(repo, "rev-parse", f"{sha}^{{tree}}")
     return expected_tree == actual_tree
+
+
+def _history_reconciliation_partition(
+    repo: Path,
+    entries: list[LedgerEntry],
+    upstream_oid: str,
+    fork_oid: str,
+    range_shas: set[str],
+) -> tuple[set[str], list[dict[str, object]]]:
+    declarers = [
+        entry for entry in entries if "History-Reconciliations" in entry.fields
+    ]
+    for entry in declarers:
+        if entry.entry_id != "G-FORK-LEDGER":
+            entry.problems.append(
+                "History-Reconciliations may be declared only by G-FORK-LEDGER"
+            )
+    ledger_declarers = [
+        entry for entry in declarers if entry.entry_id == "G-FORK-LEDGER"
+    ]
+    if not ledger_declarers:
+        return set(), []
+    if len(ledger_declarers) != 1:
+        for entry in ledger_declarers:
+            entry.problems.append(
+                "History-Reconciliations requires one unique G-FORK-LEDGER entry"
+            )
+        return set(), []
+
+    entry = ledger_declarers[0]
+    tokens = [
+        token
+        for token in _SPEC_SPLIT.split(entry.fields["History-Reconciliations"])
+        if token
+    ]
+    if not tokens:
+        entry.problems.append("History-Reconciliations cannot be empty")
+        return set(), []
+    if "none" in tokens:
+        if len(tokens) != 1:
+            entry.problems.append(
+                "History-Reconciliations token none cannot be combined with object IDs"
+            )
+        return set(), []
+
+    first_parent_range = set(
+        _git(
+            repo,
+            "rev-list",
+            "--first-parent",
+            f"{upstream_oid}..{fork_oid}",
+        ).splitlines()
+    )
+    upstream_roots = set(
+        _git(repo, "rev-list", "--max-parents=0", upstream_oid).splitlines()
+    )
+    history: set[str] = set()
+    records: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in seen:
+            entry.problems.append(
+                f"duplicate History-Reconciliations declaration: {token}"
+            )
+            continue
+        seen.add(token)
+        if not _FULL_SHA.fullmatch(token):
+            entry.problems.append(
+                "History-Reconciliations requires full 40-character object IDs: "
+                f"{token}"
+            )
+            continue
+        if not _is_canonical_commit_object(repo, token):
+            entry.problems.append(
+                f"History-Reconciliations is not a canonical commit object: {token}"
+            )
+            continue
+        if token not in range_shas:
+            entry.problems.append(
+                f"History-Reconciliations commit is outside evaluated range: {token}"
+            )
+            continue
+        if token not in first_parent_range:
+            entry.problems.append(
+                "History-Reconciliations commit must be on the fork first-parent chain: "
+                f"{token}"
+            )
+            continue
+        parents = _git(repo, "show", "-s", "--format=%P", token).split()
+        if len(parents) != 2:
+            entry.problems.append(
+                f"History-Reconciliations commit must have exactly two parents: {token}"
+            )
+            continue
+        first_parent, retired_tip = parents
+        actual_tree = _git(repo, "show", "-s", "--format=%T", token)
+        first_parent_tree = _git(repo, "show", "-s", "--format=%T", first_parent)
+        if actual_tree != first_parent_tree:
+            entry.problems.append(
+                "History-Reconciliations commit must equal its raw first-parent tree: "
+                f"{token}"
+            )
+            continue
+        retired_roots = set(
+            _git(repo, "rev-list", "--max-parents=0", retired_tip).splitlines()
+        )
+        if not retired_roots or not retired_roots <= upstream_roots:
+            entry.problems.append(
+                "History-Reconciliations retired parent must descend only from the "
+                f"official upstream root: {token}"
+            )
+            continue
+        retired = set(
+            _git(
+                repo,
+                "rev-list",
+                retired_tip,
+                f"^{first_parent}",
+                f"^{upstream_oid}",
+            ).splitlines()
+        )
+        if not retired:
+            entry.problems.append(
+                "History-Reconciliations second parent has no exclusive retired "
+                f"commits: {token}"
+            )
+            continue
+        candidate = {token, *retired}
+        outside = candidate - range_shas
+        if outside:
+            entry.problems.append(
+                "History-Reconciliations history is outside evaluated range: "
+                + ", ".join(sorted(outside))
+            )
+            continue
+        overlap = candidate & history
+        if overlap:
+            entry.problems.append(
+                "History-Reconciliations retired sets overlap: "
+                + ", ".join(sorted(overlap))
+            )
+            continue
+        history.update(candidate)
+        records.append({
+            "sha": token,
+            "retired_tip": retired_tip,
+            "retired_commits": sorted(retired),
+        })
+    return history, records
+
+
+def _partition_range(
+    repo: Path,
+    entries: list[LedgerEntry],
+    upstream_oid: str,
+    fork_oid: str,
+) -> tuple[list[dict[str, str]], list[str], set[str], list[dict[str, object]]]:
+    out = _git(
+        repo,
+        "rev-list",
+        "--format=%H%x00%P%x00%s",
+        "--no-commit-header",
+        f"{upstream_oid}..{fork_oid}",
+    )
+    rows: dict[str, tuple[list[str], str]] = {}
+    for line in out.splitlines():
+        if line.strip():
+            sha, parents_raw, subject = line.split("\x00", 2)
+            rows[sha] = (parents_raw.split(), subject)
+    range_shas = set(rows)
+    history, records = _history_reconciliation_partition(
+        repo, entries, upstream_oid, fork_oid, range_shas
+    )
+    sync_order = [
+        sha
+        for sha, (parents, _subject) in rows.items()
+        if sha not in history
+        and _is_clean_upstream_sync(repo, sha, parents, upstream_oid)
+    ]
+    sync = set(sync_order)
+    work_shas = range_shas - sync - history
+    if (
+        sync & history
+        or sync & work_shas
+        or history & work_shas
+        or sync | history | work_shas != range_shas
+    ):
+        raise CheckerError(
+            "fork range classification is not an exact disjoint partition"
+        )
+    work = [
+        {"sha": sha, "subject": subject}
+        for sha, (_parents, subject) in rows.items()
+        if sha in work_shas
+    ]
+    return work, sync_order, history, records
 
 
 def classify_range(
@@ -528,13 +714,7 @@ def _self_matches(
 def _entry_fingerprint_at(
     repo: Path, oid: str, ledger_rel: str, entry_id: str
 ) -> tuple[str, tuple[tuple[str, str], ...], tuple[str, ...]] | None:
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "show", f"{oid}:{ledger_rel}"],
-            capture_output=True,
-        )
-    except OSError as exc:
-        raise CheckerError(f"git show could not be executed: {exc}") from exc
+    proc = _run_git(repo, "show", f"{oid}:{ledger_rel}")
     if proc.returncode != 0:
         return None
     try:
@@ -563,6 +743,138 @@ def _commit_changes_entry(repo: Path, sha: str, ledger_rel: str, entry_id: str) 
     )
     after = _entry_fingerprint_at(repo, sha, ledger_rel, entry_id)
     return after is not None and after != before
+
+
+def _positive_revision(fields: dict[str, str]) -> int | None:
+    raw = fields.get("Ledger-Revision", "")
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        return None
+    return int(raw)
+
+
+def _validate_history_revision_transitions(
+    repo: Path,
+    entries: list[LedgerEntry],
+    upstream_oid: str,
+    fork_oid: str,
+    ledger_rel: str,
+    effective_owners: dict[str, str],
+) -> bool:
+    """Validate sticky history authorization against persistent first-parent state."""
+    current_entries = [entry for entry in entries if entry.entry_id == "G-FORK-LEDGER"]
+
+    def add_problem(problem: str) -> None:
+        nonlocal current_entries
+        if not current_entries:
+            synthetic = LedgerEntry(
+                entry_id="G-FORK-LEDGER",
+                title="missing activated ledger entry",
+                line=0,
+                problems=[],
+            )
+            entries.append(synthetic)
+            current_entries = [synthetic]
+        for target in current_entries:
+            if problem not in target.problems:
+                target.problems.append(problem)
+
+    first_parent = _git(
+        repo,
+        "rev-list",
+        "--reverse",
+        "--first-parent",
+        f"{upstream_oid}..{fork_oid}",
+    ).splitlines()
+    activated = False
+    seen_entry = False
+    previous_present = False
+    revision_floor: int | None = None
+    last_history: str | None = None
+
+    for sha in first_parent:
+        fingerprint = _entry_fingerprint_at(repo, sha, ledger_rel, "G-FORK-LEDGER")
+        if fingerprint is None:
+            if activated:
+                add_problem(
+                    f"G-FORK-LEDGER must not disappear after history activation: {sha}"
+                )
+            previous_present = False
+            continue
+
+        fields = dict(fingerprint[1])
+        history = fields.get("History-Reconciliations")
+        revision = _positive_revision(fields)
+
+        if not activated and history is None:
+            seen_entry = True
+            previous_present = True
+            if revision is not None:
+                revision_floor = (
+                    revision
+                    if revision_floor is None
+                    else max(revision_floor, revision)
+                )
+            continue
+
+        if revision is None:
+            add_problem(
+                "History-Reconciliations requires a positive decimal "
+                f"Ledger-Revision in commit {sha}"
+            )
+
+        history_changed = not activated or history != last_history
+        if not activated:
+            if (
+                seen_entry
+                and revision_floor is not None
+                and (revision is None or revision <= revision_floor)
+            ):
+                add_problem(
+                    "History-Reconciliations activation must exceed the persistent "
+                    f"Ledger-Revision floor {revision_floor} in commit {sha}"
+                )
+            activated = True
+        else:
+            if not previous_present:
+                add_problem(
+                    "G-FORK-LEDGER reappeared after a forbidden post-activation "
+                    f"absence in commit {sha}"
+                )
+            if revision_floor is not None and revision is not None:
+                if revision < revision_floor:
+                    add_problem(
+                        "History-Reconciliations revision regressed below the "
+                        f"persistent revision floor {revision_floor} in commit {sha}"
+                    )
+                if history_changed and revision <= revision_floor:
+                    add_problem(
+                        "History-Reconciliations change must strictly increase the "
+                        f"persistent Ledger-Revision floor in commit {sha}"
+                    )
+
+        if history_changed:
+            changed = commit_changed_paths(repo, sha)
+            after_owned = set(fingerprint[2])
+            if ledger_rel not in changed or not changed <= after_owned:
+                add_problem(
+                    "History-Reconciliations change requires a G-FORK-LEDGER "
+                    f"self-owned commit: {sha}"
+                )
+            if any(effective_owners.get(path) != "G-FORK-LEDGER" for path in changed):
+                add_problem(
+                    "History-Reconciliations change requires effective "
+                    f"G-FORK-LEDGER ownership for every changed path: {sha}"
+                )
+
+        seen_entry = True
+        previous_present = True
+        last_history = history
+        if revision is not None:
+            revision_floor = (
+                revision if revision_floor is None else max(revision_floor, revision)
+            )
+
+    return activated
 
 
 def _declared_path_owners(entries: list[LedgerEntry]) -> dict[str, list[str]]:
@@ -641,15 +953,22 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         if has_self:
             wants_self.append(entry)
 
-    explicit_claims = [resolve_entry_commits(repo, entry) for entry in entries]
-    work, sync_merges = classify_range(repo, upstream_oid, fork_oid)
-    work_shas = {commit["sha"] for commit in work}
-    changed = fork_changed_paths(repo, upstream_oid, fork_oid)
     precedence, precedence_problems = parse_path_precedence(ledger_text)
     declared_owners = _declared_path_owners(entries)
     effective_owners, invalid_precedence = _resolve_all_declared_paths(
         declared_owners, precedence
     )
+    history_activated = _validate_history_revision_transitions(
+        repo, entries, upstream_oid, fork_oid, ledger_rel, effective_owners
+    )
+
+    explicit_claims = [resolve_entry_commits(repo, entry) for entry in entries]
+    work, sync_merges, history_set, history_reconciliations = _partition_range(
+        repo, entries, upstream_oid, fork_oid
+    )
+    sync_set = set(sync_merges)
+    work_shas = {commit["sha"] for commit in work}
+    changed = fork_changed_paths(repo, upstream_oid, fork_oid)
     path_owners, unowned, ambiguous = _resolve_current_paths(
         changed, declared_owners, effective_owners
     )
@@ -659,6 +978,20 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
     for entry, claimed in zip(entries, explicit_claims, strict=True):
         valid_claimed: set[str] = set()
         for sha in set(claimed):
+            if history_activated and entry.entry_id == "G-FORK-LEDGER":
+                parents = _git(repo, "show", "-s", "--format=%P", sha).split()
+                before = (
+                    _entry_fingerprint_at(repo, parents[0], ledger_rel, "G-FORK-LEDGER")
+                    if parents
+                    else None
+                )
+                after = _entry_fingerprint_at(repo, sha, ledger_rel, "G-FORK-LEDGER")
+                if before is None or after is None:
+                    entry.problems.append(
+                        "explicit G-FORK-LEDGER claim crosses a missing "
+                        f"G-FORK-LEDGER transition: {sha}"
+                    )
+                    continue
             if sha not in work_shas:
                 entry.problems.append(
                     f"explicit commit claim is outside evaluated work range: {sha}"
@@ -723,9 +1056,11 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         "upstream_oid": upstream_oid,
         "fork_oid": fork_oid,
         "counts": {
-            "fork_only_commits": len(work) + len(sync_merges),
+            "fork_only_commits": len(work_shas | sync_set | history_set),
             "work_commits": len(work),
-            "sync_merges": len(sync_merges),
+            "sync_merges": len(sync_set),
+            "history_reconciliations": len(history_reconciliations),
+            "retired_history_commits": len(history_set) - len(history_reconciliations),
             "mapped": sum(1 for c in work if c["sha"] in mapped),
             "unmapped": len(unmapped),
             "entries": len(entries),
@@ -743,6 +1078,12 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         "invalid_precedence": invalid_precedence,
         "path_owners": path_owners,
         "sync_merges": sync_merges,
+        "history_reconciliations": history_reconciliations,
+        "partition": {
+            "work": sorted(work_shas),
+            "sync": sorted(sync_set),
+            "history": sorted(history_set),
+        },
     }
 
 

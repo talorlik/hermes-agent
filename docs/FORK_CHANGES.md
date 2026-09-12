@@ -20,7 +20,14 @@ claimant must be the effective owner of every changed path across all declared
 Owned-Files paths, even when a path is absent from the current three-dot delta.
 `self` additionally requires that the specific entry changed relative to the
 commit's first parent. Do not put a branch-only SHA in G-FORK-LEDGER; that SHA
-changes on merge or squash.
+changes on merge or squash. G-FORK-LEDGER may explicitly retire ancestry through
+`History-Reconciliations`: each listed canonical commit must be a two-parent
+first-parent-chain merge whose raw tree equals its first parent's tree, whose
+retired parent shares only official-upstream roots, and whose retired set is
+disjoint from every other partition. Every change to that field is a
+G-FORK-LEDGER-owned commit whose Ledger-Revision strictly exceeds the persistent
+first-parent revision high-water mark. After first activation, the entry cannot
+disappear; replacement entries and explicit claims cannot reset its identity.
 
 Current-path ownership is the three-dot `upstream/main...fork-ref` changed
 path set, including both source and destination of renames. Git output is
@@ -249,14 +256,15 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 12
+- Ledger-Revision: 13
+- History-Reconciliations: none
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped.
-- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction.
+- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, an unrevisioned authorization, or a delete/recreate revision reset.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
 - Disposition: active
