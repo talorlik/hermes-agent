@@ -29,7 +29,6 @@ const sidebars: SidebarsConfig = {
         'user-guide/windows-native',
         'user-guide/windows-wsl-quickstart',
         'user-guide/configuration',
-        'user-guide/free-tier',
         'user-guide/managed-scope',
         'user-guide/configuring-models',
         {
@@ -375,7 +374,6 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/creative/creative-sketch',
                     'user-guide/skills/optional/creative/creative-social-media-content-calendar',
                     'user-guide/skills/optional/creative/creative-tldraw-offline',
-                    'user-guide/skills/optional/creative/creative-touchdesigner-mcp',
                     'user-guide/skills/optional/creative/creative-unreal-mcp',
                   ],
                 },
