@@ -617,6 +617,84 @@
   }
 
   // -------------------------------------------------------------------------
+  // Published orchestration summary
+  // -------------------------------------------------------------------------
+
+  function OrchestrationSummaryPanel(props) {
+    const { t } = useI18n();
+    if (props.unavailable) {
+      return h(Card, { className: "hermes-kanban-summary hermes-kanban-summary--unavailable" },
+        h(CardContent, { className: "hermes-kanban-summary-content" },
+          h("div", { className: "hermes-kanban-summary-title" },
+            tx(t, "summaryUnavailable", "Orchestration summary unavailable")),
+          h("div", { className: "hermes-kanban-summary-subtitle" },
+            tx(t, "summaryUnavailableHint", "The board remains available while the published summary is repaired.")),
+        ),
+      );
+    }
+    const summary = props.summary;
+    if (!summary) return null;
+    const counts = summary.counts || {};
+    const cron = summary.cron || {};
+    const totals = summary.schedule_totals || {};
+    const metrics = [
+      tx(t, "summaryRunning", "Running {n}", { n: counts.running_count || 0 }),
+      tx(t, "summaryFailed", "Failed {n}", { n: counts.failed_count || 0 }),
+      tx(t, "summaryBlocked", "Blocked {n}", { n: counts.blocked_count || 0 }),
+      tx(t, "summaryCron", "Cron {n}", { n: cron.jobs_remaining || 0 }),
+      tx(t, "summarySchedulesPaused", "Schedules paused {paused}/{total}", {
+        paused: totals.paused || 0,
+        total: totals.configured || 0,
+      }),
+      tx(t, "summaryFindings", "Findings {n}", { n: summary.findings_count || 0 }),
+    ];
+    return h(Card, { className: "hermes-kanban-summary" },
+      h(CardContent, { className: "hermes-kanban-summary-content" },
+        h("div", { className: "hermes-kanban-summary-header" },
+          h("div", null,
+            h("div", { className: "hermes-kanban-summary-title" },
+              tx(t, "summaryTitle", "Orchestration summary")),
+            h("div", { className: "hermes-kanban-summary-subtitle" },
+              summary.stale
+                ? tx(t, "summaryExpired", "Expired {timestamp}", {
+                  timestamp: summary.expires_at || "unknown",
+                })
+                : tx(t, "summaryGenerated", "Generated {timestamp}", {
+                  timestamp: summary.generated_at || "unknown",
+                })),
+          ),
+          h("div", { className: "hermes-kanban-summary-status" },
+            h(Badge, { className: "hermes-kanban-summary-badge" }, summary.status || "unknown"),
+            summary.stale ? h(Badge, {
+              className: "hermes-kanban-summary-badge hermes-kanban-summary-badge--stale",
+            }, tx(t, "summaryStale", "Stale")) : null,
+          ),
+        ),
+        h("div", { className: "hermes-kanban-summary-metrics" },
+          metrics.map(function (metric) {
+            return h("span", { className: "hermes-kanban-summary-metric", key: metric }, metric);
+          }),
+        ),
+        Array.isArray(summary.lanes) && summary.lanes.length > 0
+          ? h("div", { className: "hermes-kanban-summary-lanes" },
+            summary.lanes.map(function (lane) {
+              return h("div", { className: "hermes-kanban-summary-lane", key: lane.name },
+                h("span", { className: "hermes-kanban-summary-lane-name" }, lane.name),
+                h("span", { className: "hermes-kanban-summary-lane-counts" },
+                  tx(t, "summaryLaneCounts", "run {running} · fail {failed} · ok {success}", {
+                    running: lane.running_count || 0,
+                    failed: lane.failed_count || 0,
+                    success: lane.terminal_successes || 0,
+                  })),
+              );
+            }),
+          )
+          : null,
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // Root page
   // -------------------------------------------------------------------------
 
@@ -642,6 +720,8 @@
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [boardSummary, setBoardSummary] = useState(null);
+    const [boardSummaryUnavailable, setBoardSummaryUnavailable] = useState(false);
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
@@ -671,6 +751,7 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+    const summaryRequestRef = useRef(0);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -687,8 +768,31 @@
         .catch(function () { setConfig({ render_markdown: true }); });
     }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
+    // --- fetch published summary without coupling it to board availability ---
+    const loadBoardSummary = useCallback(function () {
+      const request = ++summaryRequestRef.current;
+      if (!board) {
+        setBoardSummary(null);
+        setBoardSummaryUnavailable(false);
+        return Promise.resolve();
+      }
+      return SDK.fetchJSON(`${API}/board-summary?board=${encodeURIComponent(board)}`)
+        .then(function (summary) {
+          if (request !== summaryRequestRef.current) return;
+          setBoardSummary(summary);
+          setBoardSummaryUnavailable(false);
+        })
+        .catch(function (err) {
+          if (request !== summaryRequestRef.current) return;
+          const message = String(err && err.message ? err.message : err || "");
+          setBoardSummary(null);
+          setBoardSummaryUnavailable(!/^404(?:\s|:)/.test(message));
+        });
+    }, [board]);
+
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
+      loadBoardSummary();
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
@@ -703,7 +807,7 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
+    }, [tenantFilter, includeArchived, board, loadBoardSummary]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -1171,6 +1275,9 @@
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
       setBoardData(null);
+      summaryRequestRef.current += 1;
+      setBoardSummary(null);
+      setBoardSummaryUnavailable(false);
       cursorRef.current = 0;
       setLoading(true);
       setBoard(nextSlug);
@@ -1307,6 +1414,10 @@
             return updateBoard(board, payload).then(function () { setShowBoardSettings(false); });
           },
         }) : null,
+        h(OrchestrationSummaryPanel, {
+          summary: boardSummary,
+          unavailable: boardSummaryUnavailable,
+        }),
         h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,

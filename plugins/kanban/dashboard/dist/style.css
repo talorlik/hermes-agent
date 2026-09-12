@@ -1591,3 +1591,77 @@
 .hermes-kanban-trash-label {
   font-weight: 500;
 }
+
+
+/* ---- Published orchestration summary -------------------------------- */
+.hermes-kanban-summary {
+  border-color: color-mix(in srgb, var(--color-ring) 32%, var(--color-border));
+}
+
+.hermes-kanban-summary--unavailable {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, var(--color-border));
+}
+
+.hermes-kanban-summary-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.85rem 1rem !important;
+}
+
+.hermes-kanban-summary-header,
+.hermes-kanban-summary-status,
+.hermes-kanban-summary-metrics,
+.hermes-kanban-summary-lanes,
+.hermes-kanban-summary-lane {
+  display: flex;
+  align-items: center;
+}
+
+.hermes-kanban-summary-header {
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.hermes-kanban-summary-title {
+  color: var(--color-foreground);
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.hermes-kanban-summary-subtitle,
+.hermes-kanban-summary-lane-counts {
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+}
+
+.hermes-kanban-summary-status,
+.hermes-kanban-summary-metrics,
+.hermes-kanban-summary-lanes {
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.hermes-kanban-summary-badge,
+.hermes-kanban-summary-metric,
+.hermes-kanban-summary-lane {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  font-size: 0.68rem;
+  line-height: 1.2;
+  padding: 0.2rem 0.45rem;
+}
+
+.hermes-kanban-summary-badge--stale {
+  border-color: color-mix(in srgb, var(--color-warning, #d4b348) 55%, var(--color-border));
+}
+
+.hermes-kanban-summary-lane {
+  gap: 0.35rem;
+}
+
+.hermes-kanban-summary-lane-name {
+  color: var(--color-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-weight: 600;
+}

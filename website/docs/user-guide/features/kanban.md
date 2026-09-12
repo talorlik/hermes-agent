@@ -213,6 +213,24 @@ All dashboard API endpoints accept `?board=<slug>` for board scoping. The
 events WebSocket is pinned to a board at connection time; switching in
 the UI opens a fresh WS against the new board.
 
+### Published board summaries
+
+An external automation system can publish an optional, read-only summary for a
+board at `<hermes-home>/state/board-summaries/<slug>.json`. The dashboard reads
+only schema version 2 (`cc://board-summary/v2`) through
+`GET /api/plugins/kanban/board-summary?board=<slug>`. It validates the complete
+payload, cross-checks declared counts and authorization evidence, computes
+staleness from `expires_at`, and returns a filtered projection that excludes
+local source paths.
+
+A missing summary is normal and leaves the panel hidden. An unsafe, malformed,
+oversized, or internally inconsistent file produces a compact "summary
+unavailable" panel without blocking the board. The panel refreshes with the
+selected board, manual refreshes, and board events; it displays status,
+staleness, workflow counts, remaining cron jobs, schedule pause totals, lane
+badges, and the findings count. Producers remain optional and board-specific;
+the dashboard never contacts their workflow engine or scheduler.
+
 ### Deep links
 
 The browser dashboard's Kanban tab understands URL query parameters, so you can
@@ -734,11 +752,12 @@ The GUI is strictly a **read-through-the-DB + write-through-kanban_db** layer wi
 
 ### REST surface
 
-All routes are mounted under `/api/plugins/kanban/` and protected by the dashboard's ephemeral session token:
+All routes are mounted under `/api/plugins/kanban/`. HTTP plugin routes follow the existing unauthenticated local-dashboard contract; the WebSocket route requires the dashboard's ephemeral session token:
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/board?tenant=<name>&include_archived=…` | Full board grouped by status column, plus tenants + assignees for filter dropdowns |
+| `GET` | `/board-summary?board=<slug>` | Optional validated schema-v2 automation summary for the selected board; 404 when absent, 503 when unavailable |
 | `GET` | `/tasks/:id` | Task + comments + events + links |
 | `POST` | `/tasks` | Create (wraps `kanban_db.create_task`, accepts `triage: bool` and `parents: [id, …]`) |
 | `PATCH` | `/tasks/:id` | Status / assignee / priority / title / body / result |

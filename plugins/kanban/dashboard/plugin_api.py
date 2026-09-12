@@ -10,12 +10,17 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
+import math
+import os
 import re
 import sqlite3
+import stat
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import asdict
@@ -1655,6 +1660,796 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
     with _errors_to_500("failed to save config"):
         save_config(cfg)
     return get_orchestration_settings()  # callers re-render from the resolved state
+
+
+# --- Board summary: /board-summary?board=<slug> -------------------------------
+#
+# Generic consumer for producer-written summary files under
+# ``<HERMES_HOME>/state/board-summaries/<slug>.json`` (schema
+# ``cc://board-summary/v2``). The dashboard only ever reads this one
+# derived file — it never reaches the producer's engine, cron state, or
+# arbitrary filesystem paths. Error contract is intentionally stable and
+# opaque: 404 = no summary published, 503 = a file exists but cannot be
+# served safely (never echoes parser/OS detail to the client).
+
+_BOARD_SUMMARY_MAX_BYTES = 1_048_576  # bound reads; a summary is a few KB
+_BOARD_SUMMARY_404 = "board summary not found"
+_BOARD_SUMMARY_503 = "board summary unavailable"
+
+
+def _board_summary_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail=_BOARD_SUMMARY_503)
+
+
+def _open_board_summary_directory() -> int:
+    """Open the active profile's summary directory without following ancestors."""
+    from hermes_constants import get_hermes_home
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise _board_summary_unavailable()
+    path = get_hermes_home() / "state" / "board-summaries"
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or os.path.normpath(str(path)) != str(path)
+    ):
+        raise _board_summary_unavailable()
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    fd = -1
+    try:
+        fd = os.open("/", flags)
+        for component in path.parts[1:]:
+            try:
+                entry = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail=_BOARD_SUMMARY_404)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise _board_summary_unavailable()
+            next_fd = -1
+            try:
+                next_fd = os.open(component, flags, dir_fd=fd)
+                info = os.fstat(next_fd)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_dev != entry.st_dev
+                    or info.st_ino != entry.st_ino
+                ):
+                    raise _board_summary_unavailable()
+            except BaseException:
+                if next_fd >= 0:
+                    os.close(next_fd)
+                raise
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except HTTPException:
+        if fd >= 0:
+            os.close(fd)
+        raise
+    except (OSError, TypeError, NotImplementedError):
+        if fd >= 0:
+            os.close(fd)
+        raise _board_summary_unavailable()
+
+
+def _summary_file_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        stat.S_IFMT(info.st_mode),
+        stat.S_IMODE(info.st_mode),
+        info.st_uid,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_board_summary_bytes(slug: str) -> bytes:
+    """Read one descriptor-bound regular file below non-symlink ancestors."""
+    directory_fd = _open_board_summary_directory()
+    file_fd = -1
+    filename = f"{slug}.json"
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        try:
+            file_fd = os.open(filename, flags, dir_fd=directory_fd)
+        except (FileNotFoundError, NotADirectoryError):
+            raise HTTPException(status_code=404, detail=_BOARD_SUMMARY_404)
+        except (OSError, TypeError, NotImplementedError):
+            raise _board_summary_unavailable()
+
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > _BOARD_SUMMARY_MAX_BYTES:
+            raise _board_summary_unavailable()
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            try:
+                chunk = os.read(file_fd, min(remaining, 65536))
+            except InterruptedError:
+                continue
+            if not chunk:
+                raise _board_summary_unavailable()
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        while True:
+            try:
+                extra = os.read(file_fd, 1)
+                break
+            except InterruptedError:
+                continue
+        if extra:
+            raise _board_summary_unavailable()
+        after = os.fstat(file_fd)
+        entry = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or _summary_file_identity(after) != _summary_file_identity(before)
+            or _summary_file_identity(entry) != _summary_file_identity(before)
+        ):
+            raise _board_summary_unavailable()
+        return b"".join(chunks)
+    except HTTPException:
+        raise
+    except (OSError, TypeError, NotImplementedError):
+        raise _board_summary_unavailable()
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def _parse_board_summary(raw: bytes) -> dict[str, Any]:
+    def _reject_constant(name: str):
+        raise ValueError(f"non-finite constant {name!r}")
+
+    def _parse_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite JSON number")
+        return parsed
+
+    def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object member")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+            parse_float=_parse_float,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise _board_summary_unavailable()
+    if not isinstance(payload, dict):
+        raise _board_summary_unavailable()
+    return payload
+
+
+# Published ``cc://board-summary/v2`` contract. Routing remains board-generic,
+# while the versioned payload validator enforces the producer schema's fixed
+# inventory constants, strict types (bools are not counts), and every cross-field
+# count, digest, authorization, and clean-window invariant.
+
+_BS_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_BS_BOARD_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+_BS_API_BASE_RE = re.compile(r"^https?://.*$")
+_BS_ABSOLUTE_PATH_RE = re.compile(r"^/.*$")
+_BS_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_BS_OPT_HEX64_RE = re.compile(r"^(|[0-9a-f]{64})$")
+_BS_CRON_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_BS_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+_BS_WORKFLOW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+_BS_PHASES = frozenset({"canary", "pre_removal", "post_removal"})
+_BS_STATUSES = frozenset({"monitoring", "canary_passed", "removal_ready", "completed", "failed"})
+_BS_EXPECTED_LEGACY_IDS = (
+    "014c79161bf3",
+    "62778bbc7f7b",
+    "705134be1948",
+    "bf5ff2b8c22a",
+)
+_BS_EXPECTED_LEGACY_DIGEST = "107ff5dc64a718f9c20216032b4ec25fcc98a6a4dad0c8dae5b0f2b690f2c9e2"
+
+_BS_TOP_KEYS = frozenset({
+    "schema_version", "board_slug", "generated_at", "expires_at", "staleness",
+    "phase", "status", "cron_removal_authorized", "pre_removal_proof_digest",
+    "clean_since", "clean_elapsed_seconds", "required_clean_seconds",
+    "completed", "engine", "cron_jobs_remaining", "cron_inventory",
+    "blocked_cards_count", "duplicate_blocked_signature_count",
+    "pending_grace_count", "schedule_totals", "global", "barrier", "lanes",
+    "schedules", "blocked_cards", "pending_occurrences", "findings", "source"})
+
+_BS_CRON_KEYS = frozenset({
+    "expected_legacy_ids", "expected_legacy_ids_digest", "live_ids",
+    "live_ids_digest", "live_enabled_ids", "live_non_paused_ids",
+    "source_observed", "source_ids", "source_ids_digest",
+    "source_live_converged", "phase_expectation_met"})
+
+_BS_GLOBAL_COUNT_KEYS = (
+    "running_count", "paused_count", "success_count", "failed_count",
+    "contention_count", "duplicate_count", "stale_prerequisite_count",
+    "blocked_count", "cron_jobs_remaining", "schedule_count",
+    "schedule_paused_count", "pending_grace_count", "missed_boundary_count",
+    "findings_count")
+
+_BS_LANE_KEYS = frozenset({
+    "name", "observed_ids", "running_ids", "running_count", "paused_ids",
+    "paused_count", "success_ids", "terminal_successes", "failed_ids",
+    "failed_count", "contention_ids", "contention_count", "duplicate_ids",
+    "duplicate_count", "stale_prerequisite_ids", "stale_prerequisite_count",
+    "occurrences"})
+
+_BS_SCHEDULE_KEYS = frozenset({
+    "name", "cron_expression", "zone", "paused", "workflow_name",
+    "workflow_version", "correlation_id", "task_to_domain", "workflow_input",
+    "run_catchup_schedule_instances", "start_time", "end_time",
+    "overlap_policy", "expected_minimum_occurrences", "observed_count",
+    "matched_workflow_ids", "unmatched_workflow_ids", "pending_boundaries",
+    "drift", "missed_boundaries"})
+
+_BS_TOTALS_KEYS = frozenset({
+    "configured", "observed", "paused", "drifted", "pending", "missed",
+    "source_names", "live_keys", "paused_names", "drifted_names"})
+
+_BS_CARD_KEYS = frozenset({"board", "id", "title", "status", "created_at", "incident_id"})
+_BS_FINDING_KEYS = frozenset({"severity", "code", "message", "evidence"})
+_BS_BARRIER_KEYS = frozenset({"passed", "inventory_digest", "workflow_digest", "waves"})
+_BS_SOURCE_KEYS = frozenset({
+    "api_base", "ledger_dir", "schedules_dir", "boards_root", "cron_jobs_path",
+    "source_cron_jobs_path", "summary_path"})
+
+
+class _SummaryInvalid(ValueError):
+    """Raised (with an internal-only reason) for any v2 contract violation."""
+
+
+def _bs_fail(reason: str) -> None:
+    raise _SummaryInvalid(reason)
+
+
+def _bs_require(ok: bool, reason: str) -> None:
+    if not ok:
+        _bs_fail(reason)
+
+
+def _bs_int(value: Any, reason: str) -> int:
+    _bs_require(isinstance(value, int) and not isinstance(value, bool), reason)
+    return value
+
+
+def _bs_count(value: Any, reason: str) -> int:
+    _bs_require(_bs_int(value, reason) >= 0, reason)
+    return value
+
+
+def _bs_bool(value: Any, reason: str) -> bool:
+    _bs_require(isinstance(value, bool), reason)
+    return value
+
+
+def _bs_str(value: Any, reason: str, pattern: Optional[re.Pattern] = None,
+            allow_empty: bool = True) -> str:
+    _bs_require(isinstance(value, str), reason)
+    if not allow_empty:
+        _bs_require(bool(value), reason)
+    if pattern is not None:
+        _bs_require(pattern.fullmatch(value) is not None, reason)
+    return value
+
+
+def _bs_ts(value: Any, reason: str) -> datetime:
+    _bs_str(value, reason, pattern=_BS_TIMESTAMP_RE)
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        _bs_fail(reason)
+
+
+def _bs_exact_keys(value: Any, keys: frozenset, reason: str) -> dict:
+    _bs_require(isinstance(value, dict) and set(value.keys()) == keys, reason)
+    return value
+
+
+def _bs_sorted_unique(value: Any, reason: str, pattern: re.Pattern) -> list[str]:
+    _bs_require(isinstance(value, list), reason)
+    for item in value:
+        _bs_str(item, reason, pattern=pattern)
+    _bs_require(value == sorted(value) and len(value) == len(set(value)), reason)
+    return value
+
+
+def _bs_digest(ids: list[str]) -> str:
+    return hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _bs_validate_cron_inventory(payload: dict[str, Any]) -> dict[str, list[str]]:
+    cron = _bs_exact_keys(payload["cron_inventory"], _BS_CRON_KEYS, "cron_inventory shape")
+    id_lists = {
+        field: _bs_sorted_unique(cron[field], f"cron_inventory.{field}", _BS_CRON_ID_RE)
+        for field in ("expected_legacy_ids", "live_ids", "live_enabled_ids",
+                      "live_non_paused_ids", "source_ids")}
+    _bs_str(cron["expected_legacy_ids_digest"], "cron digest", pattern=_BS_HEX64_RE)
+    _bs_str(cron["live_ids_digest"], "cron digest", pattern=_BS_HEX64_RE)
+    _bs_str(cron["source_ids_digest"], "cron digest", pattern=_BS_OPT_HEX64_RE)
+    observed = _bs_bool(cron["source_observed"], "cron booleans")
+    converged = _bs_bool(cron["source_live_converged"], "cron booleans")
+    _bs_bool(cron["phase_expectation_met"], "cron booleans")
+    live = id_lists["live_ids"]
+    _bs_require(payload["cron_jobs_remaining"] == len(live), "cron_jobs_remaining != len(live_ids)")
+    _bs_require(set(id_lists["live_enabled_ids"]) <= set(live), "enabled ids not live")
+    _bs_require(set(id_lists["live_non_paused_ids"]) <= set(live), "non-paused ids not live")
+    _bs_require(cron["expected_legacy_ids_digest"] == _bs_digest(id_lists["expected_legacy_ids"]),
+                "expected_legacy_ids_digest does not bind expected_legacy_ids")
+    _bs_require(cron["live_ids_digest"] == _bs_digest(live), "live_ids_digest does not bind live_ids")
+    if observed:
+        _bs_require(cron["source_ids_digest"] == _bs_digest(id_lists["source_ids"]),
+                    "source_ids_digest does not bind source_ids")
+    else:
+        _bs_require(not id_lists["source_ids"] and cron["source_ids_digest"] == "",
+                    "unobserved source inventory must be empty")
+    _bs_require(converged == (observed and id_lists["source_ids"] == live),
+                "source_live_converged contradicts cron IDs")
+    _bs_require(
+        id_lists["expected_legacy_ids"] == list(_BS_EXPECTED_LEGACY_IDS)
+        and cron["expected_legacy_ids_digest"] == _BS_EXPECTED_LEGACY_DIGEST,
+        "expected legacy cron inventory does not match schema v2",
+    )
+    return id_lists
+
+
+def _bs_validate_lanes(payload: dict[str, Any]) -> tuple[dict[str, int], set[str]]:
+    lanes = payload["lanes"]
+    _bs_require(isinstance(lanes, list), "lanes must be a list")
+    names = [lane.get("name") if isinstance(lane, dict) else None for lane in lanes]
+    _bs_require(all(isinstance(n, str) for n in names)
+                and names == sorted(names) and len(names) == len(set(names)),
+                "lanes must have unique sorted names")
+    sums = {key: 0 for key in (
+        "running_count", "paused_count", "success_count", "failed_count",
+        "contention_count", "duplicate_count", "stale_prerequisite_count")}
+    seen: set[str] = set()
+    for lane in lanes:
+        _bs_exact_keys(lane, _BS_LANE_KEYS, "lane shape")
+        _bs_str(lane["name"], "lane name", pattern=_BS_NAME_RE)
+        observed = _bs_sorted_unique(lane["observed_ids"], "lane observed_ids", _BS_WORKFLOW_ID_RE)
+        _bs_require(not (seen & set(observed)), "workflow IDs appear in multiple lanes")
+        seen.update(observed)
+        partitions: list[set[str]] = []
+        for ids_field, count_field, sum_field in (
+                ("running_ids", "running_count", "running_count"),
+                ("paused_ids", "paused_count", "paused_count"),
+                ("success_ids", "terminal_successes", "success_count"),
+                ("failed_ids", "failed_count", "failed_count")):
+            ids = _bs_sorted_unique(lane[ids_field], f"lane {ids_field}", _BS_WORKFLOW_ID_RE)
+            _bs_require(_bs_count(lane[count_field], "lane count") == len(ids),
+                        f"lane {count_field} != len({ids_field})")
+            sums[sum_field] += len(ids)
+            partitions.append(set(ids))
+        _bs_require(not any(a & b for i, a in enumerate(partitions) for b in partitions[i + 1:]),
+                    "lane status ID arrays must be pairwise disjoint")
+        _bs_require(set(observed) == set().union(*partitions),
+                    "lane observed_ids must equal the status partition union")
+        occurrences = lane["occurrences"]
+        _bs_require(isinstance(occurrences, list), "lane occurrences must be a list")
+        occurrence_ids = []
+        for item in occurrences:
+            _bs_exact_keys(item, frozenset({"workflow_id", "started_at"}), "lane occurrence shape")
+            occurrence_ids.append(_bs_str(item["workflow_id"], "occurrence id", pattern=_BS_WORKFLOW_ID_RE))
+            _bs_ts(item["started_at"], "occurrence started_at")
+        _bs_require(occurrence_ids == observed, "lane occurrences must mirror observed_ids")
+        for ids_field, count_field, sum_field in (
+                ("contention_ids", "contention_count", "contention_count"),
+                ("duplicate_ids", "duplicate_count", "duplicate_count"),
+                ("stale_prerequisite_ids", "stale_prerequisite_count", "stale_prerequisite_count")):
+            ids = _bs_sorted_unique(lane[ids_field], f"lane {ids_field}", _BS_WORKFLOW_ID_RE)
+            _bs_require(_bs_count(lane[count_field], "lane count") == len(ids)
+                        and set(ids) <= set(lane["failed_ids"]),
+                        f"lane {count_field} must count a subset of failed_ids")
+            sums[sum_field] += len(ids)
+    return sums, seen
+
+
+def _bs_validate_blocked_cards(payload: dict[str, Any]) -> None:
+    cards = payload["blocked_cards"]
+    _bs_require(isinstance(cards, list), "blocked_cards must be a list")
+    identities = []
+    signature_counts: dict[str, int] = {}
+    for card in cards:
+        _bs_exact_keys(card, _BS_CARD_KEYS, "blocked card shape")
+        board = _bs_str(
+            card["board"], "card board", pattern=_BS_BOARD_SLUG_RE, allow_empty=False
+        )
+        card_id = _bs_str(card["id"], "card id", allow_empty=False)
+        _bs_str(card["title"], "card title")
+        _bs_require(card["status"] in {"blocked", "triage"}, "card status")
+        _bs_count(card["created_at"], "card created_at")
+        incident = card["incident_id"]
+        _bs_require(incident is None or isinstance(incident, str), "card incident_id")
+        identities.append(f"{board}:{card_id}")
+        if isinstance(incident, str) and incident:
+            signature_counts[incident] = signature_counts.get(incident, 0) + 1
+    _bs_require(identities == sorted(identities) and len(identities) == len(set(identities)),
+                "blocked_cards must be uniquely sorted")
+    _bs_require(payload["blocked_cards_count"] == len(cards)
+                and payload["global"]["blocked_count"] == len(cards),
+                "blocked card counts must equal blocked_cards length")
+    duplicates = sum(1 for count in signature_counts.values() if count > 1)
+    _bs_require(payload["duplicate_blocked_signature_count"] == duplicates,
+                "duplicate_blocked_signature_count must count duplicate signature groups")
+
+
+def _bs_validate_schedules(payload: dict[str, Any], observed_workflow_ids: set[str]) -> int:
+    """Validate schedules + schedule_totals + pending_occurrences; return missed total."""
+    schedules = payload["schedules"]
+    _bs_require(isinstance(schedules, list), "schedules must be a list")
+    names = [item.get("name") if isinstance(item, dict) else None for item in schedules]
+    _bs_require(all(isinstance(n, str) for n in names)
+                and names == sorted(names) and len(names) == len(set(names)),
+                "schedules must have unique sorted names")
+    all_matched: set[str] = set()
+    expected_pending: list[dict[str, str]] = []
+    missed_total = 0
+    for schedule in schedules:
+        _bs_exact_keys(schedule, _BS_SCHEDULE_KEYS, "schedule shape")
+        _bs_str(schedule["name"], "schedule name", pattern=_BS_NAME_RE)
+        _bs_str(schedule["workflow_name"], "schedule workflow_name", pattern=_BS_NAME_RE)
+        _bs_str(schedule["cron_expression"], "schedule cron_expression", allow_empty=False)
+        _bs_str(schedule["zone"], "schedule zone", allow_empty=False)
+        _bs_bool(schedule["paused"], "schedule paused")
+        _bs_require(_bs_int(schedule["workflow_version"], "schedule workflow_version") >= 1,
+                    "schedule workflow_version")
+        _bs_str(schedule["correlation_id"], "schedule correlation_id", allow_empty=False)
+        _bs_require(isinstance(schedule["task_to_domain"], dict)
+                    and isinstance(schedule["workflow_input"], dict), "schedule mappings")
+        _bs_require(schedule["run_catchup_schedule_instances"] is None
+                    or isinstance(schedule["run_catchup_schedule_instances"], bool),
+                    "schedule run_catchup")
+        for bound in ("start_time", "end_time"):
+            value = schedule[bound]
+            _bs_require(value is None or _bs_count(value, f"schedule {bound}") >= 0,
+                        f"schedule {bound}")
+        _bs_require(schedule["overlap_policy"] is None
+                    or isinstance(schedule["overlap_policy"], str), "schedule overlap_policy")
+        matched = _bs_sorted_unique(schedule["matched_workflow_ids"],
+                                    "schedule matched ids", _BS_WORKFLOW_ID_RE)
+        unmatched = _bs_sorted_unique(schedule["unmatched_workflow_ids"],
+                                      "schedule unmatched ids", _BS_WORKFLOW_ID_RE)
+        pending = _bs_sorted_unique(schedule["pending_boundaries"],
+                                    "schedule pending", _BS_TIMESTAMP_RE)
+        missed = _bs_sorted_unique(schedule["missed_boundaries"],
+                                   "schedule missed", _BS_TIMESTAMP_RE)
+        drift = schedule["drift"]
+        _bs_require(isinstance(drift, list)
+                    and all(isinstance(item, str) and item for item in drift), "schedule drift")
+        _bs_require(_bs_count(schedule["observed_count"], "schedule observed_count") == len(matched),
+                    "schedule observed_count must count matched_workflow_ids")
+        _bs_require(
+            _bs_count(schedule["expected_minimum_occurrences"], "schedule expected occurrences")
+            == len(matched) + len(pending) + len(missed),
+            "schedule occurrence equation is inconsistent")
+        _bs_require(set(matched) <= observed_workflow_ids and set(unmatched) <= observed_workflow_ids,
+                    "schedule workflow IDs must be observed lane IDs")
+        _bs_require(not (set(matched) & set(unmatched)) and not (all_matched & set(matched)),
+                    "matched workflow IDs must be disjoint")
+        all_matched.update(matched)
+        missed_total += len(missed)
+        expected_pending.extend(
+            {"schedule_name": schedule["name"], "boundary": boundary} for boundary in pending)
+
+    totals = _bs_exact_keys(payload["schedule_totals"], _BS_TOTALS_KEYS, "schedule_totals shape")
+    for key in ("configured", "observed", "paused", "drifted", "pending", "missed"):
+        _bs_count(totals[key], f"schedule_totals.{key}")
+    source_names = _bs_sorted_unique(totals["source_names"], "schedule_totals.source_names", _BS_NAME_RE)
+    _bs_require(isinstance(totals["live_keys"], list)
+                and all(isinstance(item, str) and item for item in totals["live_keys"]),
+                "schedule_totals.live_keys")
+    paused_names = _bs_sorted_unique(totals["paused_names"], "schedule_totals.paused_names", _BS_NAME_RE)
+    drifted_names = totals["drifted_names"]
+    _bs_require(isinstance(drifted_names, list)
+                and all(isinstance(item, str) and item for item in drifted_names),
+                "schedule_totals.drifted_names")
+    _bs_require(totals["configured"] == len(source_names) and source_names == names,
+                "schedule_totals.configured must mirror the schedule list")
+    _bs_require(totals["observed"] == len(totals["live_keys"]),
+                "schedule_totals.observed must equal live_keys length")
+    expected_paused = [item["name"] for item in schedules if item["paused"]]
+    _bs_require(totals["paused"] == len(paused_names) and paused_names == expected_paused,
+                "schedule_totals.paused must mirror paused schedules")
+    expected_drifted = {item["name"] for item in schedules if item["drift"]}
+    _bs_require(totals["drifted"] == len(drifted_names)
+                and expected_drifted <= set(drifted_names),
+                "schedule_totals.drifted must identify schedule drift")
+
+    pending_occurrences = payload["pending_occurrences"]
+    _bs_require(isinstance(pending_occurrences, list), "pending_occurrences must be a list")
+    for item in pending_occurrences:
+        _bs_exact_keys(item, frozenset({"schedule_name", "boundary"}), "pending occurrence shape")
+        _bs_str(item["schedule_name"], "pending schedule_name", pattern=_BS_NAME_RE)
+        _bs_ts(item["boundary"], "pending boundary")
+    expected_pending.sort(key=lambda item: (item["schedule_name"], item["boundary"]))
+    _bs_require(pending_occurrences == expected_pending,
+                "pending_occurrences must equal schedule pending boundaries")
+    _bs_require(totals["pending"] == len(pending_occurrences)
+                and payload["pending_grace_count"] == len(pending_occurrences),
+                "pending counts must equal pending_occurrences length")
+    _bs_require(totals["missed"] == missed_total, "schedule_totals.missed must equal missed boundaries")
+    return missed_total
+
+
+def _validate_board_summary(payload: dict[str, Any], slug: str) -> None:
+    """Enforce the generic v2 contract; raise ``_SummaryInvalid`` on any violation."""
+    _bs_exact_keys(payload, _BS_TOP_KEYS, "top-level shape")
+    version = payload["schema_version"]
+    _bs_require(isinstance(version, int) and not isinstance(version, bool) and version == 2,
+                "unsupported schema_version")
+    _bs_str(payload["board_slug"], "board_slug", pattern=_BS_BOARD_SLUG_RE)
+    _bs_require(payload["board_slug"] == slug, "board_slug mismatch")
+    generated = _bs_ts(payload["generated_at"], "generated_at")
+    expires = _bs_ts(payload["expires_at"], "expires_at")
+    _bs_ts(payload["clean_since"], "clean_since")
+    staleness = _bs_exact_keys(payload["staleness"], frozenset({"fresh_for_seconds"}), "staleness shape")
+    fresh = staleness["fresh_for_seconds"]
+    _bs_require(_bs_int(fresh, "fresh_for_seconds") >= 1, "fresh_for_seconds must be positive")
+    _bs_require(int((expires - generated).total_seconds()) == fresh,
+                "fresh_for_seconds must equal expires_at - generated_at")
+    phase = payload["phase"]
+    status_value = payload["status"]
+    _bs_require(phase in _BS_PHASES, "unknown phase")
+    _bs_require(status_value in _BS_STATUSES, "unknown status")
+    completed = _bs_bool(payload["completed"], "completed")
+    authorized = _bs_bool(payload["cron_removal_authorized"], "cron_removal_authorized")
+    proof = _bs_str(payload["pre_removal_proof_digest"], "pre_removal_proof_digest",
+                    pattern=_BS_OPT_HEX64_RE)
+    clean_elapsed = _bs_count(payload["clean_elapsed_seconds"], "clean_elapsed_seconds")
+    required_clean = _bs_count(payload["required_clean_seconds"], "required_clean_seconds")
+    _bs_require(
+        (phase == "canary" and 30 <= required_clean <= 600)
+        or (phase == "pre_removal" and required_clean == 7200)
+        or (phase == "post_removal" and required_clean == 0),
+        "required_clean_seconds contradicts the phase",
+    )
+    engine = _bs_exact_keys(payload["engine"], frozenset({"healthy"}), "engine shape")
+    engine_healthy = _bs_bool(engine["healthy"], "engine.healthy")
+    _bs_count(payload["cron_jobs_remaining"], "cron_jobs_remaining")
+
+    findings = payload["findings"]
+    _bs_require(isinstance(findings, list), "findings must be a list")
+    for finding in findings:
+        _bs_exact_keys(finding, _BS_FINDING_KEYS, "finding shape")
+        _bs_require(finding["severity"] == "error", "finding severity")
+        _bs_str(finding["code"], "finding code", allow_empty=False)
+        _bs_str(finding["message"], "finding message", allow_empty=False)
+        _bs_require(isinstance(finding["evidence"], dict), "finding evidence")
+
+    # Phase/status/authorization contradictions.
+    _bs_require(completed == (phase == "post_removal" and status_value == "completed"),
+                "completed must identify only a completed post_removal phase")
+    _bs_require(authorized == (phase == "pre_removal" and status_value == "removal_ready"),
+                "cron_removal_authorized must identify only removal_ready pre_removal")
+    _bs_require((phase == "post_removal") == bool(proof),
+                "pre_removal_proof_digest must be present only in post_removal")
+    _bs_require(status_value != "canary_passed" or phase == "canary", "canary_passed requires canary")
+    _bs_require(status_value != "removal_ready" or phase == "pre_removal",
+                "removal_ready requires pre_removal")
+    _bs_require(status_value != "completed" or phase == "post_removal",
+                "completed status requires post_removal")
+    _bs_require(status_value != "failed" or bool(findings), "failed status requires findings")
+    _bs_require(status_value != "monitoring" or not findings,
+                "monitoring status cannot carry findings")
+
+    global_counts = _bs_exact_keys(
+        payload["global"], frozenset(_BS_GLOBAL_COUNT_KEYS) | {"conductor_healthy"}, "global shape")
+    for key in _BS_GLOBAL_COUNT_KEYS:
+        _bs_count(global_counts[key], f"global.{key}")
+    _bs_require(_bs_bool(global_counts["conductor_healthy"], "global.conductor_healthy")
+                == engine["healthy"], "global.conductor_healthy must equal engine.healthy")
+
+    cron_ids = _bs_validate_cron_inventory(payload)
+    lane_sums, observed_workflow_ids = _bs_validate_lanes(payload)
+    for key, expected in lane_sums.items():
+        _bs_require(global_counts[key] == expected, f"global.{key} must equal the lane sum")
+    _bs_validate_blocked_cards(payload)
+    missed_total = _bs_validate_schedules(payload, observed_workflow_ids)
+
+    _bs_require(global_counts["cron_jobs_remaining"] == payload["cron_jobs_remaining"],
+                "global.cron_jobs_remaining must equal cron_jobs_remaining")
+    _bs_require(global_counts["schedule_count"] == len(payload["schedules"]),
+                "global.schedule_count must equal schedules length")
+    _bs_require(global_counts["schedule_paused_count"] == payload["schedule_totals"]["paused"],
+                "global.schedule_paused_count must equal schedule_totals.paused")
+    _bs_require(global_counts["pending_grace_count"] == payload["pending_grace_count"],
+                "global.pending_grace_count must equal pending_grace_count")
+    _bs_require(global_counts["missed_boundary_count"] == missed_total,
+                "global.missed_boundary_count must equal missed boundaries")
+    _bs_require(global_counts["findings_count"] == len(findings),
+                "global.findings_count must equal len(findings)")
+
+    barrier = _bs_exact_keys(payload["barrier"], _BS_BARRIER_KEYS, "barrier shape")
+    passed = _bs_bool(barrier["passed"], "barrier.passed")
+    _bs_str(barrier["inventory_digest"], "barrier.inventory_digest", pattern=_BS_OPT_HEX64_RE)
+    _bs_str(barrier["workflow_digest"], "barrier.workflow_digest", pattern=_BS_OPT_HEX64_RE)
+    _bs_count(barrier["waves"], "barrier.waves")
+    if passed:
+        _bs_require(_BS_HEX64_RE.fullmatch(barrier["inventory_digest"]) is not None
+                    and _BS_HEX64_RE.fullmatch(barrier["workflow_digest"]) is not None
+                    and barrier["waves"] >= 5,
+                    "passed barrier requires five waves and digest evidence")
+
+    cron = payload["cron_inventory"]
+    expected_phase_met = (
+        cron_ids["live_ids"] == list(_BS_EXPECTED_LEGACY_IDS)
+        and not cron_ids["live_enabled_ids"]
+        and not cron_ids["live_non_paused_ids"]
+        if phase in {"canary", "pre_removal"}
+        else cron["source_observed"]
+        and not cron_ids["live_ids"]
+        and not cron_ids["source_ids"]
+    )
+    _bs_require(
+        cron["phase_expectation_met"] == expected_phase_met,
+        "phase_expectation_met contradicts phase inventory",
+    )
+    _bs_require(
+        cron["phase_expectation_met"] or (status_value == "failed" and bool(findings)),
+        "false phase_expectation_met requires failed status and findings",
+    )
+    totals = payload["schedule_totals"]
+    adverse_counts = (
+        lane_sums["failed_count"],
+        lane_sums["running_count"],
+        lane_sums["paused_count"],
+        lane_sums["contention_count"],
+        lane_sums["duplicate_count"],
+        lane_sums["stale_prerequisite_count"],
+        global_counts["blocked_count"],
+        payload["duplicate_blocked_signature_count"],
+        len(payload["pending_occurrences"]),
+        missed_total,
+        totals["drifted"],
+    )
+    unmatched_scheduled = any(
+        schedule["unmatched_workflow_ids"] for schedule in payload["schedules"]
+    )
+    success_terminal = status_value in {"canary_passed", "removal_ready", "completed"}
+    _bs_require(
+        not success_terminal
+        or (
+            not findings
+            and totals["configured"] > 0
+            and clean_elapsed >= required_clean
+            and engine_healthy
+            and not any(adverse_counts)
+            and not unmatched_scheduled
+            and passed
+            and cron["phase_expectation_met"]
+            and (phase == "canary" or totals["paused"] == 0)
+        ),
+        "terminal success contradicts clean-window, inventory, or barrier evidence",
+    )
+
+    # ``source`` is producer bookkeeping: validate schema patterns, never project it.
+    source = _bs_exact_keys(payload["source"], _BS_SOURCE_KEYS, "source shape")
+    _bs_str(
+        source["api_base"],
+        "source.api_base",
+        pattern=_BS_API_BASE_RE,
+        allow_empty=False,
+    )
+    for key in _BS_SOURCE_KEYS - {"api_base"}:
+        _bs_str(
+            source[key],
+            f"source.{key}",
+            pattern=_BS_ABSOLUTE_PATH_RE,
+            allow_empty=False,
+        )
+
+
+def _board_summary_projection(payload: dict[str, Any], slug: str) -> dict[str, Any]:
+    """Filtered public view: no producer ``source`` paths, no finding evidence,
+    no schedule inputs/correlation ids — only display-safe scalars and counts."""
+    expires = datetime.strptime(payload["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    cron = payload["cron_inventory"]
+    totals = payload["schedule_totals"]
+    barrier = payload["barrier"]
+    return {
+        "board": slug,
+        "generated_at": payload["generated_at"],
+        "expires_at": payload["expires_at"],
+        "stale": datetime.now(timezone.utc) >= expires,
+        "phase": payload["phase"],
+        "status": payload["status"],
+        "completed": payload["completed"],
+        "cron_removal_authorized": payload["cron_removal_authorized"],
+        "counts": dict(payload["global"]),
+        "cron": {
+            "jobs_remaining": payload["cron_jobs_remaining"],
+            "live_ids_digest": cron["live_ids_digest"],
+            "expected_legacy_ids_digest": cron["expected_legacy_ids_digest"],
+            "source_ids_digest": cron["source_ids_digest"],
+            "source_observed": cron["source_observed"],
+            "source_live_converged": cron["source_live_converged"],
+            "phase_expectation_met": cron["phase_expectation_met"],
+        },
+        "lanes": [
+            {
+                "name": lane["name"],
+                "running_count": lane["running_count"],
+                "paused_count": lane["paused_count"],
+                "failed_count": lane["failed_count"],
+                "terminal_successes": lane["terminal_successes"],
+                "contention_count": lane["contention_count"],
+                "duplicate_count": lane["duplicate_count"],
+                "stale_prerequisite_count": lane["stale_prerequisite_count"],
+            }
+            for lane in payload["lanes"]
+        ],
+        "schedules": [
+            {
+                "name": schedule["name"],
+                "paused": schedule["paused"],
+                "cron_expression": schedule["cron_expression"],
+                "zone": schedule["zone"],
+                "observed_count": schedule["observed_count"],
+                "missed_count": len(schedule["missed_boundaries"]),
+                "drifted": bool(schedule["drift"]),
+            }
+            for schedule in payload["schedules"]
+        ],
+        "schedule_totals": {
+            "configured": totals["configured"],
+            "observed": totals["observed"],
+            "paused": totals["paused"],
+            "drifted": totals["drifted"],
+            "pending": totals["pending"],
+            "missed": totals["missed"],
+        },
+        "barrier": {
+            "passed": barrier["passed"],
+            "waves": barrier["waves"],
+            "inventory_digest": barrier["inventory_digest"],
+            "workflow_digest": barrier["workflow_digest"],
+        },
+        "findings_count": payload["global"]["findings_count"],
+        "findings": [
+            {
+                "severity": finding["severity"],
+                "code": finding["code"],
+                "message": finding["message"][:300],
+            }
+            for finding in payload["findings"]
+        ],
+    }
+
+
+@router.get("/board-summary")
+def get_board_summary(board: str = Query(..., description="Kanban board slug")):
+    """Serve the published summary for ``board``. 404 = none published;
+    503 = a summary file exists but is unsafe or violates the v2 contract."""
+    slug = _normalize_slug_or_400(board)
+    if not slug:
+        raise HTTPException(status_code=400, detail="board slug required")
+    payload = _parse_board_summary(_read_board_summary_bytes(slug))
+    try:
+        _validate_board_summary(payload, slug)
+        return _board_summary_projection(payload, slug)
+    except HTTPException:
+        raise
+    except Exception:
+        # Any structural surprise while projecting == invalid file.
+        raise _board_summary_unavailable()
 
 
 # --- WebSocket: /events?since=<event_id>&board=<slug> ------------------------

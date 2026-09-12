@@ -1257,3 +1257,561 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# GET /board-summary — generic board summary consumer
+# ---------------------------------------------------------------------------
+
+import hashlib
+from datetime import datetime, timedelta, timezone
+
+
+def _summary_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _summary_digest(ids: list) -> str:
+    return hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+_SUMMARY_EXPECTED_LEGACY_IDS = [
+    "014c79161bf3",
+    "62778bbc7f7b",
+    "705134be1948",
+    "bf5ff2b8c22a",
+]
+_SUMMARY_EXPECTED_LEGACY_DIGEST = (
+    "107ff5dc64a718f9c20216032b4ec25fcc98a6a4dad0c8dae5b0f2b690f2c9e2"
+)
+assert _summary_digest(_SUMMARY_EXPECTED_LEGACY_IDS) == _SUMMARY_EXPECTED_LEGACY_DIGEST
+
+
+def _valid_summary(slug: str = "default", *, fresh_for: int = 3600,
+                   generated: datetime | None = None) -> dict:
+    """Minimal payload satisfying the generic cc://board-summary/v2 contract."""
+    now = generated or datetime.now(timezone.utc).replace(microsecond=0)
+    expires = now + timedelta(seconds=fresh_for)
+    empty = _summary_digest([])
+    return {
+        "schema_version": 2,
+        "board_slug": slug,
+        "generated_at": _summary_iso(now),
+        "expires_at": _summary_iso(expires),
+        "staleness": {"fresh_for_seconds": fresh_for},
+        "phase": "canary",
+        "status": "monitoring",
+        "cron_removal_authorized": False,
+        "pre_removal_proof_digest": "",
+        "clean_since": _summary_iso(now),
+        "clean_elapsed_seconds": 0,
+        "required_clean_seconds": 60,
+        "completed": False,
+        "engine": {"healthy": True},
+        "cron_jobs_remaining": len(_SUMMARY_EXPECTED_LEGACY_IDS),
+        "cron_inventory": {
+            "expected_legacy_ids": list(_SUMMARY_EXPECTED_LEGACY_IDS),
+            "expected_legacy_ids_digest": _SUMMARY_EXPECTED_LEGACY_DIGEST,
+            "live_ids": list(_SUMMARY_EXPECTED_LEGACY_IDS),
+            "live_ids_digest": _SUMMARY_EXPECTED_LEGACY_DIGEST,
+            "live_enabled_ids": [],
+            "live_non_paused_ids": [],
+            "source_observed": True,
+            "source_ids": list(_SUMMARY_EXPECTED_LEGACY_IDS),
+            "source_ids_digest": _SUMMARY_EXPECTED_LEGACY_DIGEST,
+            "source_live_converged": True,
+            "phase_expectation_met": True,
+        },
+        "blocked_cards_count": 0,
+        "duplicate_blocked_signature_count": 0,
+        "pending_grace_count": 0,
+        "schedule_totals": {
+            "configured": 0, "observed": 0, "paused": 0, "drifted": 0,
+            "pending": 0, "missed": 0,
+            "source_names": [], "live_keys": [], "paused_names": [], "drifted_names": [],
+        },
+        "global": {
+            "conductor_healthy": True, "running_count": 0, "paused_count": 0,
+            "success_count": 0, "failed_count": 0, "contention_count": 0,
+            "duplicate_count": 0, "stale_prerequisite_count": 0, "blocked_count": 0,
+            "cron_jobs_remaining": len(_SUMMARY_EXPECTED_LEGACY_IDS),
+            "schedule_count": 0, "schedule_paused_count": 0,
+            "pending_grace_count": 0, "missed_boundary_count": 0, "findings_count": 0,
+        },
+        "barrier": {"passed": False, "inventory_digest": "", "workflow_digest": "", "waves": 0},
+        "lanes": [],
+        "schedules": [],
+        "blocked_cards": [],
+        "pending_occurrences": [],
+        "findings": [],
+        "source": {
+            "api_base": "http://127.0.0.1:8080",
+            "ledger_dir": "/tmp/cc-home/state/cc_lanes",
+            "schedules_dir": "/tmp/cc-home/central-command/ORCHESTRATION/schedules",
+            "boards_root": "/tmp/cc-home/kanban/boards",
+            "cron_jobs_path": "/tmp/cc-home/cron/jobs.json",
+            "source_cron_jobs_path": "/tmp/cc-home/custom-setup/cron/jobs.json",
+            "summary_path": f"/tmp/cc-home/state/board-summaries/{slug}.json",
+        },
+    }
+
+
+def _summary_dir(home: Path) -> Path:
+    d = home / "state" / "board-summaries"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_summary(home: Path, payload: dict, slug: str = "default") -> Path:
+    p = _summary_dir(home) / f"{slug}.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def _get_summary(client, slug: str = "default"):
+    return client.get(f"/api/plugins/kanban/board-summary?board={slug}")
+
+
+def test_board_summary_missing_file_is_stable_404(client, kanban_home):
+    r = _get_summary(client)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "board summary not found"
+
+
+def test_board_summary_valid_file_returns_projection(client, kanban_home):
+    _write_summary(kanban_home, _valid_summary())
+    r = _get_summary(client)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["board"] == "default"
+    assert data["phase"] == "canary"
+    assert data["status"] == "monitoring"
+    assert data["stale"] is False
+    assert data["completed"] is False
+    assert data["cron_removal_authorized"] is False
+    assert data["counts"]["running_count"] == 0
+    assert data["counts"]["findings_count"] == 0
+    assert data["cron"]["jobs_remaining"] == len(_SUMMARY_EXPECTED_LEGACY_IDS)
+    assert data["schedule_totals"]["paused"] == 0
+    assert data["barrier"]["passed"] is False
+    assert data["lanes"] == []
+    assert data["schedules"] == []
+    assert data["findings"] == []
+    # The producer-side source block (local filesystem paths) must never leak.
+    assert "source" not in data
+    assert "/tmp/cc-home" not in r.text
+
+
+def _assert_summary_unavailable(r):
+    assert r.status_code == 503
+    assert r.json()["detail"] == "board summary unavailable"
+
+
+def test_board_summary_symlink_is_refused(client, kanban_home, tmp_path):
+    real = tmp_path / "outside.json"
+    real.write_text(json.dumps(_valid_summary()), encoding="utf-8")
+    (_summary_dir(kanban_home) / "default.json").symlink_to(real)
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_non_regular_file_is_refused(client, kanban_home):
+    os.mkfifo(_summary_dir(kanban_home) / "default.json")
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_oversized_file_is_refused(client, kanban_home):
+    padded = _valid_summary()
+    padded["findings"] = []
+    text = json.dumps(padded)
+    filler = "x" * (1_048_577 - len(text))
+    p = _summary_dir(kanban_home) / "default.json"
+    p.write_text(text[:-1] + f',"pad":"{filler}"' + "}", encoding="utf-8")
+    assert p.stat().st_size > 1_048_576
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_malformed_json_is_refused(client, kanban_home):
+    (_summary_dir(kanban_home) / "default.json").write_text("{not json", encoding="utf-8")
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_non_object_json_is_refused(client, kanban_home):
+    (_summary_dir(kanban_home) / "default.json").write_text(
+        json.dumps([_valid_summary()]), encoding="utf-8")
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def _lane(name: str, ts: str, running: tuple = (), failed: tuple = ()) -> dict:
+    running_ids, failed_ids = sorted(running), sorted(failed)
+    observed = sorted({*running_ids, *failed_ids})
+    return {
+        "name": name,
+        "observed_ids": observed,
+        "running_ids": running_ids, "running_count": len(running_ids),
+        "paused_ids": [], "paused_count": 0,
+        "success_ids": [], "terminal_successes": 0,
+        "failed_ids": failed_ids, "failed_count": len(failed_ids),
+        "contention_ids": [], "contention_count": 0,
+        "duplicate_ids": [], "duplicate_count": 0,
+        "stale_prerequisite_ids": [], "stale_prerequisite_count": 0,
+        "occurrences": [{"workflow_id": w, "started_at": ts} for w in observed],
+    }
+
+
+def _schedule(name: str, paused: bool = False) -> dict:
+    return {
+        "name": name, "cron_expression": "0 * * * *", "zone": "UTC", "paused": paused,
+        "workflow_name": name, "workflow_version": 1, "correlation_id": "cc-corr",
+        "task_to_domain": {}, "workflow_input": {}, "run_catchup_schedule_instances": None,
+        "start_time": None, "end_time": None, "overlap_policy": None,
+        "expected_minimum_occurrences": 0, "observed_count": 0,
+        "matched_workflow_ids": [], "unmatched_workflow_ids": [],
+        "pending_boundaries": [], "drift": [], "missed_boundaries": [],
+    }
+
+
+def _mut_version_v1(p): p["schema_version"] = 1
+def _mut_version_str(p): p["schema_version"] = "2"
+def _mut_version_bool(p): p["schema_version"] = True
+def _mut_version_unknown(p): p["schema_version"] = 3
+def _mut_board_mismatch(p): p["board_slug"] = "other-board"
+def _mut_bad_phase(p): p["phase"] = "rollout"
+def _mut_bad_status(p): p["status"] = "ok"
+def _mut_completed_contradiction(p): p["completed"] = True
+def _mut_authorized_contradiction(p): p["cron_removal_authorized"] = True
+def _mut_proof_digest_contradiction(p): p["pre_removal_proof_digest"] = "a" * 64
+def _mut_failed_without_findings(p): p["status"] = "failed"
+def _mut_global_count_lie(p): p["global"]["running_count"] = 5
+def _mut_count_wrong_type(p): p["global"]["running_count"] = "0"
+def _mut_count_bool(p): p["global"]["running_count"] = False
+def _mut_nonfinite(p): p["clean_elapsed_seconds"] = float("nan")
+def _mut_bad_timestamp(p): p["generated_at"] = "2026-09-12 10:00:00"
+def _mut_staleness_lie(p): p["staleness"]["fresh_for_seconds"] = 5
+
+
+def _mut_monitoring_with_findings(p):
+    p["findings"] = [{"severity": "error", "code": "x", "message": "boom", "evidence": {}}]
+    p["global"]["findings_count"] = 1
+
+
+def _mut_cron_count_lie(p):
+    p["cron_jobs_remaining"] = 2
+    p["global"]["cron_jobs_remaining"] = 2
+
+
+def _mut_cron_digest_lie(p): p["cron_inventory"]["live_ids_digest"] = "0" * 64
+
+
+def _mut_unknown_key(p): p["surprise"] = 1
+
+
+def _mut_missing_key(p): del p["barrier"]
+
+
+def _mut_duplicate_lane_workflow_ids(p):
+    ts = p["generated_at"]
+    p["lanes"] = [_lane("alpha", ts, running=("wf-1",)), _lane("beta", ts, running=("wf-1",))]
+    p["global"]["running_count"] = 2
+
+
+def _mut_lane_count_lie(p):
+    ts = p["generated_at"]
+    lane = _lane("alpha", ts, running=("wf-1",))
+    lane["running_count"] = 2
+    p["lanes"] = [lane]
+    p["global"]["running_count"] = 2
+
+
+def _mut_schedule_paused_lie(p):
+    p["schedule_totals"]["paused"] = 1
+    p["global"]["schedule_paused_count"] = 1
+
+
+def _mut_barrier_contradiction(p): p["barrier"]["passed"] = True
+
+
+_SUMMARY_VIOLATIONS = [
+    _mut_version_v1, _mut_version_str, _mut_version_bool, _mut_version_unknown,
+    _mut_board_mismatch, _mut_bad_phase, _mut_bad_status,
+    _mut_completed_contradiction, _mut_authorized_contradiction,
+    _mut_proof_digest_contradiction, _mut_failed_without_findings,
+    _mut_monitoring_with_findings, _mut_global_count_lie, _mut_count_wrong_type,
+    _mut_count_bool, _mut_nonfinite, _mut_bad_timestamp, _mut_staleness_lie,
+    _mut_cron_count_lie, _mut_cron_digest_lie, _mut_unknown_key, _mut_missing_key,
+    _mut_duplicate_lane_workflow_ids, _mut_lane_count_lie,
+    _mut_schedule_paused_lie, _mut_barrier_contradiction,
+]
+
+
+@pytest.mark.parametrize("mutate", _SUMMARY_VIOLATIONS, ids=lambda fn: fn.__name__[5:])
+def test_board_summary_contract_violation_is_refused(client, kanban_home, mutate):
+    payload = _valid_summary()
+    mutate(payload)
+    _write_summary(kanban_home, payload)
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_accepts_consistent_populated_payload(client, kanban_home):
+    p = _valid_summary()
+    ts = p["generated_at"]
+    p["lanes"] = [
+        _lane("alpha", ts, running=("wf-1",), failed=("wf-2",)),
+        _lane("beta", ts, running=("wf-3",)),
+    ]
+    p["schedules"] = [_schedule("hourly_sync", paused=True)]
+    p["schedule_totals"].update(
+        configured=1, paused=1, source_names=["hourly_sync"], paused_names=["hourly_sync"])
+    p["global"].update(
+        running_count=2, failed_count=1, schedule_count=1, schedule_paused_count=1,
+        findings_count=1)
+    p["findings"] = [{
+        "severity": "error", "code": "lane_failed",
+        "message": "lane alpha reported a failed workflow", "evidence": {}}]
+    p["status"] = "failed"  # failed requires findings; monitoring forbids them
+    _write_summary(kanban_home, p)
+    r = _get_summary(client)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["status"] == "failed"
+    assert data["counts"]["running_count"] == 2
+    assert data["counts"]["failed_count"] == 1
+    assert [lane["name"] for lane in data["lanes"]] == ["alpha", "beta"]
+    assert data["lanes"][0]["failed_count"] == 1
+    assert data["schedules"] == [{
+        "name": "hourly_sync", "paused": True, "cron_expression": "0 * * * *",
+        "zone": "UTC", "observed_count": 0, "missed_count": 0, "drifted": False}]
+    assert data["schedule_totals"]["paused"] == 1
+    assert data["findings_count"] == 1
+    assert data["findings"][0]["code"] == "lane_failed"
+    # Finding evidence and schedule correlation/input payloads stay private.
+    assert "evidence" not in data["findings"][0]
+    assert "correlation_id" not in data["schedules"][0]
+
+# Review regressions: exact published schema, strict JSON, authorization evidence,
+# and descriptor-walk confinement.
+
+def _mut_consistent_foreign_legacy_inventory(payload: dict) -> None:
+    ids = ["aaaaaaaaaaaa"]
+    digest = _summary_digest(ids)
+    cron = payload["cron_inventory"]
+    cron["expected_legacy_ids"] = ids
+    cron["expected_legacy_ids_digest"] = digest
+    cron["live_ids"] = ids
+    cron["live_ids_digest"] = digest
+    cron["source_ids"] = ids
+    cron["source_ids_digest"] = digest
+    payload["cron_jobs_remaining"] = 1
+    payload["global"]["cron_jobs_remaining"] = 1
+
+
+def _mut_schema_invalid_blocked_board(payload: dict) -> None:
+    payload["blocked_cards"] = [{
+        "board": "bad_slug",
+        "id": "t_bad",
+        "title": "bad board pattern",
+        "status": "blocked",
+        "created_at": 1,
+        "incident_id": None,
+    }]
+    payload["blocked_cards_count"] = 1
+    payload["global"]["blocked_count"] = 1
+
+
+def _mut_schema_invalid_source(payload: dict) -> None:
+    payload["source"]["api_base"] = "not-url"
+    payload["source"]["ledger_dir"] = "relative/path"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _mut_consistent_foreign_legacy_inventory,
+        _mut_schema_invalid_blocked_board,
+        _mut_schema_invalid_source,
+    ],
+    ids=lambda fn: fn.__name__[5:],
+)
+def test_board_summary_rejects_published_schema_violations(
+    client, kanban_home, mutate
+):
+    payload = _valid_summary()
+    mutate(payload)
+    _write_summary(kanban_home, payload)
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def _removal_ready_summary() -> dict:
+    payload = _valid_summary()
+    payload["phase"] = "pre_removal"
+    payload["status"] = "removal_ready"
+    payload["cron_removal_authorized"] = True
+    payload["clean_elapsed_seconds"] = 7200
+    payload["required_clean_seconds"] = 7200
+    payload["schedules"] = [_schedule("cc_backups")]
+    payload["schedule_totals"].update(
+        configured=1,
+        source_names=["cc_backups"],
+    )
+    payload["global"]["schedule_count"] = 1
+    payload["barrier"] = {
+        "passed": True,
+        "inventory_digest": "a" * 64,
+        "workflow_digest": "b" * 64,
+        "waves": 5,
+    }
+    return payload
+
+
+def _mut_unhealthy_authorization(payload: dict) -> None:
+    payload["engine"]["healthy"] = False
+    payload["global"]["conductor_healthy"] = False
+
+
+def _mut_failed_barrier_authorization(payload: dict) -> None:
+    payload["barrier"] = {
+        "passed": False,
+        "inventory_digest": "",
+        "workflow_digest": "",
+        "waves": 0,
+    }
+
+
+def _mut_short_clean_window_authorization(payload: dict) -> None:
+    payload["clean_elapsed_seconds"] = 7199
+
+
+def _mut_zero_required_window_authorization(payload: dict) -> None:
+    payload["required_clean_seconds"] = 0
+
+
+def _mut_missing_schedule_evidence(payload: dict) -> None:
+    payload["schedules"] = []
+    payload["schedule_totals"].update(configured=0, source_names=[])
+    payload["global"]["schedule_count"] = 0
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _mut_unhealthy_authorization,
+        _mut_failed_barrier_authorization,
+        _mut_short_clean_window_authorization,
+        _mut_zero_required_window_authorization,
+        _mut_missing_schedule_evidence,
+    ],
+    ids=lambda fn: fn.__name__[5:],
+)
+def test_board_summary_refuses_unproven_removal_authorization(
+    client, kanban_home, mutate
+):
+    payload = _removal_ready_summary()
+    mutate(payload)
+    _write_summary(kanban_home, payload)
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_accepts_proven_removal_authorization(client, kanban_home):
+    _write_summary(kanban_home, _removal_ready_summary())
+    response = _get_summary(client)
+    assert response.status_code == 200, response.text
+    assert response.json()["cron_removal_authorized"] is True
+
+
+def test_board_summary_deep_json_is_stable_503(client, kanban_home):
+    path = _summary_dir(kanban_home) / "default.json"
+    path.write_bytes(b"[" * 1500 + b"]" * 1500)
+    with TestClient(client.app, raise_server_exceptions=False) as contained:
+        _assert_summary_unavailable(_get_summary(contained))
+
+
+def test_board_summary_maps_recursion_error_to_stable_unavailable(
+    client, kanban_home, monkeypatch
+):
+    _write_summary(kanban_home, _valid_summary())
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    def recursive_decode(*_args, **_kwargs):
+        raise RecursionError("adversarial nesting")
+
+    monkeypatch.setattr(plugin.json, "loads", recursive_decode)
+    response = _get_summary(client)
+    assert response.status_code == 503
+    assert response.content == b'{"detail":"board summary unavailable"}'
+
+
+def test_board_summary_rejects_duplicate_json_members(client, kanban_home):
+    raw = json.dumps(_valid_summary())
+    raw = raw.replace(
+        '"schema_version": 2',
+        '"schema_version": 1, "schema_version": 2',
+        1,
+    )
+    (_summary_dir(kanban_home) / "default.json").write_text(raw, encoding="utf-8")
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_rejects_nested_numeric_overflow(client, kanban_home):
+    payload = _valid_summary()
+    payload["status"] = "failed"
+    payload["findings"] = [{
+        "severity": "error",
+        "code": "overflow",
+        "message": "nested evidence",
+        "evidence": {},
+    }]
+    payload["global"]["findings_count"] = 1
+    raw = json.dumps(payload).replace(
+        '"evidence": {}',
+        '"evidence": {"overflow": 1e309}',
+        1,
+    )
+    (_summary_dir(kanban_home) / "default.json").write_text(raw, encoding="utf-8")
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_symlinked_state_ancestor_is_refused(
+    client, kanban_home, tmp_path
+):
+    outside_state = tmp_path / "outside-state"
+    outside_summary = outside_state / "board-summaries"
+    outside_summary.mkdir(parents=True)
+    (outside_summary / "default.json").write_text(
+        json.dumps(_valid_summary()),
+        encoding="utf-8",
+    )
+    (kanban_home / "state").symlink_to(outside_state, target_is_directory=True)
+
+    _assert_summary_unavailable(_get_summary(client))
+
+
+def test_board_summary_detects_in_place_mutation_during_read(
+    client, kanban_home, monkeypatch
+):
+    payload = _valid_summary()
+    payload["status"] = "failed"
+    payload["findings"] = [{
+        "severity": "error",
+        "code": "large_evidence",
+        "message": "large evidence",
+        "evidence": {"blob": "x" * 70000},
+    }]
+    payload["global"]["findings_count"] = 1
+    path = _write_summary(kanban_home, payload)
+    real_read = os.read
+    mutated = False
+
+    def racing_read(fd: int, count: int) -> bytes:
+        nonlocal mutated
+        chunk = real_read(fd, count)
+        if chunk and not mutated:
+            mutated = True
+            data = path.read_bytes()
+            position = data.rfind(b"xxxxxxxxxx")
+            assert position > 65536
+            with path.open("r+b", buffering=0) as stream:
+                stream.seek(position)
+                stream.write(b"y")
+                os.fsync(stream.fileno())
+        return chunk
+
+    monkeypatch.setattr(os, "read", racing_read)
+    _assert_summary_unavailable(_get_summary(client))
+
