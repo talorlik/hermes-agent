@@ -127,6 +127,46 @@ def _oneshot_args(**overrides) -> Namespace:
     return Namespace(**base)
 
 
+def _run_full_parser_main(monkeypatch, parser, subparsers, argv, calls) -> None:
+    import hermes_cli.config as config_mod
+    import hermes_cli.update_cmd_fleet as fleet_mod
+
+    monkeypatch.setattr(sys, "argv", ["hermes", *argv])
+    monkeypatch.setattr(main_mod, "_build_cli_parser", lambda: (parser, subparsers))
+    for name in (
+        "_set_process_title",
+        "_advertise_agent_env",
+        "_cleanup_quarantined_exes",
+        "_sweep_stale_bytecode_if_checkout_changed",
+        "_recover_from_interrupted_install",
+    ):
+        monkeypatch.setattr(main_mod, name, lambda: None)
+    for name in (
+        "_try_termux_fast_tui_launch",
+        "_try_termux_fast_cli_launch",
+        "_try_fast_serve_launch",
+        "_try_fast_chat_launch",
+    ):
+        monkeypatch.setattr(main_mod, name, lambda: False)
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(
+        fleet_mod,
+        "_warn_pending_fleet_restart_on_startup",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_prepare_agent_startup",
+        lambda _args: calls.append("startup"),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_run_oneshot_from_args",
+        lambda _args: calls.append("oneshot"),
+    )
+    main_mod._main_impl()
+
+
 def test_prepare_agent_startup_skips_all_discovery_for_oneshot_none(monkeypatch):
     calls = _spy_startup_surfaces(monkeypatch)
     main_mod._prepare_agent_startup(_oneshot_args(toolsets="none"))
@@ -987,6 +1027,51 @@ class TestColdImportGuardLease:
         # Import lease restored at successful module-import completion.
         assert _single(events, "import-done")["guard"] is None
 
+    def test_every_parser_accepted_builtin_tail_has_zero_cold_activation(
+        self, tmp_path
+    ):
+        import contextlib
+        import io
+
+        from hermes_cli._parser import BUILTIN_COMMAND_TOKENS
+
+        catalog = BUILTIN_COMMAND_TOKENS
+        parser, subparsers = main_mod._build_cli_parser()
+        assert set(catalog) == set(subparsers.choices)
+
+        accepted: list[str] = []
+        sink = io.StringIO()
+        for command in sorted(catalog):
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                try:
+                    parser.parse_args(["-z", "prompt", "-t", "none", command])
+                except SystemExit:
+                    continue
+            accepted.append(command)
+
+        assert accepted
+        failures = []
+        for command in accepted:
+            proc, events = _run_cold_start(
+                tmp_path,
+                ["-z", "prompt", "-t", "none", command],
+                mode="import",
+            )
+            unguarded = [
+                event for event in _obs_events(events) if event["guard"] != "1"
+            ]
+            if proc.returncode != 0 or unguarded or _capability_events(events):
+                failures.append((
+                    command,
+                    proc.returncode,
+                    unguarded,
+                    events,
+                    proc.stderr,
+                ))
+            elif _single(events, "import-done")["guard"] is not None:
+                failures.append((command, "lease-not-restored", events))
+        assert failures == []
+
     @pytest.mark.parametrize("session_flag", ["-c", "-r"])
     def test_multiword_session_name_guards_every_startup_read(
         self, tmp_path, session_flag
@@ -1211,6 +1296,175 @@ class TestColdMainDispatchGuard:
         )
 
 
+class TestTopLevelOneShotSubcommandPolicy:
+    @pytest.mark.parametrize("command", ["logs", "status"])
+    def test_builtin_subcommand_is_rejected_before_oneshot_dispatch(
+        self, monkeypatch, command, capsys
+    ):
+        calls: list[str] = []
+        parser, subparsers = main_mod._build_cli_parser()
+        subparsers.choices[command].set_defaults(
+            func=lambda _args: calls.append("command")
+        )
+        argv = ["-z", "prompt", "-t", "none", command]
+
+        parsed = parser.parse_args(argv)
+        assert parsed.command == command
+        assert parsed.oneshot == "prompt"
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_full_parser_main(
+                monkeypatch,
+                parser,
+                subparsers,
+                argv,
+                calls,
+            )
+
+        assert exc_info.value.code == 2
+        assert (
+            "cannot be combined with a non-chat subcommand" in capsys.readouterr().err
+        )
+        assert calls == []
+
+    def test_plugin_subcommand_override_is_rejected_before_oneshot_dispatch(
+        self, monkeypatch, capsys
+    ):
+        calls: list[str] = []
+
+        def _register(subparsers) -> None:
+            plugin_parser = subparsers.add_parser("opaque-plugin")
+            plugin_parser.set_defaults(
+                command="opaque-plugin",
+                toolsets="web",
+                func=lambda _args: calls.append("command"),
+            )
+
+        monkeypatch.setattr(main_mod, "_register_plugin_cli_commands", _register)
+        parser, subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "opaque-plugin"]
+
+        parsed = parser.parse_args(argv)
+        assert parsed.command == "opaque-plugin"
+        assert parsed.oneshot == "prompt"
+        assert parsed.toolsets == "web"
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is True
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_full_parser_main(
+                monkeypatch,
+                parser,
+                subparsers,
+                argv,
+                calls,
+            )
+
+        assert exc_info.value.code == 2
+        assert (
+            "cannot be combined with a non-chat subcommand" in capsys.readouterr().err
+        )
+        assert calls == []
+
+    def test_plugin_local_oneshot_default_cannot_hide_top_level_oneshot(
+        self, monkeypatch, capsys
+    ):
+        calls: list[str] = []
+
+        def _register(subparsers) -> None:
+            plugin_parser = subparsers.add_parser("opaque-plugin")
+            plugin_parser.add_argument("-z", "--oneshot", default=None)
+            plugin_parser.set_defaults(func=lambda _args: calls.append("command"))
+
+        monkeypatch.setattr(main_mod, "_register_plugin_cli_commands", _register)
+        parser, subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "opaque-plugin"]
+
+        parsed = parser.parse_args(argv)
+        assert parsed.command == "opaque-plugin"
+        assert parsed.oneshot is None
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_full_parser_main(
+                monkeypatch,
+                parser,
+                subparsers,
+                argv,
+                calls,
+            )
+
+        assert exc_info.value.code == 2
+        assert (
+            "cannot be combined with a non-chat subcommand" in capsys.readouterr().err
+        )
+        assert calls == []
+
+        plugin_local_argv = ["opaque-plugin", "-z", "plugin-prompt"]
+        plugin_local_args = parser.parse_args(plugin_local_argv)
+        assert plugin_local_args.oneshot == "plugin-prompt"
+        main_mod._reject_non_chat_oneshot(parser, plugin_local_argv)
+
+    def test_plugin_command_default_cannot_disguise_non_chat_command(
+        self, monkeypatch, capsys
+    ):
+        calls: list[str] = []
+
+        def _register(subparsers) -> None:
+            plugin_parser = subparsers.add_parser("opaque-plugin")
+            plugin_parser.set_defaults(
+                command="chat",
+                func=lambda _args: calls.append("command"),
+            )
+
+        monkeypatch.setattr(main_mod, "_register_plugin_cli_commands", _register)
+        parser, subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "opaque-plugin"]
+
+        parsed = parser.parse_args(argv)
+        assert parsed.command == "chat"
+        assert parsed.oneshot == "prompt"
+
+        with pytest.raises(SystemExit) as exc_info:
+            _run_full_parser_main(
+                monkeypatch,
+                parser,
+                subparsers,
+                argv,
+                calls,
+            )
+
+        assert exc_info.value.code == 2
+        assert (
+            "cannot be combined with a non-chat subcommand" in capsys.readouterr().err
+        )
+        assert calls == []
+
+    def test_termux_fast_cli_defers_plugin_local_oneshot(self, monkeypatch):
+        monkeypatch.setattr(
+            main_mod,
+            "_is_termux_startup_environment",
+            lambda: True,
+        )
+        monkeypatch.delenv("HERMES_TERMUX_DISABLE_FAST_CLI", raising=False)
+        monkeypatch.setattr(main_mod, "_wants_tui_early", lambda _argv: False)
+        monkeypatch.setattr(
+            main_mod._startup_fast,
+            "is_termux_fast_version_argv",
+            lambda _argv: False,
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_light_chat_parser",
+            lambda: pytest.fail("plugin-local one-shot must reach full parsing"),
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["hermes", "opaque-plugin", "-z", "plugin-prompt"],
+        )
+
+        assert main_mod._try_termux_fast_cli_launch() is False
+
+
 class TestRawArgvPreflightClassifier:
     """The stdlib-only raw argv classifier: only the top-level value-taking
     -z/--oneshot surface with an effective -t/--toolsets value that is
@@ -1294,14 +1548,11 @@ class TestRawArgvPreflightClassifier:
             ["-z", "hi", "--tools", "none", "--to", "web"],
             ["--one=hi"],
             ["--one=hi", "--", "--tools=none"],
-            # Parser differential: an unknown or ambiguous long option
-            # anywhere in the top-level region makes argparse reject the
-            # whole argv with a usage error, so the classifier must refuse
-            # the guard immediately — even around an otherwise valid
-            # exact-none pair (the 41-mismatch reviewer classes).
+            # An unresolved option before the exact-none pair cannot establish
+            # semantic proof. Rejected tokens after the pair may be treated as
+            # an opaque command tail by the conservative guard.
             ["--t=x", "--oneshot=hi", "--toolsets=none"],
             ["--oneshot=hi", "--t=x", "--toolsets=none"],
-            ["--oneshot=hi", "--toolsets=none", "--t=x"],
             ["--t", "--oneshot=hi", "--toolsets=none"],
             ["-z", "hi", "--t", "--toolsets", "none"],
             ["--i", "--oneshot=hi", "--toolsets=none"],
@@ -1309,7 +1560,6 @@ class TestRawArgvPreflightClassifier:
             ["--frobnicate", "--oneshot=hi", "--toolsets=none"],
             ["--frobnicate=x", "--oneshot=hi", "--toolsets=none"],
             ["--oneshot=hi", "--frobnicate=x", "--toolsets=none"],
-            ["--oneshot=hi", "--toolsets=none", "--frobnicate=x"],
             # Boolean long options never accept an inline value — argparse
             # rejects them with "ignored explicit argument".
             ["--safe-mode=1", "-z", "hi", "-t", "none"],
@@ -1331,6 +1581,128 @@ class TestRawArgvPreflightClassifier:
     )
     def test_non_guarding_argv(self, argv):
         assert main_mod._raw_oneshot_no_tools_preflight(argv) is False
+
+    def test_every_full_parser_accepted_builtin_tail_guards(self):
+        import contextlib
+        import io
+
+        parser, subparsers = main_mod._build_cli_parser()
+        accepted: list[str] = []
+        sink = io.StringIO()
+        for command in sorted(subparsers.choices):
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                try:
+                    parser.parse_args(["-z", "prompt", "-t", "none", command])
+                except SystemExit:
+                    continue
+            accepted.append(command)
+
+        missed = [
+            command
+            for command in accepted
+            if not main_mod._raw_oneshot_no_tools_preflight([
+                "-z",
+                "prompt",
+                "-t",
+                "none",
+                command,
+            ])
+        ]
+        assert missed == []
+
+    def test_rejected_required_argument_tail_may_guard(self, monkeypatch):
+        parser, _subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "import"]
+
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args(argv)
+        assert exc_info.value.code == 2
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is True
+
+        monkeypatch.setenv(_GUARD_ENV, "prior-value")
+        lease = main_mod._acquire_explicit_no_tools_lease(argv)
+        assert os.environ[_GUARD_ENV] == "1"
+        main_mod._restore_explicit_no_tools_lease(lease)
+        assert os.environ[_GUARD_ENV] == "prior-value"
+
+    def test_valid_import_tail_guards(self):
+        parser, _subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "import", "backup.zip"]
+
+        args = parser.parse_args(argv)
+        assert args.command == "import"
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is True
+
+    def test_opaque_plugin_tail_guards_without_plugin_registration(self, monkeypatch):
+        registrations: list[str] = []
+
+        def _register(subparsers):
+            registrations.append("opaque-plugin")
+            subparsers.add_parser("opaque-plugin")
+
+        monkeypatch.setattr(main_mod, "_register_plugin_cli_commands", _register)
+        parser, _subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "opaque-plugin", "--plugin-option"]
+        args, unknown = parser.parse_known_args(argv)
+        assert args.command == "opaque-plugin"
+        assert unknown == ["--plugin-option"]
+
+        registrations.clear()
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is True
+        assert registrations == []
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["-z", "prompt", "-t", "none", "-t", "web", "opaque-plugin"], False),
+            (["-z", "prompt", "-t", "web", "-t", "none", "opaque-plugin"], True),
+            (["--o=prompt", "--tools=web", "--tools=none", "opaque-plugin"], True),
+            (
+                ["--o", "prompt", "--tools", "none", "--tools", "web", "opaque-plugin"],
+                False,
+            ),
+            (["-zprompt", "-tweb", "-tnone", "opaque-plugin"], True),
+            (["-zprompt", "-tnone", "-tweb", "opaque-plugin"], False),
+        ],
+    )
+    def test_last_top_level_toolsets_value_wins_before_opaque_tail(
+        self, argv, expected
+    ):
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is expected
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["-z", "prompt", "-t", "web", "chat", "-t", "none"], True),
+            (["-z", "prompt", "-t", "none", "chat", "-t", "web"], False),
+            (["chat", "--oneshot", "-t", "none"], False),
+        ],
+    )
+    def test_chat_local_toolsets_override_top_level_value(self, argv, expected):
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is expected
+
+    @pytest.mark.parametrize(
+        ("argv", "expected"),
+        [
+            (["--o", "prompt", "--to", "none", "opaque-plugin"], True),
+            (["--t=none", "-z", "prompt", "-t", "none"], False),
+            (["--safe-mode=1", "-z", "prompt", "-t", "none"], False),
+            (["-z", "prompt", "-t", "none", "--", "-t", "web"], True),
+            (["-z", "prompt", "--", "-t", "none"], False),
+            (["--", "-z", "prompt", "-t", "none"], False),
+        ],
+    )
+    def test_abbreviation_and_terminator_boundaries(self, argv, expected):
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is expected
+
+    def test_send_local_t_is_not_a_global_toolsets_override(self):
+        parser, _subparsers = main_mod._build_cli_parser()
+        argv = ["-z", "prompt", "-t", "none", "send", "-t", "web", "message"]
+
+        args = parser.parse_args(argv)
+        assert args.toolsets == "none"
+        assert args.to == "web"
+        assert main_mod._raw_oneshot_no_tools_preflight(argv) is True
 
     def test_profile_resolution_matches_existing_and_missing_profiles(
         self, tmp_path, monkeypatch
@@ -1514,18 +1886,15 @@ class TestRawArgvPreflightClassifier:
 
 
 class TestPreflightArgparseDifferential:
-    """Strict parser differential between the raw classifier and the
-    authoritative top-level argparse parser, reproducing the reviewer's
-    mismatch classes: ambiguous or unknown long options (inline and bare)
-    before, between, and after an otherwise valid exact-none pair.
+    """One-way soundness differential against authoritative argparse.
 
     Invariants:
-    - classifier True  => argparse accepts the argv AND binds a truthy
-      -z/--oneshot with effective --toolsets exactly ``none``;
-    - argparse rejects => classifier False (the guard is never claimed
-      for an argv that dies with a usage error);
     - argparse accepts an exact-none oneshot => classifier True (zero
       activation stays decidable from raw argv).
+    - argparse accepts a non-none invocation => classifier False.
+
+    Rejected argv may be guarded. The lease suppresses capability activation
+    only until authoritative parsing emits its usage error.
     """
 
     _NONE_PAIRS = [
@@ -1585,10 +1954,6 @@ class TestPreflightArgparseDifferential:
             claimed = main_mod._raw_oneshot_no_tools_preflight(list(argv))
             args = authoritative(argv)
             if args is None:
-                if claimed:
-                    mismatches.append(
-                        (argv, "guard claimed for argparse-rejected argv")
-                    )
                 continue
             exact_none = (
                 bool(getattr(args, "oneshot", None))

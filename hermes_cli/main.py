@@ -28,104 +28,18 @@ import os
 import re
 import sys
 
+from hermes_cli._parser import (
+    BUILTIN_COMMAND_TOKENS,
+    build_top_level_parser,
+    coalesce_session_name_args as _coalesce_session_name_args,
+    first_positional_index,
+    project_no_tools_preflight_argv,
+)
+
 # Import-time no-tools lease. The real parser is stdlib-only, so classification
 # can match current argparse behavior without copying its option surface.
 _EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
 _TOOLSETS_NONE_SENTINEL_RAW = "none"
-_CLI_SUBCOMMANDS = frozenset(
-    {
-        "chat", "model", "gateway", "setup", "whatsapp", "whatsapp-cloud",
-        "login", "logout", "auth", "status", "cron", "doctor", "config",
-        "pairing", "skills", "tools", "mcp", "sessions", "insights", "update",
-        "uninstall", "profile", "dashboard", "serve", "desktop", "gui", "honcho",
-        "claw", "plugins", "security", "acp", "webhook", "peer", "memory", "dump",
-        "debug", "backup", "import", "completion", "logs",
-    }
-)
-_SESSION_NAME_FLAGS = frozenset({"-c", "--continue", "-r", "--resume"})
-
-
-def _coalesce_session_name_args(argv: list) -> list:
-    """Join unquoted multi-word values for continue/resume before parsing."""
-    result = []
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token in _SESSION_NAME_FLAGS:
-            result.append(token)
-            index += 1
-            parts: list = []
-            while (
-                index < len(argv)
-                and not argv[index].startswith("-")
-                and argv[index] not in _CLI_SUBCOMMANDS
-            ):
-                parts.append(argv[index])
-                index += 1
-            if parts:
-                result.append(" ".join(parts))
-        else:
-            result.append(token)
-            index += 1
-    return result
-
-
-def _preflight_subcommand_index(argv: list[str], parser) -> int | None:
-    """Locate the first positional using the live argparse option surface."""
-    actions = parser._option_string_actions
-    long_options = tuple(option for option in actions if option.startswith("--"))
-
-    def _resolve_long(name: str):
-        if name in actions:
-            return actions[name]
-        matches = [option for option in long_options if option.startswith(name)]
-        if len(matches) != 1:
-            return None
-        return actions[matches[0]]
-
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--":
-            return index + 1 if index + 1 < len(argv) else None
-        if not token.startswith("-") or token == "-":
-            return index
-        if token.startswith("--"):
-            name, separator, _inline = token.partition("=")
-            action = _resolve_long(name)
-            if action is None:
-                return index
-            if separator:
-                if action.nargs == 0:
-                    return index
-                index += 1
-                continue
-            if action.nargs == 0:
-                index += 1
-                continue
-            if action.nargs == "?":
-                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
-                    index += 2
-                else:
-                    index += 1
-                continue
-            index += 2
-            continue
-
-        body = token[1:]
-        consumed_following = False
-        for offset, char in enumerate(body):
-            action = actions.get(f"-{char}")
-            if action is None:
-                return index
-            if action.nargs == 0:
-                continue
-            if not body[offset + 1 :] and index + 1 < len(argv):
-                if action.nargs != "?" or not argv[index + 1].startswith("-"):
-                    consumed_following = True
-            break
-        index += 2 if consumed_following else 1
-    return None
 
 
 def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
@@ -251,13 +165,7 @@ def _raw_oneshot_no_tools_preflight(argv: "list[str]") -> bool:
                 return False
 
     parser = build_top_level_parser()[0]
-    subcommand_index = _preflight_subcommand_index(cleaned, parser)
-    if (
-        subcommand_index is not None
-        and cleaned[subcommand_index] in _CLI_SUBCOMMANDS
-        and cleaned[subcommand_index] != "chat"
-    ):
-        cleaned = cleaned[:subcommand_index]
+    cleaned = project_no_tools_preflight_argv(cleaned, parser)
 
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
@@ -2893,40 +2801,10 @@ def cmd_console(args):
     return run_console_repl()
 
 
-# Top-level subcommands known WITHOUT plugin discovery (which costs 500ms+ of
-# eager plugin imports). Keep in sync with the add_parser calls in
-# _build_cli_parser: a missing entry only costs a one-time discovery; an extra
-# entry would let a plugin command silently fail to parse.
-_BUILTIN_SUBCOMMANDS = frozenset(
-    {
-        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
-        "computer-use",
-        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
-        "journey", "memory-graph", "learning",
-        "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
-        "project", "proxy",
-        "prompt-size",
-        "resume",
-        "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
-        "vault",
-        "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
-        "browser",
-        "verify",
-        # Plugin commands missing from top-level --help is an accepted trade-off.
-        "help",
-    }
-)
-
-
 def _first_positional_argv() -> str | None:
     """Return the first top-level positional using the live argparse surface."""
-    from hermes_cli._parser import build_top_level_parser
-
     argv = sys.argv[1:]
-    index = _preflight_subcommand_index(argv, build_top_level_parser()[0])
+    index = first_positional_index(argv, build_top_level_parser()[0])
     return argv[index] if index is not None else None
 
 
@@ -2938,7 +2816,7 @@ def _plugin_cli_discovery_needed() -> bool:
     discovery is needed; for a prompt its cost amortizes over the agent run.
     """
     first = _first_positional_argv()  # None = bare ``hermes`` → chat
-    return first is not None and first not in _BUILTIN_SUBCOMMANDS
+    return first is not None and first not in BUILTIN_COMMAND_TOKENS
 
 
 def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
@@ -3329,11 +3207,7 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     first = _first_positional_argv()
-    has_oneshot = any(
-        arg == "-z" or arg == "--oneshot" or arg.startswith("--oneshot=")
-        for arg in argv
-    )
-    if not has_oneshot and first not in {None, "chat"}:
+    if first not in {None, "chat"}:
         return False
 
     parser = _light_chat_parser()
@@ -3616,6 +3490,20 @@ def _parse_cli_args(parser, subparsers, argv):
     return args
 
 
+def _reject_non_chat_oneshot(parser, argv: list[str]) -> None:
+    """Reject a raw top-level one-shot option followed by a non-chat command."""
+    processed_argv = _coalesce_session_name_args(argv)
+    policy_parser = build_top_level_parser()[0]
+    command_index = first_positional_index(processed_argv, policy_parser)
+    if command_index is None or processed_argv[command_index] == "chat":
+        return
+
+    top_level_argv = project_no_tools_preflight_argv(processed_argv, policy_parser)
+    top_level_args = policy_parser.parse_args(top_level_argv)
+    if top_level_args.oneshot is not None:
+        parser.error("-z/--oneshot cannot be combined with a non-chat subcommand")
+
+
 def _default_to_chat(args) -> None:
     """No subcommand given: run chat."""
     _promote_top_level_resume(args)
@@ -3697,6 +3585,7 @@ def _main_impl():
         sys.exit(1)  # unreachable: execvp replaces the process or raises
 
     args = _parse_cli_args(parser, subparsers, sys.argv[1:])
+    _reject_non_chat_oneshot(parser, sys.argv[1:])
 
     if args.version:
         cmd_version(args)

@@ -8,6 +8,86 @@ gateway, sessions, …) is built by ``hermes_cli/subcommands/<group>.py`` and wi
 import argparse
 from functools import lru_cache
 
+# Capability-free catalog shared by startup routing and session-name
+# normalization. The behavioral parity test compares this with the full
+# parser's root choices, including aliases.
+BUILTIN_COMMAND_TOKENS: frozenset[str] = frozenset({
+    "acp",
+    "approvals",
+    "auth",
+    "backup",
+    "browser",
+    "bundles",
+    "chat",
+    "checkpoints",
+    "claw",
+    "completion",
+    "computer-use",
+    "config",
+    "console",
+    "cron",
+    "curator",
+    "dashboard",
+    "debug",
+    "desktop",
+    "doctor",
+    "dump",
+    "egress",
+    "fallback",
+    "gateway",
+    "gui",
+    "hooks",
+    "import",
+    "import-agent",
+    "insights",
+    "journey",
+    "kanban",
+    "learning",
+    "login",
+    "logout",
+    "logs",
+    "lsp",
+    "mcp",
+    "memory",
+    "memory-graph",
+    "migrate",
+    "moa",
+    "model",
+    "monitoring",
+    "pairing",
+    "pause",
+    "peer",
+    "pets",
+    "plugins",
+    "portal",
+    "profile",
+    "project",
+    "prompt-size",
+    "proxy",
+    "resume",
+    "secrets",
+    "security",
+    "send",
+    "serve",
+    "sessions",
+    "setup",
+    "skills",
+    "skin",
+    "slack",
+    "status",
+    "sync",
+    "tools",
+    "uninstall",
+    "update",
+    "vault",
+    "verify",
+    "webhook",
+    "whatsapp",
+    "whatsapp-cloud",
+    "worktree",
+})
+_SESSION_NAME_FLAGS = frozenset({"-c", "--continue", "-r", "--resume"})
+
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before argparse runs
 # (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``), so it isn't on the parser.
 # Listed here so all "carry over on relaunch" metadata lives in one file.
@@ -48,6 +128,108 @@ def top_level_value_flag_sets() -> tuple[frozenset[str], frozenset[str]]:
         return frozenset(required), frozenset(optional)
     except Exception:
         return _VALUE_FLAGS_FALLBACK, _OPTIONAL_VALUE_FLAGS_FALLBACK
+
+
+def coalesce_session_name_args(argv: list[str]) -> list[str]:
+    """Join unquoted multi-word continue/resume values before parsing."""
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token not in _SESSION_NAME_FLAGS:
+            result.append(token)
+            index += 1
+            continue
+
+        result.append(token)
+        index += 1
+        parts: list[str] = []
+        while (
+            index < len(argv)
+            and not argv[index].startswith("-")
+            and argv[index] not in BUILTIN_COMMAND_TOKENS
+        ):
+            parts.append(argv[index])
+            index += 1
+        if parts:
+            result.append(" ".join(parts))
+    return result
+
+
+def first_positional_index(
+    argv: list[str], parser: argparse.ArgumentParser | None = None
+) -> int | None:
+    """Locate the first positional using the live top-level option actions."""
+    parser = parser or build_top_level_parser()[0]
+    actions = parser._option_string_actions
+    long_options = tuple(option for option in actions if option.startswith("--"))
+
+    def resolve_long(name: str) -> argparse.Action | None:
+        if name in actions:
+            return actions[name]
+        matches = [option for option in long_options if option.startswith(name)]
+        if len(matches) != 1:
+            return None
+        return actions[matches[0]]
+
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return index + 1 if index + 1 < len(argv) else None
+        if not token.startswith("-") or token == "-":
+            return index
+        if token.startswith("--"):
+            name, separator, _inline = token.partition("=")
+            action = resolve_long(name)
+            if action is None or (separator and action.nargs == 0):
+                return index
+            if separator or action.nargs == 0:
+                index += 1
+                continue
+            if action.nargs == "?":
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    index += 2
+                else:
+                    index += 1
+                continue
+            index += 2
+            continue
+
+        body = token[1:]
+        consumed_following = False
+        for offset, char in enumerate(body):
+            action = actions.get(f"-{char}")
+            if action is None:
+                return index
+            if action.nargs == 0:
+                continue
+            if not body[offset + 1 :] and index + 1 < len(argv):
+                if action.nargs != "?" or not argv[index + 1].startswith("-"):
+                    consumed_following = True
+            break
+        index += 2 if consumed_following else 1
+    return None
+
+
+def project_no_tools_preflight_argv(
+    argv: list[str], parser: argparse.ArgumentParser | None = None
+) -> list[str]:
+    """Project argv onto the capability-free top-level or chat grammar.
+
+    Chat is retained because its local toolset option overrides the top-level
+    destination. Every other first positional begins an opaque tail whose
+    grammar must not be discovered during import-time classification.
+    """
+    parser = parser or build_top_level_parser()[0]
+    positional_index = first_positional_index(argv, parser)
+    if positional_index is None:
+        return list(argv)
+    if positional_index > 0 and argv[positional_index - 1] == "--":
+        return list(argv[: positional_index - 1])
+    if argv[positional_index] == "chat":
+        return list(argv)
+    return list(argv[:positional_index])
 
 
 def _inherited_flag(parser, *args, **kwargs):
