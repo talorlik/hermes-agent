@@ -565,9 +565,10 @@ def finalize_detached_run(
 ) -> Optional[Dict[str, Any]]:
     """RUN_SUCCEEDED / RUN_FAILED from the detached worker, keyed by run id.
 
-    Writes only the detached terminal report — the originating execution
-    stays nonterminal until :func:`reconcile_detached_runs` converts it, so
-    the scheduler is the single writer of execution terminal states.
+    Writes the detached terminal report while the originating execution stays
+    nonterminal until :func:`reconcile_detached_runs` converts it. If the
+    scheduler has already terminalized the execution, only detached bookkeeping
+    changes; scheduler-owned result evidence remains immutable.
     """
     detached_status = "succeeded" if success else "failed"
     detail = None
@@ -575,9 +576,7 @@ def finalize_detached_run(
         # Worker-supplied failure evidence is force-redacted before it
         # persists: detached workers commonly echo command lines and env
         # fragments that can carry credentials.
-        detail = _sanitize_delivery_error(
-            str(error) if error else "unknown failure"
-        )
+        detail = _sanitize_delivery_error(str(error) if error else "unknown failure")
     with _transaction() as conn:
         matches = conn.execute(
             "SELECT id, detached_status FROM executions WHERE detached_run_id=? "
@@ -589,7 +588,12 @@ def finalize_detached_run(
         execution_id = str(matches[0]["id"])
         cur = conn.execute(
             """UPDATE executions
-               SET detached_status=?, error=COALESCE(?, error)
+               SET detached_status=?,
+                   error=CASE
+                     WHEN status IN ('claimed','running')
+                     THEN COALESCE(?, error)
+                     ELSE error
+                   END
                WHERE id=? AND detached_run_id=? AND detached_status='started'
                  AND NOT EXISTS (
                    SELECT 1 FROM executions AS other

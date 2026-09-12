@@ -167,6 +167,67 @@ def test_finalize_failed_then_reconcile_is_visible_permanent_failure(
     assert I.count_incidents() == 1
 
 
+@pytest.mark.parametrize(
+    (
+        "scheduler_success",
+        "scheduler_error",
+        "worker_success",
+        "worker_error",
+        "detached_status",
+    ),
+    [
+        pytest.param(True, None, True, None, "succeeded", id="late-success"),
+        pytest.param(
+            False,
+            "authoritative scheduler failure",
+            False,
+            "late worker failure",
+            "failed",
+            id="late-failure",
+        ),
+    ],
+)
+def test_late_detached_finalization_preserves_scheduler_terminal_evidence(
+    ledger,
+    scheduler_success,
+    scheduler_error,
+    worker_success,
+    worker_error,
+    detached_status,
+):
+    row = ledger.create_execution("job-late", source="builtin")
+    ledger.mark_execution_running(row["id"])
+    registered = ledger.register_detached_run(row["id"], run_id="corr-late")
+    ledger.finish_execution(
+        row["id"],
+        success=scheduler_success,
+        error=scheduler_error,
+        delivery_outcome="authoritative delivery outcome",
+        outcome="authoritative scheduler outcome",
+        occurrence_key="authoritative occurrence",
+    )
+    ledger.record_delivery(
+        row["id"],
+        target="authoritative target",
+        status="authoritative delivery status",
+        error="authoritative delivery error",
+    )
+    before = ledger.get_execution(row["id"])
+
+    finalized = ledger.finalize_detached_run(
+        registered["detached_run_id"],
+        success=worker_success,
+        error=worker_error,
+    )
+
+    after = ledger.get_execution(row["id"])
+    assert finalized == after
+    assert after["detached_status"] == detached_status
+    assert {key: value for key, value in after.items() if key != "detached_status"} == {
+        key: value for key, value in before.items() if key != "detached_status"
+    }
+
+
 def test_expired_lease_without_report_reconciles_as_lost_failure(ledger):
     from cron import incidents as I
 
