@@ -57,7 +57,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: 8eea1996c0f3337f8779343d1f85e4b83df368bd, 917c7b93023b9c3a6fa4e1f6f1dd3394e35474c3, d12051544fc2e1d9ac63d79028f77e01b8d6370f, ca929611378adcf2dfda0f2721d7d62c0674a696, aeb8aae6a5609970a7dec53dc7963b41e9a0aed1, 9ea9ee38eb1abd8440646fa7cb3425dc913636d3, f29b85d5af5c907eb2e71362c771adf90fef593f, 73e949fb1405f7b721d9fa7cf350d6adc725fd86, 11b0cd5055580451fca46fa6d3857aa66aacf03e, 85959aeeae58c5571e2408e262b21468f03ee62a
+- Commits: 8eea1996c0f3337f8779343d1f85e4b83df368bd, 917c7b93023b9c3a6fa4e1f6f1dd3394e35474c3, d12051544fc2e1d9ac63d79028f77e01b8d6370f, ca929611378adcf2dfda0f2721d7d62c0674a696, aeb8aae6a5609970a7dec53dc7963b41e9a0aed1, 9ea9ee38eb1abd8440646fa7cb3425dc913636d3, f29b85d5af5c907eb2e71362c771adf90fef593f, 73e949fb1405f7b721d9fa7cf350d6adc725fd86, 11b0cd5055580451fca46fa6d3857aa66aacf03e, 85959aeeae58c5571e2408e262b21468f03ee62a, 674be46a00bccef7add618c8607d28800569d218
 - Owned-Files:
   - cron/deferrals.py
   - cron/outcomes.py
@@ -134,14 +134,16 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: 7ec87ae461c3f86f2992cec2ec05166051b56195, fe97fc86777975e701d35bb56192417b6f2ec168, adb98892f4511bf92ba6880b2cd12453a7450504, 2f947a36e3d5f6f6b166716d57747e8b3e796922, 1a1d09234dd41f6b15f44879929b8cc9c25a2903, 4a2d100fa0f8b2097a54a682887a1b191db82747, b5f7a3c4f429a79852ad22cf204c9b0781f6e1c5
+- Commits: 7ec87ae461c3f86f2992cec2ec05166051b56195, fe97fc86777975e701d35bb56192417b6f2ec168, adb98892f4511bf92ba6880b2cd12453a7450504, 2f947a36e3d5f6f6b166716d57747e8b3e796922, 1a1d09234dd41f6b15f44879929b8cc9c25a2903, 4a2d100fa0f8b2097a54a682887a1b191db82747, b5f7a3c4f429a79852ad22cf204c9b0781f6e1c5, 27bef1d9b55362b14ecadb9da6a782a35e5cac91
 - Owned-Files:
   - agent/agent_init.py
+  - hermes_cli/_parser.py
   - hermes_cli/main.py
   - hermes_cli/oneshot.py
   - model_tools.py
   - tests/hermes_cli/test_mcp_startup.py
   - tests/hermes_cli/test_oneshot_skills.py
+  - tests/hermes_cli/test_startup_plugin_gating.py
   - tests/test_model_tools.py
 - Intent: A oneshot invocation that requests zero tools gets exactly zero tools: no MCP startup, no builtin tool discovery leaking into the run.
 - Protected-Invariant: Explicitly tool-less oneshot runs never load or expose any toolset.
@@ -247,7 +249,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 10
+- Ledger-Revision: 11
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
