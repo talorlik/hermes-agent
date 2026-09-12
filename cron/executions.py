@@ -53,6 +53,8 @@ _ADDITIVE_COLUMNS = (
     ("detached_status", "TEXT"),
     ("detached_worker", "TEXT"),
     ("lease_expires_at", "TEXT"),
+    ("delivery_outcome", "TEXT"),
+    ("scheduled_instant", "TEXT"),
 )
 
 _CREATE_EXECUTIONS_SQL = """CREATE TABLE IF NOT EXISTS executions (
@@ -80,7 +82,9 @@ _CREATE_EXECUTIONS_SQL = """CREATE TABLE IF NOT EXISTS executions (
      detached_run_id TEXT,
      detached_status TEXT,
      detached_worker TEXT,
-     lease_expires_at TEXT
+     lease_expires_at TEXT,
+     delivery_outcome TEXT,
+     scheduled_instant TEXT
    )"""
 
 
@@ -535,11 +539,16 @@ def register_detached_run(
                    detached_worker=?,
                    occurrence_key=COALESCE(?, occurrence_key),
                    lease_expires_at=?
-               WHERE id=? AND status IN ('claimed','running')""",
+               WHERE id=? AND status IN ('claimed','running')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM executions AS other
+                   WHERE other.detached_run_id=?
+                     AND other.id<>executions.id
+                 )""",
             (_hermes_now().isoformat(), run_id,
              str(worker) if worker else None,
              str(occurrence_key) if occurrence_key else None,
-             lease_expires, execution_id),
+             lease_expires, execution_id, run_id),
         )
         if cur.rowcount != 1:
             return None
@@ -569,16 +578,24 @@ def finalize_detached_run(
             str(error) if error else "unknown failure"
         )
     with _transaction() as conn:
+        matches = conn.execute(
+            "SELECT id FROM executions WHERE detached_run_id=? "
+            "AND detached_status='started' ORDER BY id LIMIT 2",
+            (str(run_id),),
+        ).fetchall()
+        if len(matches) != 1:
+            return None
+        execution_id = str(matches[0]["id"])
         cur = conn.execute(
             """UPDATE executions
                SET detached_status=?, error=COALESCE(?, error)
-               WHERE detached_run_id=? AND detached_status='started'""",
-            (detached_status, detail, str(run_id)),
+               WHERE id=? AND detached_run_id=? AND detached_status='started'""",
+            (detached_status, detail, execution_id, str(run_id)),
         )
         if cur.rowcount != 1:
             return None
         record = _record(conn.execute(
-            "SELECT * FROM executions WHERE detached_run_id=?", (str(run_id),)
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone())
     _emit_execution_state(record)
     return record
@@ -587,11 +604,11 @@ def finalize_detached_run(
 def find_detached_run(run_id: str) -> Optional[Dict[str, Any]]:
     """Idempotent readback: the execution row for one correlation id."""
     with _transaction() as conn:
-        row = conn.execute(
-            "SELECT * FROM executions WHERE detached_run_id=?",
+        rows = conn.execute(
+            "SELECT * FROM executions WHERE detached_run_id=? ORDER BY id LIMIT 2",
             (str(run_id),),
-        ).fetchone()
-    return _record(row)
+        ).fetchall()
+    return _record(rows[0]) if len(rows) == 1 else None
 
 
 def reconcile_detached_runs() -> List[Dict[str, Any]]:

@@ -229,6 +229,30 @@ def _write_local_fallback(row: Dict[str, Any], error: Optional[str]) -> None:
         )
 
 
+def write_enqueue_failure_fallback(
+    *,
+    execution_id: Optional[str],
+    job_id: str,
+    target: str,
+    content: str,
+    error: BaseException,
+) -> str:
+    """Persist content locally when the durable outbox cannot enqueue it."""
+    clean_error = _sanitize_error(f"Outbox enqueue failed: {error}")
+    fallback_id = f"enqueue-{execution_id or uuid.uuid4().hex}"
+    _write_local_fallback(
+        {
+            "id": fallback_id,
+            "job_id": job_id,
+            "target": target,
+            "attempts": 0,
+            "content": content,
+        },
+        clean_error,
+    )
+    return clean_error or "Outbox enqueue failed"
+
+
 def record_attempt(
     outbox_id: str,
     *,

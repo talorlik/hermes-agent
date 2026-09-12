@@ -113,6 +113,39 @@ def test_successful_send_marks_outbox_delivered(outbox_env, monkeypatch):
     assert [h["status"] for h in history] == ["delivered"]
 
 
+def test_enqueue_failure_blocks_external_send_and_writes_local_fallback(
+    outbox_env, monkeypatch
+):
+    from unittest.mock import MagicMock
+
+    from cron import outbox as O
+    from cron import scheduler as S
+
+    monkeypatch.setattr(
+        O,
+        "enqueue_with_intent",
+        MagicMock(side_effect=RuntimeError("outbox unavailable")),
+    )
+    deliver = MagicMock(return_value=None)
+    monkeypatch.setattr(S, "_deliver_result", deliver)
+
+    S.tick(verbose=False, sync=True)
+
+    deliver.assert_not_called()
+    assert O.list_outbox(job_id=outbox_env["job_id"]) == []
+    fallback_dir = outbox_env["home"] / "cron" / "failed_deliveries"
+    files = list(fallback_dir.rglob("*.md")) if fallback_dir.exists() else []
+    assert len(files) == 1
+    assert "daily report content" in files[0].read_text()
+
+    import cron.jobs as J
+
+    refreshed = J.get_job(outbox_env["job_id"])
+    assert refreshed is not None
+    assert refreshed["last_status"] == "delivery_failed"
+    assert "outbox unavailable" in (refreshed["last_delivery_error"] or "")
+
+
 def test_pending_delivery_retries_before_new_work(outbox_env, monkeypatch):
     from cron import outbox as O
     from cron import scheduler as S
@@ -328,3 +361,33 @@ def test_exception_path_successful_alert_records_delivery(
     assert latest["delivery_target"] == "telegram"
     assert latest["delivery_status"] == "delivered"
     assert latest["delivery_attempts"] == 1
+
+
+def test_exception_path_enqueue_failure_never_sends_without_durable_intent(
+    outbox_env, monkeypatch
+):
+    from unittest.mock import MagicMock
+
+    from cron import outbox as O
+    from cron import scheduler as S
+
+    monkeypatch.setattr(
+        S,
+        "run_job",
+        MagicMock(side_effect=RuntimeError("run body exploded")),
+    )
+    monkeypatch.setattr(
+        O,
+        "enqueue_with_intent",
+        MagicMock(side_effect=RuntimeError("outbox unavailable")),
+    )
+    deliver = MagicMock(return_value=None)
+    monkeypatch.setattr(S, "_deliver_result", deliver)
+
+    S.tick(verbose=False, sync=True)
+
+    deliver.assert_not_called()
+    fallback_dir = outbox_env["home"] / "cron" / "failed_deliveries"
+    files = list(fallback_dir.rglob("*.md")) if fallback_dir.exists() else []
+    assert len(files) == 1
+    assert "run body exploded" in files[0].read_text()

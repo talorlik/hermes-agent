@@ -130,6 +130,41 @@ def test_unknown_run_id_finalize_is_a_noop(ledger):
     assert ledger.finalize_detached_run("no-such-run", success=True) is None
 
 
+def test_register_detached_run_rejects_duplicate_correlation_id(ledger):
+    first = ledger.create_execution("job-first", source="builtin")
+    second = ledger.create_execution("job-second", source="builtin")
+    ledger.mark_execution_running(first["id"])
+    ledger.mark_execution_running(second["id"])
+
+    assert ledger.register_detached_run(first["id"], run_id="corr-duplicate")
+    assert ledger.register_detached_run(second["id"], run_id="corr-duplicate") is None
+    assert ledger.latest_execution("job-second")["detached_run_id"] is None
+
+
+def test_finalize_duplicate_correlation_id_is_side_effect_free(ledger):
+    first = ledger.create_execution("job-first", source="builtin")
+    second = ledger.create_execution("job-second", source="builtin")
+    ledger.mark_execution_running(first["id"])
+    ledger.mark_execution_running(second["id"])
+    conn = sqlite3.connect(ledger.EXECUTIONS_FILE)
+    try:
+        conn.execute(
+            "UPDATE executions SET detached_run_id='corr-corrupt', "
+            "detached_status='started' WHERE id IN (?, ?)",
+            (first["id"], second["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert ledger.find_detached_run("corr-corrupt") is None
+    assert ledger.finalize_detached_run("corr-corrupt", success=True) is None
+    rows = ledger.list_executions(limit=10)
+    duplicates = [row for row in rows if row["detached_run_id"] == "corr-corrupt"]
+    assert len(duplicates) == 2
+    assert {row["detached_status"] for row in duplicates} == {"started"}
+
+
 def test_incident_write_failure_rolls_back_detached_terminalization(
     ledger, monkeypatch
 ):

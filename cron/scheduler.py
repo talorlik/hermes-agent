@@ -2850,8 +2850,18 @@ def _save_compose_deliver(
                 intent_success=d.success,
                 intent_error=d.error,
             )
-        except Exception:
-            logger.warning("Outbox enqueue failed for job %s", job["id"], exc_info=True)
+        except Exception as exc:
+            from cron.outbox import write_enqueue_failure_fallback
+
+            d.delivery_error = write_enqueue_failure_fallback(
+                execution_id=job.get("execution_id"),
+                job_id=job["id"],
+                target=normalized_deliver,
+                content=deliver_content,
+                error=exc,
+            )
+            logger.error("Outbox enqueue failed for job %s", job["id"], exc_info=True)
+            return
     try:
         with fence.side_effect_fence() as owns_delivery:
             if not owns_delivery:
@@ -3012,8 +3022,18 @@ def _deliver_crash_failure(
                 intent_success=False,
                 intent_error=err_text,
             )
-        except Exception:
-            logger.warning("Outbox enqueue failed for job %s", job["id"], exc_info=True)
+        except Exception as exc:
+            from cron.outbox import write_enqueue_failure_fallback
+
+            delivery_error = write_enqueue_failure_fallback(
+                execution_id=execution_id,
+                job_id=job["id"],
+                target=normalized_deliver,
+                content=alert_content,
+                error=exc,
+            )
+            logger.error("Outbox enqueue failed for job %s", job["id"], exc_info=True)
+            return delivery_error, "failed"
     delivery_error = None
     try:
         delivery_error = _deliver_result(
