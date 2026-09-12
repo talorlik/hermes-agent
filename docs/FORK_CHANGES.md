@@ -42,7 +42,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 `retiring` (scheduled for removal by a named plan item).
 
 ## G-UPDATE-FORKSYNC: automatic upstream merge in `hermes update`
-- Commits: cbeb0229a8e345a7a2adaf5ff698d49a65c55da7, a2c03c83df48a73f3165d4b515c3398884a3661f, a9ac57c43a884142abd27057775c143f78f22ca7, b04eaa31610d8c3ba569425db9228b3c4ed07ae0, 3eee8924155495442cf25ad9d787260c23c695e9, 66375c3670805d5a72c6a9ce5bc30bdf688f3274
+- Commits: cbeb0229a8e345a7a2adaf5ff698d49a65c55da7, a2c03c83df48a73f3165d4b515c3398884a3661f, a9ac57c43a884142abd27057775c143f78f22ca7, b04eaa31610d8c3ba569425db9228b3c4ed07ae0, 3eee8924155495442cf25ad9d787260c23c695e9, 66375c3670805d5a72c6a9ce5bc30bdf688f3274, 4ab5388525fe048fd06fad61394f3abeddc61b00
 - Owned-Files:
   - hermes_cli/update_cmd.py
   - hermes_cli/update_cmd_git.py
@@ -57,7 +57,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: baa76e498e5b91539de84cbc3684763b656ac9c0, c70f07ebfa72568dbf27e2be0c6349a3df32e633, 77318d25fdc898c60d5c3af02afa2f8c188e993c, 17573db2d074a31d3b354f24108c369f6a83d5a7, 6bcd2426e168d071336e755eedd992dfa059a167, a2eacbd8886cc7fbb5c7c4622da613b9e4d2a684, 2e8c9404efae4efc634fda3a53cb6ea7d48f51ac, 96170f7609607cd7e30cd821b6d82b82a3e954f7, 36346f27754969e99d016b73a924b9fd5abb4994
+- Commits: baa76e498e5b91539de84cbc3684763b656ac9c0, c70f07ebfa72568dbf27e2be0c6349a3df32e633, 77318d25fdc898c60d5c3af02afa2f8c188e993c, 17573db2d074a31d3b354f24108c369f6a83d5a7, 6bcd2426e168d071336e755eedd992dfa059a167, a2eacbd8886cc7fbb5c7c4622da613b9e4d2a684, 2e8c9404efae4efc634fda3a53cb6ea7d48f51ac, 96170f7609607cd7e30cd821b6d82b82a3e954f7, 36346f27754969e99d016b73a924b9fd5abb4994, 803f3249f1b61009c9081ae9474618d7876603a1
 - Owned-Files:
   - cron/deferrals.py
   - cron/outcomes.py
@@ -122,7 +122,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-DEEPLINKS: browser task deep links in the Kanban dashboard
-- Commits: d185efb251c71090f5e53d5fe15e0f11acc64115, bee04af2d491c84e8de68c482c6a82a5a492788a
+- Commits: d185efb251c71090f5e53d5fe15e0f11acc64115, bee04af2d491c84e8de68c482c6a82a5a492788a, 4465666d76be5e05dc57456e99cffa64310fab6a
 - Owned-Files:
   - plugins/kanban/dashboard/dist/index.js
   - apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
@@ -134,7 +134,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: fb4f091bb9f62045a79f02551b852b5164e06350, 2904a8044a2d227e0bd82391f43ad66d948c265f, 802c7eb2900f7b1bcdf1e8bc58be1b959ca66729, b701e8ebef483e55ee6834b517b370c36912826b, cddbbe69ffe9efbe54f70f9d5596186ade525465, c24e5c7e2fd5cfca92d31d241afc4934c63f4269
+- Commits: fb4f091bb9f62045a79f02551b852b5164e06350, 2904a8044a2d227e0bd82391f43ad66d948c265f, 802c7eb2900f7b1bcdf1e8bc58be1b959ca66729, b701e8ebef483e55ee6834b517b370c36912826b, cddbbe69ffe9efbe54f70f9d5596186ade525465, c24e5c7e2fd5cfca92d31d241afc4934c63f4269, bcfaa77ca624d41ef119ee0f5b5861aa4e629f09
 - Owned-Files:
   - agent/agent_init.py
   - hermes_cli/main.py
@@ -193,7 +193,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - apps/desktop/electron/remote-lifecycle.ts
   - apps/desktop/'/var/folders/5h/qzgt02rn619fttp2d7zdxj600000gn/T/hermes-update-mutex-LMF9y5/home/.hermes-update-in-progress.mutex'
   - apps/desktop/'/var/folders/5h/qzgt02rn619fttp2d7zdxj600000gn/T/hermes-update-mutex-us8HZu/home/.hermes-update-in-progress.mutex'
-- Intent: Desktop electron tests write their fixtures and update-mutex files under isolated temp paths instead of the repository tree (quoted `/var/folders/...` literals had previously been committed as junk files). This entry also owns the two deleted quoted mutex-junk paths still present on `upstream/main`, so the deletion is not an unowned current path.
+- Intent: Desktop electron tests write fixtures and update-mutex files under isolated temp paths instead of the repository tree. The two quoted `/var/folders/...` paths are retained only as historical commit-ownership records; they are not current upstream deletions or current fork deltas.
 - Protected-Invariant: No test writes mutex/fixture state into the repository working tree.
 - Tests: apps/desktop/electron/git-worktree-ops.test.ts, apps/desktop/electron/remote-lifecycle.test.ts
 - Retirement-Condition: Upstream applies equivalent fixture/mutex isolation.
@@ -207,7 +207,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - package-lock.json
 - Intent: Track a patched Electron release ahead of upstream's pin to pick up a security fix.
 - Protected-Invariant: The desktop app never regresses below the patched Electron version.
-- Tests: apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx (bundle still builds/runs under the bumped Electron)
+- Tests: `npm ls electron --all`; `cd apps/desktop && npm run test:desktop:all` (builds and packages the Electron 41.10.3 runtime)
 - Retirement-Condition: Upstream's Electron pin reaches or passes the patched release.
 - Disposition: active
 
@@ -247,7 +247,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 8
+- Ledger-Revision: 9
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
