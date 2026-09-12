@@ -62,6 +62,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 REQUIRED_FIELDS = (
@@ -80,10 +81,23 @@ _FIELD_LINE = re.compile(r"^-\s+(?P<key>[A-Za-z-]+):\s*(?P<value>.*)$")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FULL_SHA_RANGE = re.compile(r"^(?P<a>[0-9a-f]{40})\.\.(?P<b>[0-9a-f]{40})$")
 _ABBREVIATED_SHA = re.compile(r"^[0-9a-f]{7,39}(?:\.\.[0-9a-f]{7,39})?$")
+_MAX_REVISION_DIGITS = 64
 
 
 class CheckerError(RuntimeError):
     """Environment/setup failure: the check could not be evaluated at all."""
+
+
+class RevisionKind(Enum):
+    ABSENT = "absent"
+    VALID = "valid"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class LedgerRevision:
+    kind: RevisionKind
+    value: int | None = None
 
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -303,12 +317,23 @@ def _read_ledger_from_ref(repo: Path, fork_oid: str, ledger_rel: str) -> str:
 
 
 def _ledger_repo_rel(repo: Path, ledger_path: Path) -> str:
+    repo = Path(os.path.abspath(repo))
+    ledger_path = Path(os.path.abspath(ledger_path))
     try:
-        return ledger_path.resolve().relative_to(repo.resolve()).as_posix()
+        ledger_rel = ledger_path.relative_to(repo)
     except ValueError as exc:
         raise CheckerError(
             f"ledger path must be inside repository: {ledger_path}"
         ) from exc
+    candidate = repo
+    for component in ledger_rel.parts:
+        candidate /= component
+        if candidate.is_symlink():
+            raise CheckerError(
+                "ledger path must be inside repository and cannot contain a "
+                f"symlink component: {candidate}"
+            )
+    return ledger_rel.as_posix()
 
 
 def _parse_name_status_z(raw: bytes) -> list[str]:
@@ -466,6 +491,7 @@ def _history_reconciliation_partition(
     entries: list[LedgerEntry],
     upstream_oid: str,
     fork_oid: str,
+    ledger_rel: str,
     range_shas: set[str],
 ) -> tuple[set[str], list[dict[str, object]]]:
     declarers = [
@@ -512,10 +538,25 @@ def _history_reconciliation_partition(
             f"{upstream_oid}..{fork_oid}",
         ).splitlines()
     )
+    first_parent_boundary = set(
+        _git(repo, "rev-list", "--first-parent", upstream_oid).splitlines()
+    )
+    boundary_fingerprint = _entry_fingerprint_at(
+        repo, upstream_oid, ledger_rel=ledger_rel, entry_id="G-FORK-LEDGER"
+    )
+    boundary_history = (
+        dict(boundary_fingerprint[1]).get("History-Reconciliations", "")
+        if boundary_fingerprint is not None
+        else ""
+    )
+    inherited_tokens = {
+        token for token in _SPEC_SPLIT.split(boundary_history) if token != "none"
+    }
     upstream_roots = set(
         _git(repo, "rev-list", "--max-parents=0", upstream_oid).splitlines()
     )
     history: set[str] = set()
+    declared_history: set[str] = set()
     records: list[dict[str, object]] = []
     seen: set[str] = set()
     for token in tokens:
@@ -536,12 +577,16 @@ def _history_reconciliation_partition(
                 f"History-Reconciliations is not a canonical commit object: {token}"
             )
             continue
-        if token not in range_shas:
+        inherited = token in inherited_tokens
+        if not inherited and token not in range_shas:
             entry.problems.append(
                 f"History-Reconciliations commit is outside evaluated range: {token}"
             )
             continue
-        if token not in first_parent_range:
+        required_first_parent = (
+            first_parent_boundary if inherited else first_parent_range
+        )
+        if token not in required_first_parent:
             entry.problems.append(
                 "History-Reconciliations commit must be on the fork first-parent chain: "
                 f"{token}"
@@ -571,15 +616,10 @@ def _history_reconciliation_partition(
                 f"official upstream root: {token}"
             )
             continue
-        retired = set(
-            _git(
-                repo,
-                "rev-list",
-                retired_tip,
-                f"^{first_parent}",
-                f"^{upstream_oid}",
-            ).splitlines()
-        )
+        retired_args = ["rev-list", retired_tip, f"^{first_parent}"]
+        if not inherited:
+            retired_args.append(f"^{upstream_oid}")
+        retired = set(_git(repo, *retired_args).splitlines())
         if not retired:
             entry.problems.append(
                 "History-Reconciliations second parent has no exclusive retired "
@@ -587,21 +627,24 @@ def _history_reconciliation_partition(
             )
             continue
         candidate = {token, *retired}
-        outside = candidate - range_shas
-        if outside:
-            entry.problems.append(
-                "History-Reconciliations history is outside evaluated range: "
-                + ", ".join(sorted(outside))
-            )
-            continue
-        overlap = candidate & history
+        if not inherited:
+            outside = candidate - range_shas
+            if outside:
+                entry.problems.append(
+                    "History-Reconciliations history is outside evaluated range: "
+                    + ", ".join(sorted(outside))
+                )
+                continue
+        overlap = candidate & declared_history
         if overlap:
             entry.problems.append(
                 "History-Reconciliations retired sets overlap: "
                 + ", ".join(sorted(overlap))
             )
             continue
-        history.update(candidate)
+        declared_history.update(candidate)
+        if not inherited:
+            history.update(candidate)
         records.append({
             "sha": token,
             "retired_tip": retired_tip,
@@ -615,6 +658,7 @@ def _partition_range(
     entries: list[LedgerEntry],
     upstream_oid: str,
     fork_oid: str,
+    ledger_rel: str,
 ) -> tuple[list[dict[str, str]], list[str], set[str], list[dict[str, object]]]:
     out = _git(
         repo,
@@ -630,7 +674,7 @@ def _partition_range(
             rows[sha] = (parents_raw.split(), subject)
     range_shas = set(rows)
     history, records = _history_reconciliation_partition(
-        repo, entries, upstream_oid, fork_oid, range_shas
+        repo, entries, upstream_oid, fork_oid, ledger_rel, range_shas
     )
     sync_order = [
         sha
@@ -711,9 +755,9 @@ def _self_matches(
     return matched
 
 
-def _entry_fingerprint_at(
+def _ledger_entry_at(
     repo: Path, oid: str, ledger_rel: str, entry_id: str
-) -> tuple[str, tuple[tuple[str, str], ...], tuple[str, ...]] | None:
+) -> LedgerEntry | None:
     proc = _run_git(repo, "show", f"{oid}:{ledger_rel}")
     if proc.returncode != 0:
         return None
@@ -724,9 +768,15 @@ def _entry_fingerprint_at(
             f"ledger is not valid UTF-8 at {oid}:{ledger_rel}: {exc}"
         ) from exc
     candidates = [item for item in parse_ledger(text) if item.entry_id == entry_id]
-    if len(candidates) != 1:
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _entry_fingerprint_at(
+    repo: Path, oid: str, ledger_rel: str, entry_id: str
+) -> tuple[str, tuple[tuple[str, str], ...], tuple[str, ...]] | None:
+    candidate = _ledger_entry_at(repo, oid, ledger_rel, entry_id)
+    if candidate is None:
         return None
-    candidate = candidates[0]
     return (
         candidate.title,
         tuple(sorted(candidate.fields.items())),
@@ -745,11 +795,100 @@ def _commit_changes_entry(repo: Path, sha: str, ledger_rel: str, entry_id: str) 
     return after is not None and after != before
 
 
-def _positive_revision(fields: dict[str, str]) -> int | None:
-    raw = fields.get("Ledger-Revision", "")
-    if not re.fullmatch(r"[1-9][0-9]*", raw):
-        return None
-    return int(raw)
+def _ledger_revision(fields: dict[str, str]) -> LedgerRevision:
+    if "Ledger-Revision" not in fields:
+        return LedgerRevision(RevisionKind.ABSENT)
+    raw = fields["Ledger-Revision"]
+    if len(raw) > _MAX_REVISION_DIGITS or not re.fullmatch(r"[1-9][0-9]*", raw):
+        return LedgerRevision(RevisionKind.INVALID)
+    return LedgerRevision(RevisionKind.VALID, int(raw))
+
+
+def _history_tokens(value: str) -> frozenset[str]:
+    """Return the authorization set represented by one history field."""
+    return frozenset(
+        token for token in _SPEC_SPLIT.split(value) if token and token != "none"
+    )
+
+
+def _reachable_revision_high_waters(
+    repo: Path, upstream_oid: str, fork_oid: str, ledger_rel: str
+) -> dict[str, int | None]:
+    boundary_fingerprint = _entry_fingerprint_at(
+        repo, upstream_oid, ledger_rel, "G-FORK-LEDGER"
+    )
+    boundary_revision = (
+        _ledger_revision(dict(boundary_fingerprint[1])).value
+        if boundary_fingerprint is not None
+        else None
+    )
+    rows = _git(
+        repo,
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        "--parents",
+        f"{upstream_oid}..{fork_oid}",
+    ).splitlines()
+    inclusive: dict[str, int | None] = {}
+    prior: dict[str, int | None] = {}
+    for row in rows:
+        sha, *parents = row.split()
+        prior_revision = boundary_revision
+        for parent in parents:
+            parent_revision = inclusive.get(parent)
+            if parent_revision is not None:
+                prior_revision = (
+                    parent_revision
+                    if prior_revision is None
+                    else max(prior_revision, parent_revision)
+                )
+        prior[sha] = prior_revision
+        fingerprint = _entry_fingerprint_at(repo, sha, ledger_rel, "G-FORK-LEDGER")
+        current_revision = (
+            _ledger_revision(dict(fingerprint[1])).value
+            if fingerprint is not None
+            else None
+        )
+        inclusive[sha] = (
+            prior_revision
+            if current_revision is None
+            else (
+                current_revision
+                if prior_revision is None
+                else max(prior_revision, current_revision)
+            )
+        )
+    return prior
+
+
+def _effective_owners_at(
+    repo: Path, sha: str, ledger_rel: str
+) -> tuple[dict[str, str], list[str]]:
+    proc = _run_git(repo, "show", f"{sha}:{ledger_rel}")
+    if proc.returncode != 0:
+        return {}, [f"cannot read historical ledger at {sha}:{ledger_rel}"]
+    try:
+        ledger_text = proc.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CheckerError(
+            f"ledger is not valid UTF-8 at {sha}:{ledger_rel}: {exc}"
+        ) from exc
+    historical_entries = parse_ledger(ledger_text)
+    historical_precedence, precedence_problems = parse_path_precedence(ledger_text)
+    historical_owners = _declared_path_owners(historical_entries)
+    effective, invalid_owners = _resolve_all_declared_paths(
+        historical_owners, historical_precedence
+    )
+    problems = [
+        f"historical Path-Precedence in commit {sha}: {problem}"
+        for problem in precedence_problems
+    ]
+    problems.extend(
+        f"historical ownership resolution in commit {sha}: {problem}"
+        for problem in invalid_owners
+    )
+    return effective, problems
 
 
 def _validate_history_revision_transitions(
@@ -758,7 +897,6 @@ def _validate_history_revision_transitions(
     upstream_oid: str,
     fork_oid: str,
     ledger_rel: str,
-    effective_owners: dict[str, str],
 ) -> bool:
     """Validate sticky history authorization against persistent first-parent state."""
     current_entries = [entry for entry in entries if entry.entry_id == "G-FORK-LEDGER"]
@@ -785,13 +923,39 @@ def _validate_history_revision_transitions(
         "--first-parent",
         f"{upstream_oid}..{fork_oid}",
     ).splitlines()
-    activated = False
-    seen_entry = False
-    previous_present = False
-    revision_floor: int | None = None
-    last_history: str | None = None
+    reachable_floors = _reachable_revision_high_waters(
+        repo, upstream_oid, fork_oid, ledger_rel
+    )
+    boundary_fingerprint = _entry_fingerprint_at(
+        repo, upstream_oid, ledger_rel, "G-FORK-LEDGER"
+    )
+    boundary_fields = (
+        dict(boundary_fingerprint[1]) if boundary_fingerprint is not None else {}
+    )
+    boundary_revision_state = _ledger_revision(boundary_fields)
+    boundary_revision = boundary_revision_state.value
+    boundary_history = boundary_fields.get("History-Reconciliations")
+    activated = boundary_history is not None
+    seen_entry = boundary_fingerprint is not None
+    previous_present = boundary_fingerprint is not None
+    revision_floor = boundary_revision
+    last_history = boundary_history
+
+    if boundary_revision_state.kind is RevisionKind.INVALID:
+        add_problem(
+            "invalid Ledger-Revision at upstream boundary "
+            f"{upstream_oid}: expected a positive decimal of at most "
+            f"{_MAX_REVISION_DIGITS} digits"
+        )
 
     for sha in first_parent:
+        reachable_floor = reachable_floors.get(sha)
+        if reachable_floor is not None:
+            revision_floor = (
+                reachable_floor
+                if revision_floor is None
+                else max(revision_floor, reachable_floor)
+            )
         fingerprint = _entry_fingerprint_at(repo, sha, ledger_rel, "G-FORK-LEDGER")
         if fingerprint is None:
             if activated:
@@ -803,7 +967,8 @@ def _validate_history_revision_transitions(
 
         fields = dict(fingerprint[1])
         history = fields.get("History-Reconciliations")
-        revision = _positive_revision(fields)
+        revision_state = _ledger_revision(fields)
+        revision = revision_state.value
 
         if not activated and history is None:
             seen_entry = True
@@ -816,18 +981,16 @@ def _validate_history_revision_transitions(
                 )
             continue
 
-        if revision is None:
+        if revision_state.kind is not RevisionKind.VALID:
             add_problem(
                 "History-Reconciliations requires a positive decimal "
-                f"Ledger-Revision in commit {sha}"
+                f"Ledger-Revision of at most {_MAX_REVISION_DIGITS} digits in commit {sha}"
             )
 
         history_changed = not activated or history != last_history
         if not activated:
-            if (
-                seen_entry
-                and revision_floor is not None
-                and (revision is None or revision <= revision_floor)
+            if revision_floor is not None and (
+                revision is None or revision <= revision_floor
             ):
                 add_problem(
                     "History-Reconciliations activation must exceed the persistent "
@@ -839,6 +1002,11 @@ def _validate_history_revision_transitions(
                 add_problem(
                     "G-FORK-LEDGER reappeared after a forbidden post-activation "
                     f"absence in commit {sha}"
+                )
+            if history is None:
+                add_problem(
+                    "History-Reconciliations must not be removed after activation: "
+                    f"{sha}"
                 )
             if revision_floor is not None and revision is not None:
                 if revision < revision_floor:
@@ -860,7 +1028,15 @@ def _validate_history_revision_transitions(
                     "History-Reconciliations change requires a G-FORK-LEDGER "
                     f"self-owned commit: {sha}"
                 )
-            if any(effective_owners.get(path) != "G-FORK-LEDGER" for path in changed):
+            historical_effective_owners, ownership_problems = _effective_owners_at(
+                repo, sha, ledger_rel
+            )
+            for problem in ownership_problems:
+                add_problem(problem)
+            if any(
+                historical_effective_owners.get(path) != "G-FORK-LEDGER"
+                for path in changed
+            ):
                 add_problem(
                     "History-Reconciliations change requires effective "
                     f"G-FORK-LEDGER ownership for every changed path: {sha}"
@@ -872,6 +1048,168 @@ def _validate_history_revision_transitions(
         if revision is not None:
             revision_floor = (
                 revision if revision_floor is None else max(revision_floor, revision)
+            )
+
+    first_parent_set = set(first_parent)
+    reachable_rows = _git(
+        repo,
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        "--parents",
+        f"{upstream_oid}..{fork_oid}",
+    ).splitlines()
+    for row in reachable_rows:
+        sha, *parents = row.split()
+        historical_entry = _ledger_entry_at(repo, sha, ledger_rel, "G-FORK-LEDGER")
+        if historical_entry is not None:
+            for problem in historical_entry.problems:
+                add_problem(f"malformed G-FORK-LEDGER in commit {sha}: {problem}")
+            if _ledger_revision(historical_entry.fields).kind is RevisionKind.INVALID:
+                add_problem(
+                    f"invalid Ledger-Revision in commit {sha}: expected a positive "
+                    f"decimal of at most {_MAX_REVISION_DIGITS} digits"
+                )
+        fingerprint = _entry_fingerprint_at(repo, sha, ledger_rel, "G-FORK-LEDGER")
+        history = (
+            dict(fingerprint[1]).get("History-Reconciliations")
+            if fingerprint is not None
+            else None
+        )
+        fields = dict(fingerprint[1]) if fingerprint is not None else {}
+        revision_state = _ledger_revision(fields)
+        revision = revision_state.value
+        active_parent_tokens: list[frozenset[str]] = []
+        for parent in parents:
+            parent_fingerprint = _entry_fingerprint_at(
+                repo, parent, ledger_rel, "G-FORK-LEDGER"
+            )
+            parent_history = (
+                dict(parent_fingerprint[1]).get("History-Reconciliations")
+                if parent_fingerprint is not None
+                else None
+            )
+            if parent_history is None:
+                continue
+            active_parent_tokens.append(_history_tokens(parent_history))
+            if fingerprint is None:
+                add_problem(
+                    f"G-FORK-LEDGER must not disappear after history activation: {sha}"
+                )
+            elif history is None:
+                add_problem(
+                    f"History-Reconciliations must not be removed after activation: {sha}"
+                )
+        divergent_parent_tokens = (
+            len(parents) > 1
+            and len(active_parent_tokens) > 1
+            and len(set(active_parent_tokens)) > 1
+        )
+        if divergent_parent_tokens and fingerprint is not None and history is not None:
+            parent_union = frozenset().union(*active_parent_tokens)
+            if _history_tokens(history) != parent_union:
+                add_problem(
+                    "merge result must include every active parent token and no others: "
+                    f"{sha}"
+                )
+            reachable_floor = reachable_floors.get(sha)
+            if reachable_floor is not None and (
+                revision is None or revision <= reachable_floor
+            ):
+                add_problem(
+                    "merge reconciliation must strictly increase the full parent "
+                    f"Ledger-Revision high-water {reachable_floor} in commit {sha}"
+                )
+            changed = commit_changed_paths(repo, sha)
+            after_owned = set(fingerprint[2])
+            if ledger_rel not in changed or not changed <= after_owned:
+                add_problem(
+                    "merge reconciliation requires a G-FORK-LEDGER self-owned "
+                    f"commit: {sha}"
+                )
+            historical_effective_owners, ownership_problems = _effective_owners_at(
+                repo, sha, ledger_rel
+            )
+            for problem in ownership_problems:
+                add_problem(problem)
+            if any(
+                historical_effective_owners.get(path) != "G-FORK-LEDGER"
+                for path in changed
+            ):
+                add_problem(
+                    "merge reconciliation requires effective G-FORK-LEDGER "
+                    f"ownership for every changed path: {sha}"
+                )
+        if sha in first_parent_set:
+            continue
+        first_parent_fingerprint = (
+            _entry_fingerprint_at(repo, parents[0], ledger_rel, "G-FORK-LEDGER")
+            if parents
+            else boundary_fingerprint
+        )
+        before_history = (
+            dict(first_parent_fingerprint[1]).get("History-Reconciliations")
+            if first_parent_fingerprint is not None
+            else None
+        )
+        history_was_active = before_history is not None
+        if fingerprint is None:
+            if history_was_active:
+                add_problem(
+                    f"G-FORK-LEDGER must not disappear after history activation: {sha}"
+                )
+            continue
+
+        if history_was_active and history is None:
+            add_problem(
+                f"History-Reconciliations must not be removed after activation: {sha}"
+            )
+        history_changed = history != before_history and history is not None
+        if history is not None and revision_state.kind is not RevisionKind.VALID:
+            add_problem(
+                "History-Reconciliations requires a positive decimal "
+                f"Ledger-Revision of at most {_MAX_REVISION_DIGITS} digits in commit {sha}"
+            )
+        reachable_floor = reachable_floors.get(sha)
+        if (
+            history is not None
+            and reachable_floor is not None
+            and revision is not None
+            and revision < reachable_floor
+        ):
+            add_problem(
+                "History-Reconciliations revision regressed below the "
+                f"persistent revision floor {reachable_floor} in commit {sha}"
+            )
+        if (
+            history_changed
+            and reachable_floor is not None
+            and (revision is None or revision <= reachable_floor)
+        ):
+            add_problem(
+                "History-Reconciliations change must strictly increase the "
+                f"persistent Ledger-Revision floor in commit {sha}"
+            )
+        if not history_changed:
+            continue
+        changed = commit_changed_paths(repo, sha)
+        after_owned = set(fingerprint[2])
+        if ledger_rel not in changed or not changed <= after_owned:
+            add_problem(
+                "History-Reconciliations change requires a G-FORK-LEDGER "
+                f"self-owned commit: {sha}"
+            )
+        historical_effective_owners, ownership_problems = _effective_owners_at(
+            repo, sha, ledger_rel
+        )
+        for problem in ownership_problems:
+            add_problem(problem)
+        if any(
+            historical_effective_owners.get(path) != "G-FORK-LEDGER" for path in changed
+        ):
+            add_problem(
+                "History-Reconciliations change requires effective "
+                f"G-FORK-LEDGER ownership for every changed path: {sha}"
             )
 
     return activated
@@ -936,10 +1274,10 @@ def _resolve_current_paths(
 
 
 def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -> dict:
+    ledger_rel = _ledger_repo_rel(repo, ledger_path)
     repo = Path(_git(repo, "rev-parse", "--show-toplevel")).resolve()
     upstream_oid = _git(repo, "rev-parse", "--verify", f"{upstream_ref}^{{commit}}")
     fork_oid = _git(repo, "rev-parse", "--verify", f"{fork_ref}^{{commit}}")
-    ledger_rel = _ledger_repo_rel(repo, ledger_path)
     ledger_text = _read_ledger_from_ref(repo, fork_oid, ledger_rel)
     entries = parse_ledger(ledger_text)
     seen_ids: set[str] = set()
@@ -959,12 +1297,12 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         declared_owners, precedence
     )
     history_activated = _validate_history_revision_transitions(
-        repo, entries, upstream_oid, fork_oid, ledger_rel, effective_owners
+        repo, entries, upstream_oid, fork_oid, ledger_rel
     )
 
     explicit_claims = [resolve_entry_commits(repo, entry) for entry in entries]
     work, sync_merges, history_set, history_reconciliations = _partition_range(
-        repo, entries, upstream_oid, fork_oid
+        repo, entries, upstream_oid, fork_oid, ledger_rel
     )
     sync_set = set(sync_merges)
     work_shas = {commit["sha"] for commit in work}
@@ -1022,7 +1360,22 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
             matched = _self_matches(
                 repo, entry, work, ledger_rel, path_cache, effective_owners
             )
-            if not matched:
+            boundary_fingerprint = (
+                _entry_fingerprint_at(repo, upstream_oid, ledger_rel, "G-FORK-LEDGER")
+                if entry.entry_id == "G-FORK-LEDGER"
+                else None
+            )
+            current_fingerprint = (
+                entry.title,
+                tuple(sorted(entry.fields.items())),
+                tuple(entry.owned_files),
+            )
+            inherited_unchanged = (
+                boundary_fingerprint is not None
+                and boundary_fingerprint == current_fingerprint
+                and "History-Reconciliations" in entry.fields
+            )
+            if not matched and not inherited_unchanged:
                 entry.problems.append(
                     "self matched no commit that changes the ledger and only "
                     "paths owned by this entry"
@@ -1060,7 +1413,10 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
             "work_commits": len(work),
             "sync_merges": len(sync_set),
             "history_reconciliations": len(history_reconciliations),
-            "retired_history_commits": len(history_set) - len(history_reconciliations),
+            "retired_history_commits": len(history_set)
+            - sum(
+                1 for record in history_reconciliations if record["sha"] in history_set
+            ),
             "mapped": sum(1 for c in work if c["sha"] in mapped),
             "unmapped": len(unmapped),
             "entries": len(entries),

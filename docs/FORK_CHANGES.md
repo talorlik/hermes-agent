@@ -24,9 +24,11 @@ changes on merge or squash. G-FORK-LEDGER may explicitly retire ancestry through
 `History-Reconciliations`: each listed canonical commit must be a two-parent
 first-parent-chain merge whose raw tree equals its first parent's tree, whose
 retired parent shares only official-upstream roots, and whose retired set is
-disjoint from every other partition. Every change to that field is a
-G-FORK-LEDGER-owned commit whose Ledger-Revision strictly exceeds the persistent
-first-parent revision high-water mark. After first activation, the entry cannot
+disjoint from every other partition. Every fork-introduced change to that
+field is a G-FORK-LEDGER-owned commit whose Ledger-Revision strictly exceeds
+the prior full-reachable revision high-water mark seeded at the upstream
+boundary. Unchanged inherited authorization creates no new ownership or
+in-range obligation. After first activation, the entry and field cannot
 disappear; replacement entries and explicit claims cannot reset its identity.
 
 Current-path ownership is the three-dot `upstream/main...fork-ref` changed
@@ -49,14 +51,21 @@ change; entry is removed after the next clean sync shows no residual delta),
 `retiring` (scheduled for removal by a named plan item).
 
 ## G-UPDATE-FORKSYNC: automatic upstream merge in `hermes update`
-- Commits: 08f93e614a62790a6bd29c1397c603c2181f1161, 21a38d4dc2b9301a75ac219da8f19b103813ec6d, 7de663b05eaf30157e51e795d008ed526a52c785, 5f6aeab598ad280d33903e10e4158397220bf264, b63893c1ac74800637b70efd0e74c07fcbe9175d, 2e2a5082f58f01addb00a3b60646da5dd7555e4c, 2f79ad2996d8d6d62736942ce65c88c50cf32a55
+- Commits: 08f93e614a62790a6bd29c1397c603c2181f1161, 21a38d4dc2b9301a75ac219da8f19b103813ec6d, 7de663b05eaf30157e51e795d008ed526a52c785, 5f6aeab598ad280d33903e10e4158397220bf264, b63893c1ac74800637b70efd0e74c07fcbe9175d, 2e2a5082f58f01addb00a3b60646da5dd7555e4c, 2f79ad2996d8d6d62736942ce65c88c50cf32a55, 6a00376ed41f2ec30802c30cfa07c9a7858abaf7
 - Owned-Files:
   - hermes_cli/update_cmd.py
+  - hermes_cli/update_cmd_fleet.py
   - hermes_cli/update_cmd_git.py
+  - hermes_cli/update_receipt.py
   - hermes_cli/config_defaults.py
   - tests/hermes_cli/test_cmd_update.py
   - tests/hermes_cli/test_fork_sync_strategy.py
   - tests/hermes_cli/test_update_fleet_restart_pending.py
+  - tests/hermes_cli/test_update_head_moved_gate.py
+  - tests/hermes_cli/test_update_orphan_backend_reap.py
+  - tests/hermes_cli/test_update_skip_unchanged_editable_install.py
+  - tests/hermes_cli/test_update_venv_health.py
+  - tests/hermes_cli/test_update_yes_flag.py
 - Intent: `updates.fork_sync_strategy: merge` makes `hermes update` merge `upstream/main` into `main` (fork commits preserved, recovery tag before merge, post-merge syntax guard with rollback, candidate test run before push, no-op pull accepted). Default stays `ff_only`; unknown values fall back to `ff_only`.
 - Protected-Invariant: An update never force-pushes or rewrites `main`; a conflict or a post-merge syntax/test failure aborts with the pre-merge SHA restored and nothing pushed; upstream code merged by the sync cannot reach origin unchecked.
 - Tests: tests/hermes_cli/test_fork_sync_strategy.py, tests/hermes_cli/test_cmd_update.py
@@ -64,9 +73,10 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: 82867a2110f6cfa500913f34fa3984f11ab8222b, c25ff2c605ddaf51941a69593e9e11a7abcd9b83, 9d9273e016485af63cad0bb0ebdb8f86469d8e98, 161b03e4d05d955b7246e7536d8e122fcafd1403, ed8cbe13f277229896b7c03945152891a7d35c83, 075205dd17d1c09a43d3332d9cdd3002baafd891, 424f8b423fe798eb9660b606940a322cea718d57, d87a667d7d1c87891f4618a336263cfa383e1bd0, dd36cd7a9d0759be4d36546254f4f85327ccf49a, 2bd5dea2ae19009478e1618cc14043c3e7253d61, 6a19104b72543483923aa619cdfc09f6d246b125
+- Commits: 82867a2110f6cfa500913f34fa3984f11ab8222b, c25ff2c605ddaf51941a69593e9e11a7abcd9b83, 9d9273e016485af63cad0bb0ebdb8f86469d8e98, 161b03e4d05d955b7246e7536d8e122fcafd1403, ed8cbe13f277229896b7c03945152891a7d35c83, 075205dd17d1c09a43d3332d9cdd3002baafd891, 424f8b423fe798eb9660b606940a322cea718d57, d87a667d7d1c87891f4618a336263cfa383e1bd0, dd36cd7a9d0759be4d36546254f4f85327ccf49a, 2bd5dea2ae19009478e1618cc14043c3e7253d61, 6a19104b72543483923aa619cdfc09f6d246b125, f7ed2fdfc31fba4e1c53068c3d9cc6974c1719e1, fbde468e17a1cc57199d6e03fe69a44eb7b90722, b416b65b79acc4fd8e1143adab428b16d416e96a
 - Owned-Files:
   - cron/deferrals.py
+  - cron/delivery_queue.py
   - cron/outcomes.py
   - cron/executions.py
   - cron/incidents.py
@@ -84,6 +94,9 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/cron/test_deferred_obligations.py
   - tests/cron/test_delivery_no_unawaited_coroutines.py
   - tests/cron/test_delivery_outbox.py
+  - tests/cron/test_cron_live_bot_delivery.py
+  - tests/cron/test_delivery_crash_boundary.py
+  - tests/cron/test_delivery_queue.py
   - tests/cron/test_detached_runs.py
   - tests/cron/test_execution_ledger.py
   - tests/cron/test_execution_schema_migration.py
@@ -256,7 +269,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 13
+- Ledger-Revision: 15
 - History-Reconciliations: none
 - Owned-Files:
   - docs/FORK_CHANGES.md
@@ -264,7 +277,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
 - Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction.
-- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, an unrevisioned authorization, or a delete/recreate revision reset.
+- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
 - Disposition: active

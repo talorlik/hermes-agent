@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -18,6 +19,7 @@ from tests.ci.test_check_fork_ledger import (
     _make_fork_repo,
     _multi_owned_feature_ledger,
     _run_checker,
+    _run_checker_raw,
     _write_ledger,
 )
 
@@ -110,6 +112,26 @@ def test_relative_ledger_path_is_resolved_from_repo(tmp_path: Path) -> None:
         cwd=tmp_path,
     )
     assert code == 0, payload
+
+
+def test_internal_symlink_ledger_redirection_is_rejected(tmp_path: Path) -> None:
+    fx = _make_fork_repo(tmp_path)
+    repo = cast(Path, fx["repo"])
+    _write_ledger(
+        repo,
+        _entry(
+            "G-FEATURE",
+            "fork feature",
+            commits=f"{fx['fork_a']}, {fx['fork_b']}",
+            owned_files=["fork_feature.py"],
+        ),
+    )
+    (repo / "docs" / "linked-ledger.md").symlink_to("FORK_CHANGES.md")
+
+    code, payload = _run_checker(repo, "--ledger", "docs/linked-ledger.md")
+
+    assert code == 2
+    assert "symlink" in payload["error"]
 
 
 def test_symlink_ledger_escape_is_rejected(tmp_path: Path) -> None:
@@ -832,6 +854,823 @@ def test_initial_history_field_increments_existing_ledger_revision(
         )
 
 
+def test_inherited_activation_then_local_change_still_sticky(tmp_path: Path) -> None:
+    repo = tmp_path / "inherited-sticky-activation"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "upstream-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _history_ledger_entry(reconciliation, "7"))
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate reconciliation")
+
+    _git(repo, "checkout", "-b", "fork-main")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    lines = [
+        line
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("- History-Reconciliations:")
+    ]
+    ledger.write_text(
+        "\n".join(lines).replace("- Ledger-Revision: 7", "- Ledger-Revision: 8") + "\n",
+        encoding="utf-8",
+    )
+    removal = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="remove inherited reconciliation"
+    )
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert any(
+        ("removed" in problem or "removal" in problem) and removal in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_historical_precedence_parser_error_cannot_be_laundered(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "historical-precedence-laundering"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    baseline = _history_ledger_entry("none", "1").replace(
+        "- History-Reconciliations: none\n", ""
+    )
+    _write_ledger(repo, baseline)
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="publish ledger baseline")
+    _git(repo, "checkout", "-b", "fork-main")
+
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    malformed_block = "\n## Path-Precedence\n\n- malformed precedence row\n"
+    ledger.write_text(
+        ledger
+        .read_text(encoding="utf-8")
+        .replace("- Ledger-Revision: 1", "- Ledger-Revision: 2")
+        .replace(
+            "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+            f"- History-Reconciliations: {reconciliation}\n"
+            "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+            1,
+        )
+        + malformed_block,
+        encoding="utf-8",
+    )
+    activation = _commit_existing(
+        repo,
+        "docs/FORK_CHANGES.md",
+        subject="authorize malformed historical precedence",
+    )
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(malformed_block, ""),
+        encoding="utf-8",
+    )
+    cleanup = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="clean precedence syntax"
+    )
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Commits: self", f"- Commits: self, {cleanup}", 1
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="map precedence cleanup")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert any(
+        "historical Path-Precedence" in problem and activation in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_temporal_precedence_cannot_launder_activation(tmp_path: Path) -> None:
+    repo = tmp_path / "temporal-precedence"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    baseline = _history_ledger_entry("none", "1").replace(
+        "- History-Reconciliations: none\n", ""
+    )
+    baseline += _entry(
+        "G-OTHER",
+        "competing ledger owner",
+        commits="none",
+        owned_files=["docs/FORK_CHANGES.md"],
+    )
+    baseline += "## Path-Precedence\n\n- docs/FORK_CHANGES.md: G-OTHER\n"
+    _write_ledger(repo, baseline)
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="publish ledger baseline")
+    _git(repo, "checkout", "-b", "fork-main")
+
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger
+        .read_text(encoding="utf-8")
+        .replace("- Ledger-Revision: 1", "- Ledger-Revision: 2")
+        .replace(
+            "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+            f"- History-Reconciliations: {reconciliation}\n"
+            "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    activation = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="activate under losing precedence"
+    )
+    ledger.write_text(
+        ledger
+        .read_text(encoding="utf-8")
+        .replace(
+            "- Protected-Invariant: Fork feature stays enabled.",
+            "- Protected-Invariant: Fork feature stays enabled under ledger ownership.",
+            1,
+        )
+        .replace(
+            "- docs/FORK_CHANGES.md: G-OTHER",
+            "- docs/FORK_CHANGES.md: G-FORK-LEDGER",
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="flip ledger precedence")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert any(
+        "effective G-FORK-LEDGER ownership" in problem and activation in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_inherited_unchanged_activation_is_accepted(tmp_path: Path) -> None:
+    repo = tmp_path / "inherited-activation"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "retired-main", root)
+    retired = _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "upstream-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _history_ledger_entry(reconciliation, "7"))
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate reconciliation")
+
+    _git(repo, "checkout", "-b", "fork-main")
+    unrelated = _commit_file(
+        repo, "unrelated.py", "UNRELATED = 1\n", "add unrelated fork work"
+    )
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8")
+        + _entry(
+            "G-OTHER",
+            "unrelated fork work",
+            commits=f"{unrelated}, self",
+            owned_files=["unrelated.py", "docs/FORK_CHANGES.md"],
+        )
+        + "## Path-Precedence\n\n"
+        + "- docs/FORK_CHANGES.md: G-OTHER\n",
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="map unrelated fork work")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 0, payload
+    assert payload["ok"] is True
+    assert payload["counts"]["history_reconciliations"] == 1
+    assert payload["history_reconciliations"][0]["sha"] == reconciliation
+    assert payload["history_reconciliations"][0]["retired_commits"] == [retired]
+    inherited_problems = [
+        problem
+        for item in payload["invalid_entries"]
+        if item["id"] == "G-FORK-LEDGER"
+        for problem in item["problems"]
+    ]
+    assert not any(
+        "self-owned" in problem
+        or "effective G-FORK-LEDGER ownership" in problem
+        or "outside evaluated range" in problem
+        for problem in inherited_problems
+    )
+
+
+def test_boundary_activation_reuse_same_revision_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "boundary-activation-reuse"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+
+    reconciliations: list[str] = []
+    for index in (1, 2):
+        branch = f"retired-{index}"
+        _git(repo, "checkout", "-b", branch, root)
+        _commit_file(
+            repo,
+            f"retired-{index}.py",
+            f"RETIRED_{index} = 1\n",
+            f"retired work {index}",
+        )
+        _git(repo, "checkout", "upstream-main")
+        _git(
+            repo,
+            "merge",
+            "--no-ff",
+            "-s",
+            "ours",
+            "-m",
+            f"history reconciliation {index}",
+            branch,
+        )
+        reconciliations.append(_git(repo, "rev-parse", "HEAD"))
+
+    _write_ledger(repo, _history_ledger_entry(reconciliations[0], "7"))
+    _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="activate first reconciliation"
+    )
+    _git(repo, "checkout", "-b", "fork-main")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            f"- History-Reconciliations: {reconciliations[0]}",
+            "- History-Reconciliations: " + ", ".join(reconciliations),
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="authorize second reconciliation"
+    )
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert any(
+        "strictly increase the persistent Ledger-Revision floor" in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_activation_floor_seeded_from_upstream_boundary(tmp_path: Path) -> None:
+    repo = tmp_path / "boundary-revision-floor"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _write_ledger(
+        repo,
+        _history_ledger_entry("none", "50").replace(
+            "- History-Reconciliations: none\n", ""
+        ),
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="publish revision 50")
+    _git(repo, "checkout", "-b", "fork-main")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace("- Ledger-Revision: 50\n", ""),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="drop revision line")
+
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    text = ledger.read_text(encoding="utf-8").replace(
+        "- Commits: self\n",
+        "- Commits: self\n"
+        "- Ledger-Revision: 1\n"
+        f"- History-Reconciliations: {reconciliation}\n",
+    )
+    ledger.write_text(text, encoding="utf-8")
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate reconciliation")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert any("floor 50" in problem for problem in _ledger_problems(payload))
+
+
+def test_merge_cannot_discard_a_different_active_parent_token_set(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "cross-parent-token-discard"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    baseline = _history_ledger_entry("none", "1").replace(
+        "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+        "- Owned-Files:\n  - docs/FORK_CHANGES.md\n  - side-marker.py",
+    )
+    _write_ledger(repo, baseline)
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate baseline state")
+    _git(repo, "checkout", "-b", "fork-main")
+    _git(repo, "checkout", "-b", "divergent-side")
+    side_token = _commit_file(
+        repo, "side-marker.py", "SIDE = 1\n", "add side authorization token"
+    )
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger
+        .read_text(encoding="utf-8")
+        .replace("- Ledger-Revision: 1", "- Ledger-Revision: 2")
+        .replace(
+            "- History-Reconciliations: none",
+            f"- History-Reconciliations: {side_token}",
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="authorize side token")
+
+    _git(repo, "checkout", "fork-main")
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Ledger-Revision: 1", "- Ledger-Revision: 2"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="reserve main revision")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "discard divergent side authorization",
+        "divergent-side",
+    )
+    discarding_merge = _git(repo, "rev-parse", "HEAD")
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Commits: self", f"- Commits: self, {side_token}, {discarding_merge}"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="map merge topology")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert any(
+        "must include every active parent token" in problem
+        and discarding_merge in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_cross_parent_activation_cannot_be_discarded_as_retired_history(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "cross-parent-activation-disappearance"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "fork-main")
+    _git(repo, "checkout", "-b", "activated-side")
+    _write_ledger(repo, _history_ledger_entry("none", "100"))
+    _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="activate side history state"
+    )
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "discard activated side state",
+        "activated-side",
+    )
+    disappearing_merge = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _history_ledger_entry(disappearing_merge, "101"))
+    _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="activate main history state"
+    )
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert payload["ok"] is False
+    assert any(
+        "must not disappear after history activation" in problem
+        and disappearing_merge in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_reachable_duplicate_history_field_cannot_be_laundered(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "side-branch-duplicate-history"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "upstream-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    inherited_reconciliation = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _history_ledger_entry(inherited_reconciliation, "7"))
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate reconciliation")
+    _git(repo, "checkout", "-b", "fork-main")
+    _git(repo, "checkout", "-b", "malformed-side")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            f"- History-Reconciliations: {inherited_reconciliation}",
+            f"- History-Reconciliations: {inherited_reconciliation}\n"
+            "- History-Reconciliations: malformed",
+        ),
+        encoding="utf-8",
+    )
+    malformed = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="duplicate inherited history field"
+    )
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "discard malformed side state",
+        "malformed-side",
+    )
+    side_merge = _git(repo, "rev-parse", "HEAD")
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Commits: self", f"- Commits: self, {malformed}, {side_merge}"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="map malformed side state")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert payload["ok"] is False
+    assert any(
+        "duplicate field: History-Reconciliations" in problem and malformed in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_side_branch_first_entry_revision_high_water_seeds_floor(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "side-branch-first-entry-floor"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "fork-main")
+    _git(repo, "checkout", "-b", "high-revision-side")
+    _write_ledger(
+        repo,
+        _history_ledger_entry("none", "100").replace(
+            "- History-Reconciliations: none\n", ""
+        ),
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="reserve revision 100")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "retire high revision side branch",
+        "high-revision-side",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _history_ledger_entry(reconciliation, "1"))
+    activation = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="activate reconciliation"
+    )
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert payload["ok"] is False
+    assert any(
+        "floor 100" in problem and activation in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_problem"),
+    [
+        ("remove-marker", "must not be removed after activation"),
+        ("regress-revision", "revision regressed below"),
+        ("malformed-revision", "positive decimal Ledger-Revision"),
+    ],
+)
+def test_reachable_side_branch_cannot_launder_inherited_revision_state(
+    tmp_path: Path, mutation: str, expected_problem: str
+) -> None:
+    repo = tmp_path / "side-branch-inherited-removal"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "upstream-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    inherited_reconciliation = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _history_ledger_entry(inherited_reconciliation, "7"))
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate reconciliation")
+    _git(repo, "checkout", "-b", "fork-main")
+    _git(repo, "checkout", "-b", "marker-removal-side")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger_text = ledger.read_text(encoding="utf-8")
+    if mutation == "remove-marker":
+        ledger_text = (
+            "\n".join(
+                line
+                for line in ledger_text.splitlines()
+                if not line.startswith("- History-Reconciliations:")
+            )
+            + "\n"
+        )
+    elif mutation == "regress-revision":
+        ledger_text = ledger_text.replace(
+            "- Ledger-Revision: 7", "- Ledger-Revision: 1"
+        )
+    else:
+        ledger_text = ledger_text.replace(
+            "- Ledger-Revision: 7", "- Ledger-Revision: malformed"
+        )
+    ledger.write_text(ledger_text, encoding="utf-8")
+    removal = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="remove inherited history marker"
+    )
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "discard marker removal side branch",
+        "marker-removal-side",
+    )
+    side_merge = _git(repo, "rev-parse", "HEAD")
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Commits: self", f"- Commits: self, {removal}, {side_merge}"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="map discarded side branch")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert payload["ok"] is False
+    assert any(
+        expected_problem in problem and removal in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_side_branch_revision_high_water_seeds_floor(tmp_path: Path) -> None:
+    repo = tmp_path / "side-branch-revision-floor"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    base = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    _git(repo, "checkout", "-b", "fork-main")
+    _write_ledger(repo, _history_ledger_entry("none", "2"))
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="add baseline ledger")
+
+    _git(repo, "checkout", "-b", "high-revision-side")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Ledger-Revision: 2", "- Ledger-Revision: 100"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="reserve revision 100")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "merge high revision side branch",
+        "high-revision-side",
+    )
+    side_merge = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-b", "retired-main", base)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
+    text = ledger.read_text(encoding="utf-8").replace(
+        "- Commits: self", f"- Commits: self, {side_merge}"
+    )
+    text = text.replace("- Ledger-Revision: 2", "- Ledger-Revision: 3")
+    text = text.replace(
+        "- History-Reconciliations: none",
+        f"- History-Reconciliations: {reconciliation}",
+    )
+    ledger.write_text(text, encoding="utf-8")
+    activation = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="activate reconciliation"
+    )
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    assert payload["ok"] is False
+    assert any(
+        "floor 100" in problem and activation in problem
+        for problem in _ledger_problems(payload)
+    )
+
+
+def test_invalid_revision_is_rejected_without_history_at_boundary_and_reachable_snapshot(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "invalid-revision-without-history"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    baseline = _history_ledger_entry("none", "malformed").replace(
+        "- History-Reconciliations: none\n", ""
+    )
+    _write_ledger(repo, baseline)
+    boundary = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="publish malformed boundary revision"
+    )
+    _git(repo, "checkout", "-b", "fork-main")
+    ledger = repo / "docs" / "FORK_CHANGES.md"
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Ledger-Revision: malformed", "- Ledger-Revision: 1"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="repair revision")
+    _git(repo, "checkout", "-b", "invalid-revision-side")
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Ledger-Revision: 1", f"- Ledger-Revision: {'9' * 65}"
+        ),
+        encoding="utf-8",
+    )
+    invalid_snapshot = _commit_existing(
+        repo, "docs/FORK_CHANGES.md", subject="publish oversized side revision"
+    )
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "discard invalid side revision",
+        "invalid-revision-side",
+    )
+    side_merge = _git(repo, "rev-parse", "HEAD")
+    ledger.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "- Commits: self", f"- Commits: self, {side_merge}"
+        ),
+        encoding="utf-8",
+    )
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="map revision merge")
+
+    code, payload = _run_checker(repo, materialize_ledger=False)
+
+    assert code == 1
+    problems = _ledger_problems(payload)
+    assert any(
+        "invalid Ledger-Revision" in problem and boundary in problem
+        for problem in problems
+    )
+    assert any(
+        "invalid Ledger-Revision" in problem and invalid_snapshot in problem
+        for problem in problems
+    )
+
+
+def test_oversized_ledger_revision_fails_closed(tmp_path: Path) -> None:
+    fx = _make_reconciliation_repo(tmp_path, initial_revision="9" * 5000)
+    repo = cast(Path, fx["repo"])
+
+    proc = _run_checker_raw(repo)
+
+    assert proc.returncode == 1
+    assert proc.stdout.count("\n{") == 0
+    assert proc.stdout.strip().startswith("{")
+    payload = json.loads(proc.stdout)
+    assert payload["ok"] is False
+    assert any(
+        "Ledger-Revision" in problem and "digits" in problem
+        for problem in _ledger_problems(payload)
+    )
+    assert "Traceback" not in proc.stderr
+    assert "ValueError" not in proc.stderr
+
+
 @pytest.mark.parametrize(
     "revision",
     [None, "0", "-1", "malformed"],
@@ -1046,22 +1885,52 @@ def test_reconciliation_change_rejects_invalid_revision_transition(
 def test_history_authorization_requires_effective_ledger_ownership(
     tmp_path: Path,
 ) -> None:
-    fx = _make_reconciliation_repo(tmp_path)
-    repo = cast(Path, fx["repo"])
+    repo = tmp_path / "losing-history-owner"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    root = _commit_file(repo, "core.py", "BASE = 1\n", "upstream base")
+    baseline = _history_ledger_entry("none", "1").replace(
+        "- History-Reconciliations: none\n", ""
+    )
+    baseline += _entry(
+        "G-OTHER",
+        "competing ledger owner",
+        commits="none",
+        owned_files=["docs/FORK_CHANGES.md"],
+    )
+    baseline += "## Path-Precedence\n\n- docs/FORK_CHANGES.md: G-OTHER\n"
+    _write_ledger(repo, baseline)
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="publish losing precedence")
+    _git(repo, "checkout", "-b", "fork-main")
+
+    _git(repo, "checkout", "-b", "retired-main", root)
+    _commit_file(repo, "retired.py", "RETIRED = 1\n", "retired work")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-s",
+        "ours",
+        "-m",
+        "history reconciliation",
+        "retired-main",
+    )
+    reconciliation = _git(repo, "rev-parse", "HEAD")
     ledger = repo / "docs" / "FORK_CHANGES.md"
     ledger.write_text(
-        ledger.read_text(encoding="utf-8")
-        + _entry(
-            "G-OTHER",
-            "competing ledger owner",
-            commits="self",
-            owned_files=["docs/FORK_CHANGES.md"],
-        )
-        + "## Path-Precedence\n\n"
-        + "- `docs/FORK_CHANGES.md`: G-OTHER\n",
+        ledger
+        .read_text(encoding="utf-8")
+        .replace("- Ledger-Revision: 1", "- Ledger-Revision: 2")
+        .replace(
+            "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+            f"- History-Reconciliations: {reconciliation}\n"
+            "- Owned-Files:\n  - docs/FORK_CHANGES.md",
+            1,
+        ),
         encoding="utf-8",
     )
-    _git(repo, "commit", "-am", "move effective ledger ownership")
+    _commit_existing(repo, "docs/FORK_CHANGES.md", subject="activate reconciliation")
 
     code, payload = _run_checker(repo, materialize_ledger=False)
 
