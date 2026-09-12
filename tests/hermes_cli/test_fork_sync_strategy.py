@@ -52,6 +52,7 @@ class TestForkSyncStrategy:
         origin_ahead,
         upstream_ahead,
         merge_rc=0,
+        tag_rc=0,
         test_rc=0,
         head_sha: str | None = "feedbead1234567890",
         calls=None,
@@ -80,6 +81,13 @@ class TestForkSyncStrategy:
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout=f"{upstream_ahead}\n", stderr=""
                 )
+            if "tag pre-upstream-sync-" in joined:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    tag_rc,
+                    stdout="",
+                    stderr="tag creation failed" if tag_rc else "",
+                )
             if "merge" in joined and "--no-edit" in joined:
                 return subprocess.CompletedProcess(cmd, merge_rc, stdout="", stderr="")
             if "-c import pytest, pytest_asyncio" in joined:
@@ -102,6 +110,7 @@ class TestForkSyncStrategy:
         origin_ahead,
         upstream_ahead,
         merge_rc=0,
+        tag_rc=0,
         test_rc=0,
         head_sha: str | None = "feedbead1234567890",
         syntax=(True, None, None),
@@ -118,6 +127,7 @@ class TestForkSyncStrategy:
                 origin_ahead,
                 upstream_ahead,
                 merge_rc=merge_rc,
+                tag_rc=tag_rc,
                 test_rc=test_rc,
                 head_sha=head_sha,
                 calls=calls,
@@ -159,6 +169,18 @@ class TestForkSyncStrategy:
         assert not any("push" in c for c in calls)
         out = capsys.readouterr().out
         assert "sync stopped, nothing was changed" in out
+
+    def test_merge_strategy_tag_failure_never_merges_or_pushes(self, capsys):
+        calls = self._run_sync(
+            strategy="merge",
+            origin_ahead=2,
+            upstream_ahead=5,
+            tag_rc=1,
+        )
+
+        assert not any("merge --no-edit" in call for call in calls)
+        assert not any("push" in call for call in calls)
+        assert "recovery tag" in capsys.readouterr().out.lower()
 
     def test_merge_strategy_syntax_failure_rolls_back_and_never_pushes(self, capsys):
         """The post-merge syntax guard resets to the pre-merge SHA instead of

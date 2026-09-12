@@ -455,13 +455,23 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
             print("  ✗ Could not capture the pre-sync HEAD. Skipping upstream sync.")
             return False
         sync_tag = f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        subprocess.run(
+        tag_result = subprocess.run(
             git_cmd + ["tag", sync_tag],
             cwd=cwd,
             capture_output=True,
-            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             **_no_prompt_git_kwargs(),
         )
+        if tag_result.returncode != 0:
+            detail = (tag_result.stderr or tag_result.stdout or "unknown Git error").strip()
+            print(
+                "  ✗ Could not create the pre-upstream-sync recovery tag. "
+                "Skipping upstream sync."
+            )
+            print(f"  Git reported: {detail}")
+            return False
         merge_result = subprocess.run(
             git_cmd + ["merge", "--no-edit", "upstream/main"],
             cwd=cwd,
