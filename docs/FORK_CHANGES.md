@@ -118,12 +118,15 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-LIFECYCLE: durable Kanban lifecycle contracts and CAS guards
-- Commits: 97a8adab283e5b3e292d1cca4dd019149c62d544, b14684474269d1e7b32a881fdf387fa6b85ca13f, 690611dd293b2ebea1d98628f4e7d8a3cf7de14f, 4996728aa28bfc3ac1b05b42d6625c6af79b8138, f496346d2ee17a48295de9f1140108bc4ff35942, f8443d665d5deba0177057559d987d0a116a5314, 18e0b13a50e23f70d67aa345ebbc22be79f82d50, e742bfb874138deca7d797d941a1b834ff067f76, 39a6be8ba3339a26b73f637bde3785cf0781cbed, 49019067125ff63a3be2d65aaf37f7469dc630b0, 9a27c914ae3fd0d9700946e806fb038b61ecf288
+- Commits: 97a8adab283e5b3e292d1cca4dd019149c62d544, b14684474269d1e7b32a881fdf387fa6b85ca13f, 690611dd293b2ebea1d98628f4e7d8a3cf7de14f, 4996728aa28bfc3ac1b05b42d6625c6af79b8138, f496346d2ee17a48295de9f1140108bc4ff35942, f8443d665d5deba0177057559d987d0a116a5314, 18e0b13a50e23f70d67aa345ebbc22be79f82d50, e742bfb874138deca7d797d941a1b834ff067f76, 39a6be8ba3339a26b73f637bde3785cf0781cbed, 49019067125ff63a3be2d65aaf37f7469dc630b0, 9a27c914ae3fd0d9700946e806fb038b61ecf288, 66b92833a99cc2e9176809b24ca63b67d0b467b5, 7adbe4ecbfefa5796995149aae49d69e9bb8fb4d, cbd0d6ba095a0ac5064c25c66cdc77d3a4423659, bac93d67aed81f5d36fd0974259539bb86e8efba
 - Owned-Files:
   - hermes_cli/kanban.py
   - hermes_cli/kanban_db.py
   - hermes_cli/kanban_db_connect.py
   - hermes_cli/kanban_parser.py
+  - apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
+  - plugins/kanban/dashboard/dist/index.js
+  - plugins/kanban/dashboard/dist/style.css
   - plugins/kanban/dashboard/plugin_api.py
   - tools/kanban_tools.py
   - tests/hermes_cli/test_kanban_cli_exit_status.py
@@ -135,22 +138,11 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/hermes_cli/test_kanban_write_txn_busy_retry.py
   - tests/plugins/test_kanban_dashboard_plugin.py
   - tests/tools/test_kanban_tools.py
-- Intent: Compare-and-swap guards on card lifecycle transitions (claim, complete with expected status, expected-run-id), idempotent guarded comments, claim-replay hardening, lifecycle authorship receipts, and busy-retry on write transactions, so concurrent agents cannot corrupt board state or double-claim cards.
-- Protected-Invariant: A lifecycle transition observed under a stale expectation fails with a nonzero exit instead of silently overwriting; replayed claims and repeated guarded comments are idempotent; lifecycle receipts identify the author.
-- Tests: tests/hermes_cli/test_kanban_db.py, tests/hermes_cli/test_kanban_cli_exit_status.py, tests/tools/test_kanban_tools.py
-- Retirement-Condition: Upstream ships equivalent CAS lifecycle guards and receipts for the Kanban board.
-- Disposition: active
-
-## G-KANBAN-DEEPLINKS: browser task deep links in the Kanban dashboard
-- Commits: 66b92833a99cc2e9176809b24ca63b67d0b467b5, 7adbe4ecbfefa5796995149aae49d69e9bb8fb4d, cbd0d6ba095a0ac5064c25c66cdc77d3a4423659
-- Owned-Files:
-  - plugins/kanban/dashboard/dist/index.js
-  - apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
   - website/docs/user-guide/features/kanban.md
-- Intent: Deep links from Kanban dashboard cards into browser tasks, plus reconciliation of the automated formatter output for the bundled dashboard test.
-- Protected-Invariant: Dashboard card links resolve to their task views; the dist bundle and its test stay in sync.
-- Tests: apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
-- Retirement-Condition: Upstream ships task deep links in the Kanban dashboard bundle.
+- Intent: Protect durable Kanban lifecycle transitions and serve the board dashboard's task deep links and bounded schema-v2 orchestration summaries without coupling board operations to a producer.
+- Protected-Invariant: Stale lifecycle transitions fail closed; replayed claims and guarded comments are idempotent; summary paths stay profile-confined and unsafe or inconsistent files remain panel-local; stale asynchronous responses cannot overwrite the selected board.
+- Tests: tests/hermes_cli/test_kanban_db.py, tests/hermes_cli/test_kanban_cli_exit_status.py, tests/tools/test_kanban_tools.py, tests/plugins/test_kanban_dashboard_plugin.py, apps/desktop/src/plugins/kanban/dashboard-bundle.test.tsx
+- Retirement-Condition: Upstream ships equivalent Kanban lifecycle guards, task deep links, and a profile-safe schema-v2 board-summary endpoint and panel.
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
@@ -269,7 +261,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 16
+- Ledger-Revision: 17
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
