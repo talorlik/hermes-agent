@@ -942,7 +942,7 @@ def test_pre_resolved_conflict_sync_merge_is_exempt(tmp_path):
 
 
 def test_repo_ledger_exists_and_every_entry_is_well_formed():
-    ledger = REPO_ROOT / "website" / "docs" / "developer-guide" / "FORK_CHANGES.md"
+    ledger = REPO_ROOT / "docs" / "FORK_CHANGES.md"
     assert ledger.is_file(), "docs/FORK_CHANGES.md is missing"
     mod = _load_checker_module()
     entries = mod.parse_ledger(ledger.read_text(encoding="utf-8"))
@@ -954,7 +954,7 @@ def test_repo_ledger_exists_and_every_entry_is_well_formed():
 
 
 def test_repo_ledger_entry_ids_are_unique():
-    ledger = REPO_ROOT / "website" / "docs" / "developer-guide" / "FORK_CHANGES.md"
+    ledger = REPO_ROOT / "docs" / "FORK_CHANGES.md"
     mod = _load_checker_module()
     entries = mod.parse_ledger(ledger.read_text(encoding="utf-8"))
     ids = [e.entry_id for e in entries]

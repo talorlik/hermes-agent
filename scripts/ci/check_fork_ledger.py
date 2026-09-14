@@ -1497,7 +1497,7 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = args.repo or Path(__file__).resolve().parents[2]
     if args.ledger is None:
-        ledger = repo / "website" / "docs" / "developer-guide" / "FORK_CHANGES.md"
+        ledger = repo / "docs" / "FORK_CHANGES.md"
     else:
         ledger = args.ledger if args.ledger.is_absolute() else repo / args.ledger
     try:
