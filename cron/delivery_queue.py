@@ -22,7 +22,6 @@ from typing import Callable, Iterator, Optional, Sequence
 
 from agent.redact import redact_sensitive_text
 from cron.executions import _owner_is_live, _process_start_time
-from hermes_cli.sqlite_util import add_column_if_missing
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
@@ -75,74 +74,82 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_cli.sqlite_util import add_column_if_missing
+
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS deliveries (
+             execution_id TEXT PRIMARY KEY,
+             job_json TEXT NOT NULL,
+             content TEXT NOT NULL,
+             destination_json TEXT,
+             destination_hash TEXT,
+             outbox_id TEXT,
+             delivery_contract INTEGER NOT NULL DEFAULT 0,
+             generation INTEGER NOT NULL DEFAULT 0,
+             state TEXT,
+             owner_token TEXT,
+             lease_expires_at TEXT,
+             outcome_error TEXT,
+             for_failure INTEGER NOT NULL DEFAULT 0,
+             status TEXT NOT NULL CHECK(status IN
+               ('pending','delivering','delivered','failed','unknown')),
+             owner_process_id TEXT,
+             owner_pid INTEGER,
+             owner_started_at INTEGER,
+             created_at TEXT NOT NULL,
+             finished_at TEXT,
+             error TEXT
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delivery_tombstones (
+             execution_id TEXT PRIMARY KEY,
+             terminal_status TEXT NOT NULL CHECK(terminal_status IN
+               ('delivered','failed','unknown')),
+             finished_at TEXT
+           )"""
+    )
+    additive = (
+        ("for_failure", "for_failure INTEGER NOT NULL DEFAULT 0"),
+        ("destination_json", "destination_json TEXT"),
+        ("outbox_id", "outbox_id TEXT"),
+        ("delivery_contract", "delivery_contract INTEGER NOT NULL DEFAULT 0"),
+        ("destination_hash", "destination_hash TEXT"),
+        ("generation", "generation INTEGER NOT NULL DEFAULT 0"),
+        ("state", "state TEXT"),
+        ("owner_token", "owner_token TEXT"),
+        ("lease_expires_at", "lease_expires_at TEXT"),
+        ("outcome_error", "outcome_error TEXT"),
+    )
+    for column, ddl in additive:
+        add_column_if_missing(conn, "deliveries", column, ddl)
+
+
+def _connect() -> sqlite3.Connection:
+    # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
+    # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
+    # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
+    from hermes_cli.sqlite_util import open_db
+
+    path = _path()
+    conn = open_db(path, db_label="cron/deliveries.db", synchronous_full=True, initialize=_initialize_schema)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return conn
+
+
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    with _lock:
-        path = _path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, timeout=5)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-        conn.row_factory = sqlite3.Row
-        try:
-            from hermes_state_wal import apply_wal_with_fallback
+    # Pruning is done explicitly by the paths that create terminal
+    # rows (_finish / recover_abandoned / _terminalize_wait_timeout);
+    # read-only polls must not pay for a full-table UPDATE + COUNT.
+    from hermes_cli.sqlite_util import transaction
 
-            conn.execute("PRAGMA busy_timeout=5000")
-            apply_wal_with_fallback(conn, db_label="cron/deliveries.db")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS deliveries (
-                     execution_id TEXT PRIMARY KEY,
-                     job_json TEXT NOT NULL,
-                     content TEXT NOT NULL,
-                     destination_json TEXT,
-                     destination_hash TEXT,
-                     outbox_id TEXT,
-                     delivery_contract INTEGER NOT NULL DEFAULT 0,
-                     generation INTEGER NOT NULL DEFAULT 0,
-                     state TEXT,
-                     owner_token TEXT,
-                     lease_expires_at TEXT,
-                     outcome_error TEXT,
-                     for_failure INTEGER NOT NULL DEFAULT 0,
-                     status TEXT NOT NULL CHECK(status IN
-                       ('pending','delivering','delivered','failed','unknown')),
-                     owner_process_id TEXT,
-                     owner_pid INTEGER,
-                     owner_started_at INTEGER,
-                     created_at TEXT NOT NULL,
-                     finished_at TEXT,
-                     error TEXT
-                   )"""
-            )
-            conn.execute(
-                """CREATE TABLE IF NOT EXISTS delivery_tombstones (
-                     execution_id TEXT PRIMARY KEY,
-                     terminal_status TEXT NOT NULL CHECK(terminal_status IN
-                       ('delivered','failed','unknown')),
-                     finished_at TEXT
-                   )"""
-            )
-            additive = (
-                ("for_failure", "for_failure INTEGER NOT NULL DEFAULT 0"),
-                ("destination_json", "destination_json TEXT"),
-                ("outbox_id", "outbox_id TEXT"),
-                ("delivery_contract", "delivery_contract INTEGER NOT NULL DEFAULT 0"),
-                ("destination_hash", "destination_hash TEXT"),
-                ("generation", "generation INTEGER NOT NULL DEFAULT 0"),
-                ("state", "state TEXT"),
-                ("owner_token", "owner_token TEXT"),
-                ("lease_expires_at", "lease_expires_at TEXT"),
-                ("outcome_error", "outcome_error TEXT"),
-            )
-            for column, ddl in additive:
-                add_column_if_missing(conn, "deliveries", column, ddl)
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+    with _lock, transaction(_connect()) as conn:
+        yield conn
 
 
 def _delivery_key(execution_id: str, outbox_id: Optional[str]) -> str:

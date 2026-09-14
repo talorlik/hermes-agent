@@ -41,6 +41,8 @@ from cron.jobs import (
     pause_job,
     remove_job,
     resolve_job_ref,
+    resnapshot_all_unpinned,
+    resnapshot_job,
     resume_job,
     update_job)
 from tools.cronjob_prompt_scan import _scan_cron_prompt
@@ -826,8 +828,51 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
         {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
 
 
+def _action_resnap(a: Dict[str, Any]) -> str:
+    """Refresh stored effective pins to the current global inference resolution (#44585).
+
+    Bulk (``all=true``) refreshes every unpinned job; single-job resolves
+    ``job_id`` and refreshes just that job. Refuses to guess scope.
+    """
+    if bool(a["all"]):
+        updated = resnapshot_all_unpinned()
+        _notify_provider_jobs_changed_safe()
+        return _dumps({
+            "success": True,
+            "message": (
+                f"Refreshed inference snapshots on {len(updated)} unpinned "
+                "job(s). Successfully resolved axes are re-pinned to current "
+                "defaults until another resnap; unresolved axes retain their "
+                "prior snapshots."),
+            "updated_jobs": [_format_job(j) for j in updated],
+        })
+    job_id = a["job_id"]
+    if not job_id:
+        return tool_error(
+            "resnap requires either `job_id=<id>` (single job) or `all=true` "
+            "(refresh every unpinned job). Refusing to guess scope.",
+            success=False,
+        )
+    job, error = _resolve_job_or_error(job_id)
+    if error is not None:
+        return error
+    assert job is not None  # error is None ⇔ job resolved
+    updated = resnapshot_job(job["id"])
+    if not updated:
+        return tool_error(f"Failed to resnap job '{job_id}'", success=False)
+    _notify_provider_jobs_changed_safe()
+    return _dumps({
+        "success": True,
+        "message": (
+            f"Cron job '{updated['name']}' resnapshot completed. Successfully "
+            "resolved axes are re-pinned to current defaults until another "
+            "resnap; unresolved axes retain their prior snapshots."),
+        "job": _format_job(updated),
+    })
+
+
 # Actions that need no job_id, and job-bound actions (job resolved first).
-_JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
+_JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list, "resnap": _action_resnap}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
@@ -883,6 +928,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    all: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
@@ -929,6 +975,8 @@ CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
 
+'resnap' refreshes stored effective pins for an unpinned job (job_id) or all unpinned jobs (all=true). Successfully resolved axes use the CURRENT global inference defaults until another resnap; unresolved axes retain their prior snapshots.
+
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
@@ -937,11 +985,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run, resnap. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. When action=resnap, pass either job_id (single job) or all=true (every unpinned job)."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run"
+                "description": "Required for update/pause/resume/remove/run. For resnap: the job to adopt the current global inference resolution (omit if all=true)."
+            },
+            "all": {
+                "type": "boolean",
+                "description": "Only for action='resnap'. all=true re-pins every successfully resolved unpinned inference axis to its current global default until another resnap. Must be explicitly set to true — never implied. Omit (or false) to resnap a single job via job_id."
             },
             "prompt": {
                 "type": "string",
@@ -1037,8 +1089,9 @@ def check_cronjob_requirements() -> bool:
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
-    "script", "script_failure_policy", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason")
+    "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
+    "script_failure_policy",
+    "paused_reason", "all")
 
 
 def _cronjob_handler(args, **kw):

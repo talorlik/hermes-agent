@@ -39,10 +39,7 @@ from hermes_constants import get_hermes_home
 from cron.env_settings import cron_env_setting
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
-    _expand_env_vars,
-    load_config,
-    resolve_cron_model_drift_defaults,
-)
+    load_config, load_config_readonly, resolve_cron_model_drift_defaults)
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from cron.outcomes import (
@@ -510,6 +507,7 @@ from cron.jobs import (
 )
 from cron.executions import (
     _TERMINAL_STATES,
+    HANDOFF_ADOPTION_GRACE_SECONDS,
     create_execution,
     finish_execution,
     get_execution,
@@ -546,6 +544,9 @@ _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # Shutdown must not misclassify these as ownerless in-process runs: the tool
 # process sweep cannot reach the worker's transient scope.
 _restart_safe_waiter_job_ids: set[str] = set()
+# job_id -> pid of the restart-safe external worker executing it (absent for in-process runs), so a
+# drain observer can name the process holding the gateway open.
+_running_worker_pids: dict[str, int] = {}
 _running_lock = threading.Lock()
 
 # Per in-flight id: time.time() claim instant + the future owning its release (``_FUTURE_PENDING``
@@ -614,6 +615,18 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids | _running_fire_owners.keys())
 
 
+def get_running_job_details() -> list[dict]:
+    """Per in-flight job: ``{"job_id", "elapsed_s", "worker_pid"}`` (``worker_pid`` None for in-process
+    runs). The drain wait publishes this so ``hermes update`` can say WHICH job it is waiting on."""
+    now = time.time()
+    with _running_lock:
+        return [
+            {"job_id": jid, "elapsed_s": round(now - _running_since[jid], 1) if jid in _running_since else None,
+             "worker_pid": _running_worker_pids.get(jid)}
+            for jid in sorted(_running_job_ids | _running_fire_owners.keys())
+        ]
+
+
 def try_register_running_job(job_id: str) -> bool:
     """Atomically add ``job_id`` to the in-flight set; False (caller must skip) if already mid-run.
     Single dedupe owner for ticker + manual runs (the fire claim's 300s TTL is outlived by real
@@ -643,6 +656,7 @@ def release_running_job(job_id: str) -> None:
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+        _running_worker_pids.pop(job_id, None)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -1471,24 +1485,19 @@ class _CronJobConfig:
 
 
 def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
-    """The creation snapshot is an unpinned axis's effective pin: return it, logging once when it
+    """The stored snapshot is an unpinned axis's effective pin: return it, logging once when it
     differs from *current* (the live global default); ``""`` for legacy jobs without one, which keep
     following the global default. A global model/provider change must never stop a cron job; a job
-    keeps running on what it was created under until the operator pins it or sets a cron.* fleet
-    default (#44585)."""
+    keeps running on its stored snapshot until the operator resnaps it, explicitly pins it, or sets
+    a cron.* fleet default (#44585)."""
     snapshot = str(job.get(f"{axis}_snapshot") or "").strip()
     if snapshot and current and snapshot.lower() != current.lower():
         logger.info(
-            "Job '%s': running on creation-snapshot %s %r (global default is now %r); "
-            "`hermes cron edit %s --%s <value>` or cron.%s in config.yaml moves it.",
-            job_id,
-            axis,
-            snapshot,
-            current,
-            job_id,
-            axis,
-            "model" if axis == "model" else "model_provider",
-        )
+            "Job '%s': running on stored-snapshot %s %r (global default is now %r); "
+            "`hermes cron resnap %s` adopts the new default as its stored effective pin, "
+            "`hermes cron edit %s --%s <value>` or cron.%s in config.yaml pins it.",
+            job_id, axis, snapshot, current, job_id, job_id, axis,
+            "model" if axis == "model" else "model_provider")
     return snapshot
 
 
@@ -1501,17 +1510,10 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     _cfg: dict = {}
     _model_cfg: Any = {}
     try:
-        from hermes_cli.config import read_user_config_raw
-
+        from hermes_cli.config_effective import load_user_config_effective
         _cfg_path = str(_get_hermes_home() / "config.yaml")
         if os.path.exists(_cfg_path):
-            _cfg = read_user_config_raw(Path(_cfg_path))
-            # Honor administrator-pinned managed scope (fail-open; no-op without managed scope).
-            with contextlib.suppress(Exception):
-                from hermes_cli import managed_scope
-
-                _cfg = managed_scope.apply_managed_overlay(_cfg)
-            _cfg = _expand_env_vars(_cfg)
+            _cfg = load_user_config_effective(Path(_cfg_path))
             # Coerce null to {} so a falsy default never clobbers a resolved env value.
             _model_cfg = _cfg.get("model") or {}
             _cron_cfg_for_model = _cfg.get("cron") or {}
@@ -1626,7 +1628,11 @@ def _preflight_or_block(
         _pf_reason = None
     if not _pf_reason:
         return None
+    return _blocked_config_result(job_id, job_name, _pf_reason)
 
+
+def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple:
+    """The ``blocked_config`` failure tuple for *_pf_reason*, alerting once per job."""
     logger.warning(
         "Job '%s' (ID: %s): BLOCKED by pre-dispatch config validation — %s (no LLM call was made)",
         job_name,
@@ -2587,6 +2593,12 @@ def _resolve_cron_agent_setup(
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)
+    # Only now can a requested MCP toolset be judged: its alias is process-global but its tools live
+    # in this profile's registry overlay, and quiet_mode hides the empty resolution (#109050).
+    if _cron_preflight_enabled(_cfg):
+        _mcp_reason = _empty_requested_mcp_toolsets(job, _cfg)
+        if _mcp_reason:
+            setup.blocked = _blocked_config_result(job_id, job_name, _mcp_reason)
     return setup
 
 
@@ -2768,6 +2780,15 @@ def run_job(
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
+        # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+        # tail can schedule a bounded automatic re-run instead of waiting a full period.
+        try:
+            from cron.unreachable_retry import is_model_unreachable_failure
+            if is_model_unreachable_failure(e, agent):
+                job["_model_unreachable"] = True
+        except Exception:  # classification must never mask the real failure
+            logger.debug("Job '%s': unreachable-failure classification failed", job_id)
         # No audit row when we failed before the agent existed; the audit write must never raise.
         if _audit is not None:
             _audit.write({}, error_msg)
@@ -3185,6 +3206,7 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    unreachable_retry_decision: Any = None
 
 
 def _queue_owns_exact_attempt(entry: dict) -> bool:
@@ -3319,6 +3341,18 @@ def _save_compose_deliver(
     )
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
+    if d.should_deliver and not d.success and job.get("_model_unreachable"):
+        # The model was never reached and a bounded automatic re-run will be scheduled
+        # (cron/unreachable_retry.py): hold the failure notice — the re-run either
+        # delivers the real result or, once the ladder is exhausted, the next failure
+        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
+        from cron.unreachable_retry import prepare_retry
+
+        d.unreachable_retry_decision = prepare_retry(job)
+        if d.unreachable_retry_decision.should_retry:
+            d.should_deliver = False
+            logger.info(
+                "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
     if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
@@ -3439,13 +3473,13 @@ def _finish_completed_run(
 
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
-    mark_kwargs = {"delivery_error": d.delivery_error}
-    if (
-        d.success
-        and not d.delivery_error
-        and d.should_deliver
-        and job.get("last_delivery_queued")
-    ):
+    mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    if not d.success and job.pop("_model_unreachable", False):
+        # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
+        # (cron/unreachable_retry.py) inside the same fenced store write.
+        mark_kwargs["model_unreachable"] = True
+        mark_kwargs["unreachable_retry_decision"] = d.unreachable_retry_decision
+    if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
@@ -3761,7 +3795,7 @@ def _run_one_job_body(
                 )
                 _teardown_deferred()
                 return True
-            mark_kwargs = {"status": "detached"}
+            mark_kwargs: dict = {"status": "detached"}
             if fire_owner is not None:
                 mark_kwargs["expected_fire_owner"] = fire_owner
             marked = mark_job_run(job["id"], True, None, **mark_kwargs)
@@ -4003,12 +4037,13 @@ def _wait_for_external_cron_worker(
 
 
 def _launch_external_cron_worker(job: dict) -> bool:
-    """Launch *job* outside a managed gateway cgroup when required.
+    """Launch *job* outside the managed gateway process when required.
 
-    Returns ``False`` when the caller is not a managed systemd gateway and the
-    existing in-process path should be used.  In managed topology, failure to
-    establish the transient scope raises: falling back would recreate the
-    restart interruption this handoff exists to prevent.
+    Returns ``False`` outside a managed systemd gateway (in-process path).  In
+    managed topology the job always goes to an external worker with the #101940
+    ownership handoff: in a transient user scope, or — when no user D-Bus
+    session exists and ``cron.require_restart_safe_scope`` is false — as a
+    direct subprocess (process separation kept, cgroup isolation lost).
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
@@ -4038,12 +4073,19 @@ def _launch_external_cron_worker(job: dict) -> bool:
         systemd_user_bus_env,
     )
 
+    try:
+        require_restart_safe_scope = bool(
+            (load_config_readonly().get("cron") or {}).get("require_restart_safe_scope", False)
+        )
+    except Exception:
+        require_restart_safe_scope = False
     multiplex_active = is_multiplex_active()
-    scoped_command = restart_safe_gateway_child_argv(
+    dispatch = restart_safe_gateway_child_argv(
         command,
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
+        require_restart_safe_scope=require_restart_safe_scope,
     )
-    if scoped_command == command:
+    if dispatch.mode == "in_process":
         return False
 
     if mark_execution_handoff_pending(execution_id) is None:
@@ -4089,7 +4131,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     worker_env = systemd_user_bus_env(worker_env)
     try:
         process = subprocess.Popen(
-            scoped_command,
+            dispatch.argv,
             cwd=str(Path(__file__).resolve().parent.parent),
             env=worker_env,
             stdin=subprocess.DEVNULL,
@@ -4105,7 +4147,11 @@ def _launch_external_cron_worker(job: dict) -> bool:
     with _running_lock:
         _restart_safe_waiter_job_ids.add(job_id)
 
-    deadline = time.monotonic() + 5.0
+    # Same window the dead-owner recovery ledger grants a pending handoff: a cold
+    # worker start (imports + secret hydration) measures ~10-12s in the field, and
+    # a dispatch deadline shorter than the adoption grace made the two guards
+    # around one handoff disagree.
+    deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
     while time.monotonic() < deadline:
         if ack_path.exists():
             try:
@@ -4145,6 +4191,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 acknowledgement.get("pid"),
                 execution_id,
             )
+            with _running_lock, contextlib.suppress(TypeError, ValueError):
+                _running_worker_pids[job_id] = int(acknowledgement.get("pid") or process.pid)
             return _wait_for_external_cron_worker(
                 process,
                 execution_id=execution_id,
@@ -4167,9 +4215,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # handoff: that could duplicate side effects.  The execution owner/dead-owner
     # recovery ledger remains the authority.
     logger.warning(
-        "Cron external worker for job '%s' did not acknowledge within 5s; "
+        "Cron external worker for job '%s' did not acknowledge within %.0fs; "
         "leaving the durable execution claim untouched",
         job_id,
+        HANDOFF_ADOPTION_GRACE_SECONDS,
     )
     return _wait_for_external_cron_worker(
         process,
@@ -4887,6 +4936,7 @@ from cron.scheduler_preflight import (  # noqa: E402
     BLOCKED_CONFIG_MARKER,
     BLOCKED_CONFIG_SILENT_MARKER,
     _cron_preflight_enabled,
+    _empty_requested_mcp_toolsets,
     _is_transient_provider_resolve_error,
     _preflight_job_config,
 )

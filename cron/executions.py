@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
-from cron.ledger import ledger_transaction, open_ledger, prepare_ledger
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
@@ -91,13 +90,21 @@ _CREATE_EXECUTIONS_SQL = """CREATE TABLE IF NOT EXISTS executions (
 # --- executions ledger --------------------------------------------------------------------------
 
 def _connect() -> sqlite3.Connection:
-    return open_ledger(EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db"))
+    # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
+    # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
+    # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
+    from cron.jobs import _ensure_cron_dir
+    from hermes_cli.sqlite_util import open_db
+
+    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    _ensure_cron_dir(path.parent)
+    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    prepare_ledger(conn, db_label="cron/executions.db")
-    from hermes_cli.sqlite_util import add_column_if_missing
-
+    # Preserve the ledger's row-mapping contract even for callers/tests that
+    # supply a raw sqlite3 connection instead of going through open_db().
+    conn.row_factory = sqlite3.Row
     conn.execute(_CREATE_EXECUTIONS_SQL)
     _migrate_schema_unlocked(conn)
     conn.execute(
@@ -108,8 +115,6 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
-    add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
-    add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -172,8 +177,15 @@ def _migrate_schema_unlocked(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    with ledger_transaction(_lock, _connect, _initialize_schema) as conn:
-        yield conn
+    from hermes_cli.sqlite_util import transaction
+
+    with _lock:
+        conn = _connect()
+        # _connect() configures this through open_db(); retain the row-mapping
+        # contract when a caller supplies a raw connection for race injection.
+        conn.row_factory = sqlite3.Row
+        with transaction(conn) as conn:
+            yield conn
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
