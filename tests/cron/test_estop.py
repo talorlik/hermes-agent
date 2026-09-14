@@ -265,10 +265,10 @@ def test_cli_resume_when_not_paused(hermes_home, capsys):
 
 
 def test_builtin_subcommands_include_pause_resume():
-    from hermes_cli.main import _BUILTIN_SUBCOMMANDS
+    from hermes_cli._parser import BUILTIN_COMMAND_TOKENS
 
-    assert "pause" in _BUILTIN_SUBCOMMANDS
-    assert "resume" in _BUILTIN_SUBCOMMANDS
+    assert "pause" in BUILTIN_COMMAND_TOKENS
+    assert "resume" in BUILTIN_COMMAND_TOKENS
 
 
 # ── hermes status surfacing ─────────────────────────────────────────────────
