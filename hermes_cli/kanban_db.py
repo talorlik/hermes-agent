@@ -2902,7 +2902,7 @@ def complete_task(
     except (TransactionOutcomeUnknownError, ReceiptFinalizationError):
         # The transition may already be durable; preserve referenced files.
         raise
-    except Exception:
+    except BaseException:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
@@ -2958,7 +2958,7 @@ def _stage_completion_artifacts(
                 conn, task_id, filename=path.name, stored_path=str(path),
                 size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
             )
-    except Exception:
+    except BaseException:
         if staged:
             _discard_staged_copies(staged, staged[0].parent)
         raise
@@ -3115,12 +3115,12 @@ def _persist_scratch_completion_artifacts(
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
             _copy_capped(resolved_src, dest, artifact)
-        except Exception as exc:
+        except BaseException as exc:
             if dest is not None:
                 with contextlib.suppress(OSError):
                     dest.unlink(missing_ok=True)
             _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
+            if not isinstance(exc, Exception) or isinstance(exc, ArtifactPreservationError):
                 raise
             raise ArtifactPreservationError(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
@@ -3518,7 +3518,7 @@ def request_review(
         # The transition may already be durable. Its attachment rows must not
         # point at files deleted by local exception cleanup.
         raise
-    except Exception:
+    except BaseException:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise

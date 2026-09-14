@@ -875,7 +875,10 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
-def test_complete_task_rollback_discards_staged_copies(kanban_home, monkeypatch):
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_complete_task_rollback_discards_staged_copies(
+    kanban_home, monkeypatch, failure_type
+):
     """A failure after completion staging cannot leave an unreferenced copy."""
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="completion rollback")
@@ -887,10 +890,10 @@ def test_complete_task_rollback_discards_staged_copies(kanban_home, monkeypatch)
         run_id = kb.get_task(conn, t).current_run_id
 
         def fail_run(*_args, **_kwargs):
-            raise RuntimeError("run bookkeeping failed")
+            raise failure_type("run bookkeeping failed")
 
         monkeypatch.setattr(kb, "_end_run", fail_run)
-        with pytest.raises(RuntimeError, match="run bookkeeping"):
+        with pytest.raises(failure_type):
             kb.complete_task(
                 conn, t, summary="done", metadata={"artifacts": [str(artifact)]},
                 expected_run_id=run_id,
@@ -931,7 +934,8 @@ def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     ]
 
 
-def test_request_review_rollback_discards_staged_copies(kanban_home):
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_request_review_rollback_discards_staged_copies(kanban_home, failure_type):
     """A failure after staging rolls the txn back; the copied file must go
     too, or the retry stages ``evidence_1.json`` next to an orphan."""
     with kbc.connect() as conn:
@@ -945,11 +949,11 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         kwargs = dict(summary="ready", metadata={"artifacts": [str(artifact)]}, expected_run_id=run_id)
 
         def _boom(*_a, **_k):
-            raise RuntimeError("run bookkeeping failed")
+            raise failure_type("run bookkeeping failed")
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(kb, "_end_or_synthesize_run", _boom)
-            with pytest.raises(RuntimeError):
+            with pytest.raises(failure_type):
                 kb.request_review(conn, t, **kwargs)
         attachment_dir = kb.task_attachments_dir(t)
         assert kb.get_task(conn, t).status == "running"
@@ -959,7 +963,10 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]
 
 
-def test_request_review_staging_failure_discards_every_copy(kanban_home, monkeypatch):
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_request_review_staging_failure_discards_every_copy(
+    kanban_home, monkeypatch, failure_type
+):
     """Failure while inserting a later attachment cannot orphan earlier copies."""
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="review staging failure")
@@ -977,11 +984,11 @@ def test_request_review_staging_failure_discards_every_copy(kanban_home, monkeyp
             nonlocal calls
             calls += 1
             if calls == 2:
-                raise RuntimeError("second attachment insert failed")
+                raise failure_type("second attachment insert failed")
             return real_insert(*args, **kwargs)
 
         monkeypatch.setattr(kb, "_insert_completion_attachment", fail_second)
-        with pytest.raises(RuntimeError, match="second attachment"):
+        with pytest.raises(failure_type):
             kb.request_review(
                 conn, t, summary="ready",
                 metadata={"artifacts": [str(path) for path in artifacts]},
