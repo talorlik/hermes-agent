@@ -384,15 +384,39 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 
     def test_recorder_skips_the_write_when_nothing_changed(self):
         with patch("cron.jobs.update_job") as update_job:
-            sched_delivery._record_delivery_verification({"id": "j1", "last_delivery_unverified": None}, [])
+            job = {
+                "id": "j1",
+                "execution_id": "exec-1",
+                "_delivery_projection_revision": 7,
+                "last_delivery_unverified": None,
+            }
+            sched_delivery._record_delivery_verification(job, [])
             update_job.assert_not_called()
-            sched_delivery._record_delivery_verification({"id": "j1", "last_delivery_unverified": None}, ["slack:C1"])
-            update_job.assert_called_once_with("j1", {"last_delivery_unverified": ["slack:C1"]})
+            sched_delivery._record_delivery_verification(job, ["slack:C1"])
+            update_job.assert_called_once_with(
+                "j1",
+                {"last_delivery_unverified": ["slack:C1"]},
+                expected_execution_id="exec-1",
+                expected_projection_revision=7,
+            )
 
     def test_recorder_clears_a_stale_marker(self):
         with patch("cron.jobs.update_job") as update_job:
-            sched_delivery._record_delivery_verification({"id": "j1", "last_delivery_unverified": ["slack:C1"]}, [])
-            update_job.assert_called_once_with("j1", {"last_delivery_unverified": None})
+            sched_delivery._record_delivery_verification(
+                {
+                    "id": "j1",
+                    "execution_id": "exec-1",
+                    "_delivery_projection_revision": 7,
+                    "last_delivery_unverified": ["slack:C1"],
+                },
+                [],
+            )
+            update_job.assert_called_once_with(
+                "j1",
+                {"last_delivery_unverified": None},
+                expected_execution_id="exec-1",
+                expected_projection_revision=7,
+            )
 
     def test_tool_listing_exposes_the_field(self):
         from tools.cronjob_tools import _format_job

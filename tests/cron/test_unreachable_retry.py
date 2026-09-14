@@ -72,3 +72,27 @@ def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home
     assert mark_job_run(once["id"], False, "ConnectError: dns", model_unreachable=True)
     remaining = get_job(once["id"])
     assert remaining is None or remaining.get(ur.STATE_KEY) is None
+
+
+def test_retry_decision_does_not_suppress_notice_for_nearer_natural_run(
+    tmp_cron_home, monkeypatch
+):
+    """The pre-delivery decision includes the same natural-run gate as the
+    store write: no retry means the scheduler must leave the failure notice on."""
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(ur, "_hermes_now", lambda: now)
+    natural_next = (now + timedelta(minutes=1)).isoformat()
+    job = {
+        "id": "near-natural",
+        "name": "near natural",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "state": "scheduled",
+        "next_run_at": natural_next,
+    }
+
+    decision = ur.prepare_retry(job)
+
+    assert decision.should_retry is False
+    assert ur.plan_retry(job, decision) is False
+    assert job.get(ur.STATE_KEY) is None
+    assert job["next_run_at"] == natural_next
