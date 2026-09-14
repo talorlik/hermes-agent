@@ -2819,84 +2819,93 @@ def complete_task(
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
-    with write_txn(conn):
-        # Hard invariant even for human review approval: a parent may have
-        # reopened while this task waited.
-        if not _parents_satisfied(conn, task_id):
-            return False
-        observed = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if observed is None:
-            return False
-        prior_status = observed["status"]
-        if expected_status is not None and prior_status != expected_status:
-            return False
-        if (
-            normalized_expected_run_id is not None
-            and observed["current_run_id"] != normalized_expected_run_id
-        ):
-            return False
-        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
-        sql = """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                """
-        params: tuple = (result, now, task_id)
-        if normalized_expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, normalized_expected_run_id)
-        if expected_status is not None:
-            sql += " AND status = ?"
-            params = (*params, expected_status)
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        if isinstance(metadata, dict):
-            _stage_completion_artifacts(conn, task_id, metadata, now)
-        run_id = _end_run(
-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
-            metadata=metadata,
-        )
-        # Never-claimed task: synthesize a run so the handoff fields survive.
-        if run_id is None and (summary or metadata or result or prior_status == "review"):
-            synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
-            run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+    staged_copies: list[Path] = []
+    try:
+        with write_txn(conn):
+            # Hard invariant even for human review approval: a parent may have
+            # reopened while this task waited.
+            if not _parents_satisfied(conn, task_id):
+                return False
+            observed = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if observed is None:
+                return False
+            prior_status = observed["status"]
+            if expected_status is not None and prior_status != expected_status:
+                return False
+            if (
+                normalized_expected_run_id is not None
+                and observed["current_run_id"] != normalized_expected_run_id
+            ):
+                return False
+            if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
+                return False
+            sql = """
+                    UPDATE tasks
+                       SET status       = 'done',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked', 'review')
+                    """
+            params: tuple = (result, now, task_id)
+            if normalized_expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params = (*params, normalized_expected_run_id)
+            if expected_status is not None:
+                sql += " AND status = ?"
+                params = (*params, expected_status)
+            if conn.execute(sql, params).rowcount != 1:
+                return False
+            if isinstance(metadata, dict):
+                staged_copies = _stage_completion_artifacts(conn, task_id, metadata, now)
+            run_id = _end_run(
+                conn, task_id, outcome="completed", status="done", summary=handoff_summary,
+                metadata=metadata,
             )
-        event_summary = handoff_summary
-        if prior_status == "review" and not event_summary:
-            event_summary = _REVIEW_APPROVED_NOTE
-        event_id = _append_event(
-            conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
-            run_id=run_id,
-        )
-        _stage_receipt(
-            conn,
-            receipt_capture,
-            LifecycleReceipt(
-                operation="complete",
-                task_id=task_id,
-                prior_status=prior_status,
-                final_status="done",
-                newly_committed=True,
+            # Never-claimed task: synthesize a run so the handoff fields survive.
+            if run_id is None and (summary or metadata or result or prior_status == "review"):
+                synth_summary, synth_metadata = handoff_summary, metadata
+                if prior_status == "review" and not synth_summary and not synth_metadata:
+                    synth_summary = _REVIEW_APPROVED_NOTE
+                    synth_metadata = {"source_status": "review", "approval": "manual"}
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                )
+            event_summary = handoff_summary
+            if prior_status == "review" and not event_summary:
+                event_summary = _REVIEW_APPROVED_NOTE
+            event_id = _append_event(
+                conn, task_id, "completed",
+                _completed_event_payload(result, event_summary, verified_cards, metadata),
                 run_id=run_id,
-                event_id=event_id,
-            ),
-        )
+            )
+            _stage_receipt(
+                conn,
+                receipt_capture,
+                LifecycleReceipt(
+                    operation="complete",
+                    task_id=task_id,
+                    prior_status=prior_status,
+                    final_status="done",
+                    newly_committed=True,
+                    run_id=run_id,
+                    event_id=event_id,
+                ),
+            )
+    except (TransactionOutcomeUnknownError, ReceiptFinalizationError):
+        # The transition may already be durable; preserve referenced files.
+        raise
+    except Exception:
+        if staged_copies:
+            _discard_staged_copies(staged_copies, staged_copies[0].parent)
+        raise
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -2943,11 +2952,16 @@ def _stage_completion_artifacts(
     transaction rolls back."""
     _persist_scratch_completion_artifacts(conn, task_id, metadata)
     staged = [Path(stored_path) for stored_path in metadata.pop("_staged_artifacts", [])]
-    for path in staged:
-        _insert_completion_attachment(
-            conn, task_id, filename=path.name, stored_path=str(path),
-            size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
-        )
+    try:
+        for path in staged:
+            _insert_completion_attachment(
+                conn, task_id, filename=path.name, stored_path=str(path),
+                size=path.stat().st_size, created_at=now, uploaded_by=uploaded_by,
+            )
+    except Exception:
+        if staged:
+            _discard_staged_copies(staged, staged[0].parent)
+        raise
     return staged
 
 
@@ -3500,6 +3514,10 @@ def request_review(
                 event_id=event_id,
                 ),
             ),
+    except (TransactionOutcomeUnknownError, ReceiptFinalizationError):
+        # The transition may already be durable. Its attachment rows must not
+        # point at files deleted by local exception cleanup.
+        raise
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
@@ -4652,6 +4670,8 @@ def build_task_snapshot(
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     LifecycleReceipt,
     LifecycleReceiptCapture,
+    ReceiptFinalizationError,
+    TransactionOutcomeUnknownError,
     _INITIALIZED_PATHS,
     _clear_receipt_capture,
     _stage_receipt,

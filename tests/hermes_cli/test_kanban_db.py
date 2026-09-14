@@ -875,6 +875,33 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_complete_task_rollback_discards_staged_copies(kanban_home, monkeypatch):
+    """A failure after completion staging cannot leave an unreferenced copy."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="completion rollback")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        artifact = ws / "evidence.json"
+        artifact.write_text("{}")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+        def fail_run(*_args, **_kwargs):
+            raise RuntimeError("run bookkeeping failed")
+
+        monkeypatch.setattr(kb, "_end_run", fail_run)
+        with pytest.raises(RuntimeError, match="run bookkeeping"):
+            kb.complete_task(
+                conn, t, summary="done", metadata={"artifacts": [str(artifact)]},
+                expected_run_id=run_id,
+            )
+
+        attachment_dir = kb.task_attachments_dir(t)
+        assert kb.get_task(conn, t).status == "running"
+        assert kb.list_attachments(conn, t) == []
+        assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
+
+
 def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     """A review-bound card's declared files must outlive the reviewer's
     completion — that completion is what cleans the scratch workspace up."""
@@ -930,6 +957,71 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         assert kb.request_review(conn, t, **kwargs)
         assert [a.filename for a in kb.list_attachments(conn, t)] == ["evidence.json"]
         assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]
+
+
+def test_request_review_staging_failure_discards_every_copy(kanban_home, monkeypatch):
+    """Failure while inserting a later attachment cannot orphan earlier copies."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="review staging failure")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        artifacts = [ws / "first.json", ws / "second.json"]
+        for artifact in artifacts:
+            artifact.write_text("{}")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        real_insert = kb._insert_completion_attachment
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("second attachment insert failed")
+            return real_insert(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_insert_completion_attachment", fail_second)
+        with pytest.raises(RuntimeError, match="second attachment"):
+            kb.request_review(
+                conn, t, summary="ready",
+                metadata={"artifacts": [str(path) for path in artifacts]},
+                expected_run_id=run_id,
+            )
+
+        attachment_dir = kb.task_attachments_dir(t)
+        assert kb.get_task(conn, t).status == "running"
+        assert kb.list_attachments(conn, t) == []
+        assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
+
+
+def test_request_review_receipt_failure_preserves_committed_artifact(
+    kanban_home, monkeypatch
+):
+    """Post-commit receipt failure must not delete a durably referenced file."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="review receipt failure")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        artifact = ws / "evidence.json"
+        artifact.write_text("{}")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        capture = kbc.LifecycleReceiptCapture()
+
+        def fail_receipt(_self, _conn, _receipt):
+            raise RuntimeError("receipt publication failed")
+
+        monkeypatch.setattr(kbc.LifecycleReceiptCapture, "_publish", fail_receipt)
+        with pytest.raises(kbc.ReceiptFinalizationError):
+            kb.request_review(
+                conn, t, summary="ready", metadata={"artifacts": [str(artifact)]},
+                expected_run_id=run_id, receipt_capture=capture,
+            )
+
+        attachments = kb.list_attachments(conn, t)
+        assert kb.get_task(conn, t).status == "review"
+        assert len(attachments) == 1
+        assert Path(attachments[0].stored_path).read_text() == "{}"
 
 
 # ---------------------------------------------------------------------------
