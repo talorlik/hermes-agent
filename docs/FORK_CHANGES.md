@@ -51,7 +51,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 `retiring` (scheduled for removal by a named plan item).
 
 ## G-UPDATE-FORKSYNC: automatic upstream merge in `hermes update`
-- Commits: 08f93e614a62790a6bd29c1397c603c2181f1161, 21a38d4dc2b9301a75ac219da8f19b103813ec6d, 7de663b05eaf30157e51e795d008ed526a52c785, 5f6aeab598ad280d33903e10e4158397220bf264, b63893c1ac74800637b70efd0e74c07fcbe9175d, 2e2a5082f58f01addb00a3b60646da5dd7555e4c, 2f79ad2996d8d6d62736942ce65c88c50cf32a55, 6a00376ed41f2ec30802c30cfa07c9a7858abaf7
+- Commits: 08f93e614a62790a6bd29c1397c603c2181f1161, 21a38d4dc2b9301a75ac219da8f19b103813ec6d, 7de663b05eaf30157e51e795d008ed526a52c785, 5f6aeab598ad280d33903e10e4158397220bf264, b63893c1ac74800637b70efd0e74c07fcbe9175d, 2e2a5082f58f01addb00a3b60646da5dd7555e4c, 2f79ad2996d8d6d62736942ce65c88c50cf32a55, 6a00376ed41f2ec30802c30cfa07c9a7858abaf7, 780b21e1bbad1951cfa8cfa30ed2cc6d8c9e1cb0
 - Owned-Files:
   - hermes_cli/update_cmd.py
   - hermes_cli/update_cmd_fleet.py
@@ -73,7 +73,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: 82867a2110f6cfa500913f34fa3984f11ab8222b, c25ff2c605ddaf51941a69593e9e11a7abcd9b83, 9d9273e016485af63cad0bb0ebdb8f86469d8e98, 161b03e4d05d955b7246e7536d8e122fcafd1403, ed8cbe13f277229896b7c03945152891a7d35c83, 075205dd17d1c09a43d3332d9cdd3002baafd891, 424f8b423fe798eb9660b606940a322cea718d57, d87a667d7d1c87891f4618a336263cfa383e1bd0, dd36cd7a9d0759be4d36546254f4f85327ccf49a, 2bd5dea2ae19009478e1618cc14043c3e7253d61, 6a19104b72543483923aa619cdfc09f6d246b125, f7ed2fdfc31fba4e1c53068c3d9cc6974c1719e1, fbde468e17a1cc57199d6e03fe69a44eb7b90722, b416b65b79acc4fd8e1143adab428b16d416e96a
+- Commits: 82867a2110f6cfa500913f34fa3984f11ab8222b, c25ff2c605ddaf51941a69593e9e11a7abcd9b83, 9d9273e016485af63cad0bb0ebdb8f86469d8e98, 161b03e4d05d955b7246e7536d8e122fcafd1403, ed8cbe13f277229896b7c03945152891a7d35c83, 075205dd17d1c09a43d3332d9cdd3002baafd891, 424f8b423fe798eb9660b606940a322cea718d57, d87a667d7d1c87891f4618a336263cfa383e1bd0, dd36cd7a9d0759be4d36546254f4f85327ccf49a, 2bd5dea2ae19009478e1618cc14043c3e7253d61, 6a19104b72543483923aa619cdfc09f6d246b125, f7ed2fdfc31fba4e1c53068c3d9cc6974c1719e1, fbde468e17a1cc57199d6e03fe69a44eb7b90722, b416b65b79acc4fd8e1143adab428b16d416e96a, 1fe4789920d70228426e329317537a1fcf9b6d51, 147a6c0334dccf2a24305481ec3f0daabc54c989
 - Owned-Files:
   - cron/deferrals.py
   - cron/delivery_queue.py
@@ -86,6 +86,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - cron/scheduler.py
   - cron/scheduler_delivery.py
   - cron/scheduler_script.py
+  - cron/unreachable_retry.py
   - hermes_cli/cron.py
   - hermes_cli/subcommands/cron.py
   - hermes_cli/main.py
@@ -95,6 +96,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/cron/test_delivery_no_unawaited_coroutines.py
   - tests/cron/test_delivery_outbox.py
   - tests/cron/test_cron_live_bot_delivery.py
+  - tests/cron/test_cron_live_delivery_confirmation.py
   - tests/cron/test_delivery_crash_boundary.py
   - tests/cron/test_delivery_queue.py
   - tests/cron/test_detached_runs.py
@@ -108,6 +110,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/cron/test_cron_script_failure_policy.py
   - tests/cron/test_cronjob_schema.py
   - tests/cron/test_script_claim_heartbeat.py
+  - tests/cron/test_unreachable_retry.py
   - tests/hermes_cli/test_cron.py
   - tests/hermes_cli/test_cron_exit_code_propagation.py
   - website/docs/user-guide/features/cron.md
@@ -118,7 +121,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-LIFECYCLE: durable Kanban lifecycle contracts and CAS guards
-- Commits: 97a8adab283e5b3e292d1cca4dd019149c62d544, b14684474269d1e7b32a881fdf387fa6b85ca13f, 690611dd293b2ebea1d98628f4e7d8a3cf7de14f, 4996728aa28bfc3ac1b05b42d6625c6af79b8138, f496346d2ee17a48295de9f1140108bc4ff35942, f8443d665d5deba0177057559d987d0a116a5314, 18e0b13a50e23f70d67aa345ebbc22be79f82d50, e742bfb874138deca7d797d941a1b834ff067f76, 39a6be8ba3339a26b73f637bde3785cf0781cbed, 49019067125ff63a3be2d65aaf37f7469dc630b0, 9a27c914ae3fd0d9700946e806fb038b61ecf288, 66b92833a99cc2e9176809b24ca63b67d0b467b5, 7adbe4ecbfefa5796995149aae49d69e9bb8fb4d, cbd0d6ba095a0ac5064c25c66cdc77d3a4423659, bac93d67aed81f5d36fd0974259539bb86e8efba
+- Commits: 97a8adab283e5b3e292d1cca4dd019149c62d544, b14684474269d1e7b32a881fdf387fa6b85ca13f, 690611dd293b2ebea1d98628f4e7d8a3cf7de14f, 4996728aa28bfc3ac1b05b42d6625c6af79b8138, f496346d2ee17a48295de9f1140108bc4ff35942, f8443d665d5deba0177057559d987d0a116a5314, 18e0b13a50e23f70d67aa345ebbc22be79f82d50, e742bfb874138deca7d797d941a1b834ff067f76, 39a6be8ba3339a26b73f637bde3785cf0781cbed, 49019067125ff63a3be2d65aaf37f7469dc630b0, 9a27c914ae3fd0d9700946e806fb038b61ecf288, 66b92833a99cc2e9176809b24ca63b67d0b467b5, 7adbe4ecbfefa5796995149aae49d69e9bb8fb4d, cbd0d6ba095a0ac5064c25c66cdc77d3a4423659, bac93d67aed81f5d36fd0974259539bb86e8efba, 7e3cf6f09b6317533d6522d115bfe7f3650c23ab, 6fa1a258cabe1c28dc630fe6e333b9064297401f
 - Owned-Files:
   - hermes_cli/kanban.py
   - hermes_cli/kanban_db.py
@@ -259,9 +262,22 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Met - the clean upstream reset removed all three residual deltas.
 - Disposition: absorbed-upstream
 
+## G-UPSTREAM-HYGIENE: repair integration residue during upstream sync
+- Commits: 36cb1d0ed9fbde8e78466531b33d01187f6c110c
+- Reconciliations: 68f8ab91e3a3b0aa5cb3c8d114fa60b253f227bd
+- Owned-Files:
+  - tests/cron/test_estop.py
+  - tests/cron/test_file_permissions.py
+  - website/docs/reference/optional-skills-catalog.md
+- Intent: Adapt inherited tests to the upstream parser and macOS symlink-boundary contracts while removing an accidentally published conflict marker from generated documentation.
+- Protected-Invariant: Integrated upstream tests exercise the live APIs and host path semantics, and published documentation contains no unresolved conflict marker.
+- Tests: tests/cron/test_estop.py, tests/cron/test_file_permissions.py; `git diff --check`
+- Retirement-Condition: Upstream carries equivalent test updates and removes the documentation marker.
+- Disposition: active
+
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 19
+- Ledger-Revision: 20
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
