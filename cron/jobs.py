@@ -2718,7 +2718,6 @@ def mark_job_run(
     *,
     expected_fire_owner: Optional[str] = None,
     model_unreachable: bool = False,
-    unreachable_retry_decision: Any = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2749,7 +2748,7 @@ def mark_job_run(
         from cron.unreachable_retry import clear_state, plan_retry
 
         if not success and model_unreachable and not is_terminal_job(job):
-            plan_retry(job, unreachable_retry_decision)
+            plan_retry(job)
         else:
             # Any run that reached the model (either outcome) resets the re-run ladder.
             clear_state(job)

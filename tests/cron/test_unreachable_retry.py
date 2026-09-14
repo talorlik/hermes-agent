@@ -74,11 +74,8 @@ def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home
     assert remaining is None or remaining.get(ur.STATE_KEY) is None
 
 
-def test_retry_decision_does_not_suppress_notice_for_nearer_natural_run(
-    tmp_cron_home, monkeypatch
-):
-    """The pre-delivery decision includes the same natural-run gate as the
-    store write: no retry means the scheduler must leave the failure notice on."""
+def test_retry_yields_to_nearer_natural_run(tmp_cron_home, monkeypatch):
+    """The durable store mutation leaves a nearer natural occurrence intact."""
     now = datetime.now(timezone.utc)
     monkeypatch.setattr(ur, "_hermes_now", lambda: now)
     natural_next = (now + timedelta(minutes=1)).isoformat()
@@ -90,9 +87,6 @@ def test_retry_decision_does_not_suppress_notice_for_nearer_natural_run(
         "next_run_at": natural_next,
     }
 
-    decision = ur.prepare_retry(job)
-
-    assert decision.should_retry is False
-    assert ur.plan_retry(job, decision) is False
+    assert ur.plan_retry(job) is False
     assert job.get(ur.STATE_KEY) is None
     assert job["next_run_at"] == natural_next

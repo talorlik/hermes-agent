@@ -3206,7 +3206,6 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
-    unreachable_retry_decision: Any = None
 
 
 def _queue_owns_exact_attempt(entry: dict) -> bool:
@@ -3341,18 +3340,6 @@ def _save_compose_deliver(
     )
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
-    if d.should_deliver and not d.success and job.get("_model_unreachable"):
-        # The model was never reached and a bounded automatic re-run will be scheduled
-        # (cron/unreachable_retry.py): hold the failure notice — the re-run either
-        # delivers the real result or, once the ladder is exhausted, the next failure
-        # alerts normally. Mirrors Cowork's silent 5/15/30-minute re-runs.
-        from cron.unreachable_retry import prepare_retry
-
-        d.unreachable_retry_decision = prepare_retry(job)
-        if d.unreachable_retry_decision.should_retry:
-            d.should_deliver = False
-            logger.info(
-                "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
     # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
     # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
     if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
@@ -3478,7 +3465,6 @@ def _finish_completed_run(
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
         mark_kwargs["model_unreachable"] = True
-        mark_kwargs["unreachable_retry_decision"] = d.unreachable_retry_decision
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
     if fire_owner is not None:
