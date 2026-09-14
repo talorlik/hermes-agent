@@ -160,6 +160,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/hermes_cli/test_oneshot_skills.py
   - tests/hermes_cli/test_startup_plugin_gating.py
   - tests/test_model_tools.py
+  - tests/tools/test_model_tools.py
 - Intent: A oneshot invocation that requests zero tools gets exactly zero tools: no MCP startup, no builtin tool discovery leaking into the run.
 - Protected-Invariant: Explicitly tool-less oneshot runs never load or expose any toolset.
 - Tests: tests/hermes_cli/test_oneshot_skills.py, tests/hermes_cli/test_mcp_startup.py, tests/test_model_tools.py
@@ -277,7 +278,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 21
+- Ledger-Revision: 22
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md

@@ -941,6 +941,38 @@ def test_pre_resolved_conflict_sync_merge_is_exempt(tmp_path):
     assert sync_merge in payload["sync_merges"]
 
 
+def test_pre_resolved_directory_rename_keeps_first_parent_path(tmp_path):
+    repo = tmp_path / "pre-resolved-directory-rename"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "docs/base.md", "base\n", "base")
+    _git(repo, "checkout", "-b", "fork-main")
+    _commit_file(repo, "docs/fork-only.md", "fork\n", "add fork-only doc")
+    _git(repo, "checkout", "upstream-main")
+    (repo / "website" / "docs").mkdir(parents=True)
+    _git(repo, "mv", "docs/base.md", "website/docs/base.md")
+    _git(repo, "commit", "-m", "move upstream docs")
+    upstream = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "rm", "--force", "website/docs/fork-only.md")
+    _git(repo, "checkout", "HEAD", "--", "docs/fork-only.md")
+    _git(repo, "add", "docs/fork-only.md")
+    _git(repo, "commit", "-m", "retain canonical fork doc path")
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    parents = _git(repo, "show", "-s", "--format=%P", sync_merge).split()
+
+    mod = _load_checker_module()
+    assert mod._is_clean_upstream_sync(repo, sync_merge, parents, upstream)
+
+
 def test_repo_ledger_exists_and_every_entry_is_well_formed():
     ledger = REPO_ROOT / "docs" / "FORK_CHANGES.md"
     assert ledger.is_file(), "docs/FORK_CHANGES.md is missing"

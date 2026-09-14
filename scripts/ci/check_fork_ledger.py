@@ -475,49 +475,115 @@ def _is_clean_upstream_sync(
         return False
     if _is_ancestor(repo, first_parent, upstream_oid):
         return False
-    proc = _run_git(repo, "merge-tree", "--write-tree", first_parent, upstream_parent)
+    proc = _run_git(
+        repo,
+        "merge-tree",
+        "--write-tree",
+        "--messages",
+        "--name-only",
+        "-z",
+        first_parent,
+        upstream_parent,
+    )
     if proc.returncode not in {0, 1}:
         detail = proc.stderr.decode("utf-8", errors="replace").strip()
         raise CheckerError(f"git merge-tree failed (exit {proc.returncode}): {detail}")
-    lines = proc.stdout.decode("utf-8", errors="surrogateescape").splitlines()
-    if not lines or not re.fullmatch(r"[0-9a-f]{40,64}", lines[0]):
+    tree_section, separator, message_section = proc.stdout.partition(b"\0\0")
+    tree_parts = tree_section.split(b"\0")
+    expected_tree_raw = tree_parts[0] if tree_parts else b""
+    if not re.fullmatch(rb"[0-9a-f]{40,64}", expected_tree_raw):
         return False
-    expected_tree = lines[0]
+    expected_tree = expected_tree_raw.decode("ascii")
     actual_tree = _git(repo, "rev-parse", f"{sha}^{{tree}}")
     if proc.returncode == 0:
         return expected_tree == actual_tree
-
-    # Conflict merges are byte-clean upstream syncs only when every
-    # conflict was resolved in the first parent and the merge keeps those
-    # exact pre-resolved blobs. No new resolution bytes can enter via the
-    # otherwise exempt merge commit.
-    stages: dict[str, dict[int, str]] = {}
-    for line in lines[1:]:
-        if not line:
-            break
-        match = re.fullmatch(
-            r"[0-7]{6} ([0-9a-f]{40,64}) ([123])\t(.*)", line
-        )
-        if match is None:
-            return False
-        blob, stage, path = match.groups()
-        stages.setdefault(path, {})[int(stage)] = blob
-    if not stages or any(2 not in values for values in stages.values()):
+    if not separator:
         return False
-    conflict_paths = set(stages)
+
+    # A conflicted sync is exempt only when the fork resolved every conflict
+    # before the merge and the merge retained those exact first-parent paths.
+    # Directory-rename suggestions name both the proposed destination and the
+    # original source, so retaining the original ledger path is also auditable.
+    conflict_paths = {
+        raw.decode("utf-8", errors="surrogateescape")
+        for raw in tree_parts[1:]
+        if raw
+    }
+    if not conflict_paths:
+        return False
+
+    relocation_sources: dict[str, str] = {}
+    message_parts = message_section.split(b"\0")
+    index = 0
+    while index < len(message_parts) and message_parts[index]:
+        try:
+            path_count = int(message_parts[index])
+        except ValueError:
+            return False
+        group_end = index + path_count + 3
+        if path_count < 1 or group_end > len(message_parts):
+            return False
+        paths = [
+            raw.decode("utf-8", errors="surrogateescape")
+            for raw in message_parts[index + 1 : index + 1 + path_count]
+        ]
+        kind = message_parts[index + 1 + path_count]
+        if kind == b"CONFLICT (directory rename suggested)":
+            if path_count != 2:
+                return False
+            destination, source = paths
+            if destination in relocation_sources.values() or source in relocation_sources:
+                return False
+            relocation_sources[source] = destination
+        index = group_end
+
+    def tree_entries(treeish: str) -> dict[str, str]:
+        entries: dict[str, str] = {}
+        raw = _git_bytes(repo, "ls-tree", "-r", "-z", treeish)
+        for record in raw.split(b"\0"):
+            if not record:
+                continue
+            try:
+                metadata, path = record.split(b"\t", 1)
+                _mode, _kind, oid = metadata.split(b" ", 2)
+            except ValueError as exc:
+                raise CheckerError("malformed git ls-tree output") from exc
+            entries[path.decode("utf-8", errors="surrogateescape")] = oid.decode("ascii")
+        return entries
+
+    first_entries = tree_entries(first_parent)
+    expected_entries = tree_entries(expected_tree)
+    actual_entries = tree_entries(actual_tree)
     changed = {
         path
-        for path in _git_bytes(
-            repo, "diff", "--name-only", "-z", expected_tree, actual_tree
-        ).decode("utf-8", errors="surrogateescape").split("\0")
-        if path
+        for path in expected_entries.keys() | actual_entries.keys()
+        if expected_entries.get(path) != actual_entries.get(path)
     }
-    if changed != conflict_paths:
+
+    # Every conflicted destination must retain the first-parent object,
+    # including exact absence for an upstream deletion or rename suggestion.
+    if any(
+        actual_entries.get(path) != first_entries.get(path)
+        for path in conflict_paths
+    ):
         return False
-    return all(
-        _git(repo, "rev-parse", f"{sha}:{path}") == values[2]
-        for path, values in stages.items()
-    )
+
+    allowed = set(conflict_paths)
+    for source, destination in relocation_sources.items():
+        if destination not in conflict_paths:
+            return False
+        source_oid = first_entries.get(source)
+        if (
+            source_oid is None
+            or actual_entries.get(source) != source_oid
+            or expected_entries.get(source) == source_oid
+            or expected_entries.get(destination) != source_oid
+        ):
+            return False
+        allowed.add(source)
+
+    return changed <= allowed
+
 
 
 def _history_reconciliation_partition(
