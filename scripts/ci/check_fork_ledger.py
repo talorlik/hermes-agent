@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify docs/FORK_CHANGES.md maps every fork-only commit to a ledger entry.
+"""Verify the fork change ledger maps every fork-only commit to an entry.
 
 This is the deterministic post_verify gate behind the fork change ledger
 (ARD-010 in the Central Command orchestration plan): the autonomous upstream
@@ -476,14 +476,48 @@ def _is_clean_upstream_sync(
     if _is_ancestor(repo, first_parent, upstream_oid):
         return False
     proc = _run_git(repo, "merge-tree", "--write-tree", first_parent, upstream_parent)
-    if proc.returncode == 1:
-        return False
-    if proc.returncode != 0:
+    if proc.returncode not in {0, 1}:
         detail = proc.stderr.decode("utf-8", errors="replace").strip()
         raise CheckerError(f"git merge-tree failed (exit {proc.returncode}): {detail}")
-    expected_tree = proc.stdout.decode("ascii", errors="strict").splitlines()[0]
+    lines = proc.stdout.decode("utf-8", errors="surrogateescape").splitlines()
+    if not lines or not re.fullmatch(r"[0-9a-f]{40,64}", lines[0]):
+        return False
+    expected_tree = lines[0]
     actual_tree = _git(repo, "rev-parse", f"{sha}^{{tree}}")
-    return expected_tree == actual_tree
+    if proc.returncode == 0:
+        return expected_tree == actual_tree
+
+    # Conflict merges are byte-clean upstream syncs only when every
+    # conflict was resolved in the first parent and the merge keeps those
+    # exact pre-resolved blobs. No new resolution bytes can enter via the
+    # otherwise exempt merge commit.
+    stages: dict[str, dict[int, str]] = {}
+    for line in lines[1:]:
+        if not line:
+            break
+        match = re.fullmatch(
+            r"[0-7]{6} ([0-9a-f]{40,64}) ([123])\t(.*)", line
+        )
+        if match is None:
+            return False
+        blob, stage, path = match.groups()
+        stages.setdefault(path, {})[int(stage)] = blob
+    if not stages or any(2 not in values for values in stages.values()):
+        return False
+    conflict_paths = set(stages)
+    changed = {
+        path
+        for path in _git_bytes(
+            repo, "diff", "--name-only", "-z", expected_tree, actual_tree
+        ).decode("utf-8", errors="surrogateescape").split("\0")
+        if path
+    }
+    if changed != conflict_paths:
+        return False
+    return all(
+        _git(repo, "rev-parse", f"{sha}:{path}") == values[2]
+        for path, values in stages.items()
+    )
 
 
 def _history_reconciliation_partition(
@@ -1463,7 +1497,7 @@ def main(argv: list[str] | None = None) -> int:
 
     repo = args.repo or Path(__file__).resolve().parents[2]
     if args.ledger is None:
-        ledger = repo / "docs" / "FORK_CHANGES.md"
+        ledger = repo / "website" / "docs" / "developer-guide" / "FORK_CHANGES.md"
     else:
         ledger = args.ledger if args.ledger.is_absolute() else repo / args.ledger
     try:

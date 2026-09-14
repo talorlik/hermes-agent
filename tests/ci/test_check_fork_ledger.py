@@ -1,6 +1,6 @@
 """Contract tests for scripts/ci/check_fork_ledger.py.
 
-The checker is the deterministic post_verify gate behind docs/FORK_CHANGES.md
+The checker is the deterministic post_verify gate behind the fork ledger
 (ARD-010): every fork-only commit must map to a ledger entry, and every entry
 must carry the full set of required fields. Tests build throwaway git repos in
 tmp_path (no network, explicit refs) and drive the script as a subprocess so
@@ -903,8 +903,46 @@ def _load_checker_module():
     return module
 
 
+def test_pre_resolved_conflict_sync_merge_is_exempt(tmp_path):
+    repo = tmp_path / "pre-resolved-sync"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'base'\n", "base")
+    _git(repo, "checkout", "-b", "fork-main")
+    pre_resolved = _commit_file(
+        repo, "shared.py", "VALUE = 'fork-plus-upstream'\n", "pre-resolve conflict"
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'upstream'\n", "upstream change")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream with pre-resolved conflict")
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(
+        repo,
+        _entry(
+            "G-SHARED",
+            "pre-resolved shared path",
+            commits=pre_resolved,
+            owned_files=["shared.py"],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert sync_merge in payload["sync_merges"]
+
+
 def test_repo_ledger_exists_and_every_entry_is_well_formed():
-    ledger = REPO_ROOT / "docs" / "FORK_CHANGES.md"
+    ledger = REPO_ROOT / "website" / "docs" / "developer-guide" / "FORK_CHANGES.md"
     assert ledger.is_file(), "docs/FORK_CHANGES.md is missing"
     mod = _load_checker_module()
     entries = mod.parse_ledger(ledger.read_text(encoding="utf-8"))
@@ -916,7 +954,7 @@ def test_repo_ledger_exists_and_every_entry_is_well_formed():
 
 
 def test_repo_ledger_entry_ids_are_unique():
-    ledger = REPO_ROOT / "docs" / "FORK_CHANGES.md"
+    ledger = REPO_ROOT / "website" / "docs" / "developer-guide" / "FORK_CHANGES.md"
     mod = _load_checker_module()
     entries = mod.parse_ledger(ledger.read_text(encoding="utf-8"))
     ids = [e.entry_id for e in entries]
