@@ -183,7 +183,10 @@ export const ja = defineLocale({
       errorTitle: 'MCP サーバーに接続できません',
       errorMessage: name => `${name} MCP のヘルスチェックに失敗しました。`,
       signIn: 'サインイン',
-      view: '表示'
+      view: '表示',
+      disable: '無効化',
+      disabledMessage: name => `${name} MCP を無効にしました。機能 → MCP からいつでも再有効化できます。`,
+      disableFailed: name => `${name} MCP を無効にできませんでした。`
     },
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT には ELEVENLABS_API_KEY が必要です。',
@@ -1637,6 +1640,10 @@ export const ja = defineLocale({
     restartGateway: 'ゲートウェイを再起動',
     openBrowser: 'ブラウザを開く',
     gatewayRestartFailed: 'ゲートウェイの再起動に失敗しました。',
+    sharedGatewayRestartTitle: '共有ゲートウェイを再起動しますか？',
+    sharedGatewayRestartDescription: bots => `このデバイス上のすべてのボットが再接続します: ${bots}`,
+    sharedGatewayRestartConfirm: 'すべて再起動',
+    sharedGatewayRestarted: count => `共有ゲートウェイを再起動しました（${count} ボット）`,
     updateHermes: 'Hermes を更新',
     reloadWindow: 'ウィンドウを再読み込み',
     actionRunning: '実行中',
@@ -1683,6 +1690,7 @@ export const ja = defineLocale({
     },
     unknown: '不明',
     hintPendingRestart: 'この変更を適用するにはステータスバーからゲートウェイを再起動してください。',
+    sharedListenerUrl: '共有ゲートウェイのリスナーで提供中:',
     hintGatewayStopped: 'ステータスバーからゲートウェイを起動して接続してください。',
     restartNeeded: '保存しました。新しい設定を反映するにはメッセージングゲートウェイを再起動してください。',
     restartNow: '今すぐ再起動',

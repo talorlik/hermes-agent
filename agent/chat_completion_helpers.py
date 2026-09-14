@@ -2074,7 +2074,11 @@ def _summary_text(agent, response, **normalize_kwargs) -> str:
 def _codex_summary_attempt(agent, api_messages: list, api_request_id: str):
     def _attempt(retry_count: int) -> str:
         codex_kwargs = agent._build_api_kwargs(api_messages)
+        # The transport emits these three as one block (transports/codex.py build_kwargs);
+        # strict Responses backends 400 on tool_choice/parallel_tool_calls without tools.
         codex_kwargs.pop("tools", None)
+        codex_kwargs.pop("tool_choice", None)
+        codex_kwargs.pop("parallel_tool_calls", None)
         return _summary_text(agent, agent._run_codex_stream(codex_kwargs))
     return _attempt
 
@@ -2944,9 +2948,11 @@ class _StreamingCall(StreamingWaitMonitor):
                 _dropped_names)
             return _build_partial_stream_stub(
                 role, full_content, full_reasoning, model_name, usage_obj, dropped_tool_names=_dropped_names or None)
-        if finish_reason is None and content_parts and not tool_calls_acc and usage_obj is None:
-            # Text-only drop: otherwise the partial text is stamped "stop" and the next step is
-            # lost. A usage object proves the provider finished (include_usage's final chunk).
+        if finish_reason is None and (content_parts or reasoning_parts) and not tool_calls_acc and usage_obj is None:
+            # Text-only (or reasoning-only) drop: otherwise the partial text is stamped "stop"
+            # and the next step is lost — for reasoning-only, the clean-stop promotion in
+            # finish_text_response would then surface a truncated thought as the answer.
+            # A usage object proves the provider finished (include_usage's final chunk).
             logger.warning(
                 "Stream ended with no finish_reason after delivering text with no tool calls; treating as a mid-stream drop.")
             return _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj)
