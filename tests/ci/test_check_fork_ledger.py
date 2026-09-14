@@ -941,6 +941,36 @@ def test_pre_resolved_conflict_sync_merge_is_exempt(tmp_path):
     assert sync_merge in payload["sync_merges"]
 
 
+def test_pre_resolved_conflict_rejects_mode_change_in_merge(tmp_path):
+    repo = tmp_path / "pre-resolved-mode-change"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'base'\n", "base")
+    _git(repo, "checkout", "-b", "fork-main")
+    _commit_file(repo, "shared.py", "VALUE = 'fork'\n", "pre-resolve conflict")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'upstream'\n", "upstream change")
+    upstream = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "update-index", "--chmod=+x", "shared.py")
+    _git(repo, "commit", "-m", "alter mode during conflict resolution")
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    parents = _git(repo, "show", "-s", "--format=%P", sync_merge).split()
+
+    mod = _load_checker_module()
+    assert not mod._is_clean_upstream_sync(repo, sync_merge, parents, upstream)
+
+
 def test_pre_resolved_directory_rename_keeps_first_parent_path(tmp_path):
     repo = tmp_path / "pre-resolved-directory-rename"
     repo.mkdir()

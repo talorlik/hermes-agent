@@ -537,18 +537,20 @@ def _is_clean_upstream_sync(
             relocation_sources[source] = destination
         index = group_end
 
-    def tree_entries(treeish: str) -> dict[str, str]:
-        entries: dict[str, str] = {}
+    def tree_entries(treeish: str) -> dict[str, tuple[str, str, str]]:
+        entries: dict[str, tuple[str, str, str]] = {}
         raw = _git_bytes(repo, "ls-tree", "-r", "-z", treeish)
         for record in raw.split(b"\0"):
             if not record:
                 continue
             try:
                 metadata, path = record.split(b"\t", 1)
-                _mode, _kind, oid = metadata.split(b" ", 2)
+                mode, kind, oid = metadata.split(b" ", 2)
             except ValueError as exc:
                 raise CheckerError("malformed git ls-tree output") from exc
-            entries[path.decode("utf-8", errors="surrogateescape")] = oid.decode("ascii")
+            entries[path.decode("utf-8", errors="surrogateescape")] = (
+                mode.decode("ascii"), kind.decode("ascii"), oid.decode("ascii")
+            )
         return entries
 
     first_entries = tree_entries(first_parent)
@@ -572,12 +574,12 @@ def _is_clean_upstream_sync(
     for source, destination in relocation_sources.items():
         if destination not in conflict_paths:
             return False
-        source_oid = first_entries.get(source)
+        source_entry = first_entries.get(source)
         if (
-            source_oid is None
-            or actual_entries.get(source) != source_oid
-            or expected_entries.get(source) == source_oid
-            or expected_entries.get(destination) != source_oid
+            source_entry is None
+            or actual_entries.get(source) != source_entry
+            or expected_entries.get(source) == source_entry
+            or expected_entries.get(destination) != source_entry
         ):
             return False
         allowed.add(source)

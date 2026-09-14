@@ -11,8 +11,11 @@ Verification: `python scripts/ci/check_fork_ledger.py` (the weekly
 `post_verify` gate). It resolves both refs once, reads this ledger from the
 pinned fork commit, and uses only those immutable OIDs afterward. A merge is
 an exempt upstream sync only when it has exactly two parents in fork/upstream
-order and its tree equals `git merge-tree --write-tree`; octopus, conflicted,
-or manually altered merges remain mapped work. Every work commit must be
+order and its tree equals `git merge-tree --write-tree`. A conflicted merge
+is also exempt when every conflict retains the exact first-parent path entry
+(mode, kind, and object ID), including an audited retained source for a
+directory-rename suggestion; other conflicted or manually altered merges
+remain mapped work. Every work commit must be
 claimed by exactly one entry. A Commits field may list full 40-character SHAs,
 non-empty `<sha>..<sha>` ranges, `none` (path ownership with no commit claim),
 or `self`. Explicit claims must be inside the evaluated work range and the
@@ -278,7 +281,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 22
+- Ledger-Revision: 23
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
