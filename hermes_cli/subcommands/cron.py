@@ -200,7 +200,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents")
     cron_incidents.add_argument(
-        "--state", choices=["detected", "alerted", "recovered", "closed"],
+        "--state", choices=["detected", "alerted", "resolved", "recovered", "closed"],
         help="Filter incidents by lifecycle state")
     cron_incidents.add_argument(
         "incident_action", nargs="?", default="list", choices=["list", "ack"],

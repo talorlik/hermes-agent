@@ -25,7 +25,11 @@ from hermes_time import now as _hermes_now
 # Optional test override (mirrors ``cron.executions.EXECUTIONS_FILE``).
 EXECUTIONS_FILE: Optional[Path] = None
 
-INCIDENT_STATES = ("detected", "alerted", "recovered", "closed")
+# ``resolved``: the job ran OK after the failure (auto); ``closed``: the operator acked the signature
+# and wants it silent. ``recovered`` is the category-scoped auto-heal (see ``record_recovery``) used
+# by the delivery outbox. Only ``closed`` is terminal; a repeat of a resolved or recovered error
+# re-opens it.
+INCIDENT_STATES = ("detected", "alerted", "resolved", "recovered", "closed")
 # "Open" for operators = failure seen, not yet healed or acknowledged.
 OPEN_INCIDENT_STATES = ("detected", "alerted")
 # Recovery scopes: a successful RUN heals `execution` incidents (any
@@ -164,8 +168,13 @@ def upsert_incident_in(
 
     ``conn`` must already hold the cron store schema (the caller is inside
     its own transaction on the SAME database — e.g. the delivery outbox
-    writing an attempt + its incident in one commit). Behavior is identical
-    to :func:`upsert_incident`, which wraps this in its own transaction.
+    writing an attempt + its incident in one commit). Returns ``(incident_id,
+    alert)``: ``alert`` is True for a brand-new incident and for a ``resolved``
+    one re-opening (job recovered, then broke the same way again) so the
+    operator is alerted once more. A ``recovered`` (category-healed) incident
+    re-opens as ``detected`` without a fresh alert; a ``closed`` (acked)
+    incident stays closed. A changed error text mints a new incident.
+    :func:`upsert_incident` wraps this in its own transaction.
     """
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
@@ -179,22 +188,21 @@ def upsert_incident_in(
         "SELECT id, state FROM cron_incidents WHERE id=?", (incident_id,)
     ).fetchone()
     if row is not None:
+        # A repeat of an auto-healed signature re-opens the SAME incident
+        # (idempotent dedup — never a duplicate row); only a `resolved`
+        # re-open alerts the operator again. A closed (acknowledged)
+        # incident stays closed forever.
+        reopen = row["state"] == "resolved"
         conn.execute(
             """UPDATE cron_incidents
-               SET last_seen_at=?, error=?, output_file=?
+               SET last_seen_at=?, error=?, output_file=?,
+                   state=CASE WHEN state IN ('resolved', 'recovered') THEN 'detected' ELSE state END,
+                   closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END,
+                   recovered_at=CASE WHEN state='recovered' THEN NULL ELSE recovered_at END
                WHERE id=?""",
             (now, stored_error, output_file, incident_id),
         )
-        if row["state"] == "recovered":
-            # The signature failed AGAIN after healing: re-open the SAME
-            # incident (idempotent dedup — never a duplicate row). A closed
-            # (acknowledged) incident stays closed forever.
-            conn.execute(
-                """UPDATE cron_incidents
-                   SET state='detected', recovered_at=NULL WHERE id=?""",
-                (incident_id,),
-            )
-        return incident_id, False
+        return incident_id, reopen
     conn.execute(
         """INSERT INTO cron_incidents
            (id, job_id, error_sig, state, failure_type,
@@ -216,10 +224,12 @@ def upsert_incident(
 ) -> tuple[str, bool]:
     """Record (or refresh) the incident for ``job_id`` + ``error``.
 
-    Returns ``(incident_id, is_new)``. A row for the same signature already
+    Returns ``(incident_id, alert)``. A row for the same signature already
     existing refreshes ``last_seen_at``/``error``/``output_file`` and keeps its
     current state — a ``closed`` (acked) incident stays closed for the same
-    signature. A changed error text mints a new incident automatically.
+    signature, while a ``resolved`` one re-opens as ``detected`` with
+    ``alert=True`` (see :func:`upsert_incident_in`). A changed error text
+    mints a new incident automatically.
     """
     with _transaction() as conn:
         return upsert_incident_in(
@@ -317,6 +327,29 @@ def open_incidents() -> List[Dict[str, Any]]:
 def ack_incident(incident_id: str) -> bool:
     """Acknowledge (close) an incident; ``False`` when missing or already closed."""
     return set_incident_state(incident_id, "closed")
+
+
+def close_incidents_for_recovered_job(job_id: str) -> int:
+    """Mark every open incident for ``job_id`` ``resolved`` after a successful run; returns how many.
+    Without this the ledger only ever grows: a one-off failure (a config drift skip, a provider
+    outage) stayed ``detected``/``alerted`` forever after the job recovered, so ``hermes cron
+    incidents`` showed dozens of "open" incidents for jobs that had been green for weeks (32 of 32 on
+    one install). ``resolved`` is distinct from the operator's ``closed`` on purpose: a repeat of the
+    same error re-opens a resolved incident and alerts again (see ``upsert_incident``), whereas
+    ``closed`` keeps that signature silent."""
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        # A successful RUN proves the execution healed, not the channel:
+        # delivery incidents heal only when a send lands (the outbox calls
+        # ``record_recovery(category='delivery')``). The categories recover
+        # independently by design.
+        cursor = conn.execute(
+            """UPDATE cron_incidents SET state='resolved', closed_at=?
+               WHERE job_id=? AND state IN ('detected', 'alerted')
+                 AND (failure_type IS NULL OR failure_type != 'delivery')""",
+            (now, str(job_id or "")),
+        )
+        return int(cursor.rowcount or 0)
 
 
 def _state_filter(state: Optional[str]) -> tuple[str, tuple]:

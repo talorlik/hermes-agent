@@ -179,11 +179,17 @@ def test_scheduler_registration_receives_script_failure_policy(cron_store):
 
 
 def test_cronjob_tool_creates_updates_and_lists_script_failure_policy(
-    cron_store, monkeypatch
+    cron_store, tmp_path, monkeypatch
 ):
     from tools.cronjob_tools import cronjob
 
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    # Create-time validation requires the script to exist in this profile's
+    # scripts/ dir (#94821), so the gate script must exist before the job can.
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "scripts").mkdir(parents=True)
+    (hermes_home / "scripts" / "gate.py").write_text("print('gate')\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     created = json.loads(
         cronjob(
             action="create",

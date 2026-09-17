@@ -178,7 +178,10 @@ def test_scheduler_records_recovery_on_successful_run(tmp_path, monkeypatch):
     S.tick(verbose=False, sync=True)
 
     assert I.open_incidents() == []
-    assert I.get_incident(open_rows[0]["id"])["state"] == "recovered"
+    # The scheduler's run-success seam heals via ``close_incidents_for_recovered_job``
+    # (state ``resolved``); ``record_recovery`` keeps ``recovered`` for the
+    # category-scoped paths (delivery outbox). Both auto-heal states re-open.
+    assert I.get_incident(open_rows[0]["id"])["state"] == "resolved"
 
 
 def test_not_configured_delivery_does_not_mark_incident_alerted(

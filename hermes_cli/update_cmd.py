@@ -63,43 +63,22 @@ from hermes_cli.update_cmd_windows import (  # noqa: F401
     _write_update_planned_stop_marker,
 )
 from hermes_cli.update_cmd_fleet import (  # noqa: F401
-    _FLEET_RESTART_PENDING_NAME,
-    _FRESH_RESTART_SUPERVISORS,
-    _GatewayRestartOutcome,
-    _apply_pending_fleet_restart_catchup,
-    _clear_fleet_restart_pending_marker,
-    _current_checkout_sha,
-    _drain_or_signal_gateway_for_update,
-    _fleet_probe_expected_runtimes,
-    _fleet_restart_pending_marker_path,
-    _for_each_systemd_gateway_unit,
-    _gateway_recovery_partition,
-    _gateway_service_matches_profile,
-    _pending_fleet_restart_needed,
-    _receipt_looks_unfinished,
-    _receipt_reports_stale_runtime,
-    _resolve_manage_cmd,
-    _restart_gateway_fleet_after_update,
-    _restart_launchd_gateway_after_update,
-    _restart_macos_launchd_gateways,
-    _restart_phase_failure_is_incomplete,
-    _restart_systemd_gateway_units,
-    _restart_systemd_gateway_units_best_effort,
-    _run_pending_fleet_restart,
-    _service_restart_sec,
-    _service_unit_supports_graceful_sigusr1_restart,
-    _surviving_gateway_pids_after_failed_restart,
-    _systemctl,
-    _systemctl_reset_and_restart,
-    _verify_fleet_after_update,
-    _wait_for_service_active,
-    _warn_gateway_restart_phase_aborted,
-    _warn_incomplete_gateway_fleet_restart,
-    _warn_pending_fleet_restart,
-    _warn_pending_fleet_restart_on_startup,
-    _write_fleet_restart_pending_marker,
-    _write_gateway_update_exit_code,
-)
+    _FLEET_RESTART_PENDING_NAME, _FRESH_RESTART_SUPERVISORS, _GatewayRestartOutcome,
+    _apply_pending_fleet_restart_catchup, _clear_fleet_restart_pending_marker,
+    _current_checkout_sha, _defer_fleet_restart_after_update, _drain_or_signal_gateway_for_update, _fleet_probe_expected_runtimes,
+    _fleet_restart_pending_marker_path, _for_each_systemd_gateway_unit,
+    _gateway_recovery_partition, _gateway_service_matches_profile, _pending_fleet_restart_needed,
+    _receipt_looks_unfinished, _receipt_reports_stale_runtime, _resolve_manage_cmd,
+    _restart_gateway_fleet_after_update, _restart_launchd_gateway_after_update,
+    _restart_macos_launchd_gateways, _restart_phase_failure_is_incomplete,
+    _restart_systemd_gateway_units, _restart_systemd_gateway_units_best_effort,
+    _run_pending_fleet_restart, _service_restart_sec,
+    _service_unit_supports_graceful_sigusr1_restart, _surviving_gateway_pids_after_failed_restart,
+    _systemctl, _systemctl_reset_and_restart, _verify_fleet_after_update,
+    _wait_for_service_active, _warn_gateway_restart_phase_aborted,
+    _warn_incomplete_gateway_fleet_restart, _warn_pending_fleet_restart,
+    _warn_pending_fleet_restart_on_startup, _write_fleet_restart_pending_marker,
+    _write_gateway_update_exit_code)
 from hermes_cli.update_cmd_zip import (  # noqa: F401
     _ZIP_PRESERVED_TOP_LEVEL,
     _ZIP_STAGING_ARTIFACT_SUFFIXES,
@@ -220,38 +199,20 @@ from hermes_cli.update_cmd_git import (  # noqa: F401
     _verify_origin_main_postcondition,
 )
 from hermes_cli.update_cmd_maint import (  # noqa: F401
-    _PRE_UPDATE_SNAPSHOT_KEEP,
-    _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
-    _STALE_PURGE_PREFIXES,
+    _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
     _STALE_PURGE_PROTECTED,
-    _UPDATE_RUNTIME_RELOAD_MODULES,
-    _clear_stale_sqlite_sidecars,
-    _ensure_acp_launcher,
-    _ensure_fhs_path_guard,
-    _finish_dashboard_update_cleanup,
-    _format_time_ago,
-    _post_update_sqlite_runtime_status,
-    _print_bundled_skills_sync_report,
-    _print_curator_first_run_notice,
-    _print_curator_recent_run_notice,
-    _print_fts_optimize_available_notice,
-    _print_update_completion,
-    _print_update_summary,
-    _print_verified_update_completion,
-    _purge_stale_hermes_modules,
-    _read_project_version,
-    _reload_process_scan_modules,
-    _reload_updated_runtime_modules,
-    _resolve_pre_update_backup_mode,
-    _restore_state_db_from_snapshot,
-    _run_post_update_maintenance,
-    _run_pre_update_backup,
+    _UPDATE_RUNTIME_RELOAD_MODULES, _clear_stale_sqlite_sidecars,
+    _ensure_acp_launcher, _ensure_fhs_path_guard, _finish_dashboard_update_cleanup,
+    _format_time_ago, _post_update_sqlite_runtime_status, _print_bundled_skills_sync_report,
+    _print_curator_first_run_notice, _print_curator_recent_run_notice,
+    _print_fts_optimize_available_notice, _print_update_completion, _print_update_summary,
+    _print_verified_update_completion, _purge_stale_hermes_modules, _read_project_version,
+    _reload_process_scan_modules, _reload_updated_runtime_modules,
+    _resolve_pre_update_backup_mode, _restore_state_db_from_snapshot,
+    _run_post_update_maintenance, _run_pre_update_backup, _stale_purge_prefixes,
     _sweep_bytecode_after_update,
-    _update_complete_message,
-    _verify_and_restore_one_state_db,
-    _verify_and_restore_state_dbs_post_update,
-)
-
+    _update_complete_message, _verify_and_restore_one_state_db,
+    _verify_and_restore_state_dbs_post_update)
 logger = logging.getLogger(__name__)
 
 
@@ -2077,6 +2038,7 @@ class _UpdateOptions:
     keep_stash: bool
     switch_branch: bool
     discard_local_changes: bool
+    no_gateway_restart: bool = False
 
 
 def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
@@ -2105,6 +2067,10 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
     # branch's history; only meaningful with parked_branch_strategy "update_in_place".
     # See #89507.
     switch_branch = bool(getattr(args, "switch_branch", False))
+    # --no-gateway-restart (cron inside the gateway's own cgroup): update code
+    # and dependencies but defer the fleet restart so the updater is not killed
+    # by its own restart. The pending-restart marker is kept for catch-up.
+    no_gateway_restart = bool(getattr(args, "no_gateway_restart", False))
 
     # Interactive terminals always stash-and-ask; only non-interactive updates consult
     # updates.non_interactive_local_changes (auto-restore vs discard).
@@ -2118,14 +2084,10 @@ def _resolve_update_options(args, gateway_mode: bool) -> _UpdateOptions:
             discard_local_changes = _mode == "discard"
     return _UpdateOptions(
         active_lazy_features=active_lazy_features,
-        active_tool_dependencies=active_tool_dependencies,
-        pre_update_version=pre_update_version,
-        gw_input_fn=gw_input_fn,
-        assume_yes=assume_yes,
-        keep_stash=keep_stash,
-        switch_branch=switch_branch,
-        discard_local_changes=discard_local_changes,
-    )
+        active_tool_dependencies=active_tool_dependencies, pre_update_version=pre_update_version,
+        gw_input_fn=gw_input_fn, assume_yes=assume_yes, keep_stash=keep_stash,
+        switch_branch=switch_branch, discard_local_changes=discard_local_changes,
+        no_gateway_restart=no_gateway_restart)
 
 
 def _begin_update_receipt_and_plan(args):
@@ -2302,20 +2264,22 @@ def _handle_update_called_process_error(
         if gateway_mode:
             _write_gateway_update_exit_code(desktop_build_ok)
     else:
-        print(f"✗ {stage}: {e}")
-        _print_called_process_error_tail(e)
         if _called_process_error_is_python_dep_install(e):
-            print(
-                "  The git update already finished. Re-downloading the source "
-                "ZIP cannot fix a dependency install error and would overwrite local files."
-            )
+            print(f"✗ {stage} (the code update itself succeeded).")
+            _print_called_process_error_tail(e)
+            print()
+            print("  Hermes may not start until the dependencies are installed. Fix the error above")
+            print("  (usually network or disk space), then run `hermes update` again.")
             if _m()._is_windows():
-                print("  Retry through the venv interpreter:")
+                print("  If `hermes update` itself will not start, retry through the venv interpreter:")
                 print(
-                    "    venv\\Scripts\\python.exe -c "
-                    '"from hermes_cli.main import main; main()" update --yes'
-                )
-        _finalize_receipt("failed", "Update receipt finalize failed: %s")
+                    '    venv\\Scripts\\python.exe -c '
+                    '"from hermes_cli.main import main; main()" update --yes')
+        else:
+            print(f"✗ {stage}.")
+            print(f"  Details: {e}")
+            _print_called_process_error_tail(e)
+        _finalize_receipt("failed", 'Update receipt finalize failed: %s')
         sys.exit(1)
 
 
@@ -2330,8 +2294,9 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
 def _finish_already_up_to_date(
     git_cmd, branch: str, current_branch: str, _plan, opts, *, assume_yes: bool, gateway_mode: bool,
     gw_input_fn, pre_update_snapshot_id, had_desktop_app_before_update: bool,
-    active_lazy_features, active_tool_dependencies, _windows_gateway_resume) -> None:
-    """Handle the already-up-to-date path and catch up the runtime fleet.
+    active_lazy_features, active_tool_dependencies, _windows_gateway_resume,
+    no_gateway_restart: bool = False) -> None:
+    """"Already up to date" path: restore stash/branch, repair the checkout, catch up the fleet.
     ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt)."""
     _invalidate_update_cache()
 
@@ -2374,8 +2339,9 @@ def _finish_already_up_to_date(
     # Catch up even on the "Already up to date" path — that early return is what left the gateway on stale
     # code for two days. Runs BEFORE the runtime-verification exit gate below: a vulnerable SQLite runtime
     # demotes the outcome to partial, but must not strand the fleet on stale code (#91277 fleet contract —
-    # the pending-restart check always executes).
-    _apply_pending_fleet_restart_catchup()
+    # the pending-restart check always executes). Under --no-gateway-restart the
+    # catch-up is deferred instead (executing it would kill the cron's own gateway).
+    _apply_pending_fleet_restart_catchup(defer=no_gateway_restart)
     if not current_checkout_complete:
         if gateway_mode:
             _write_gateway_update_exit_code(False)
@@ -2456,6 +2422,28 @@ def _apply_pulled_update(
     # the marker would never land and the new gateway's watcher would time out spuriously.
     if gateway_mode:
         _write_gateway_update_exit_code(update_complete)
+
+    if opts.no_gateway_restart:
+        # Cron inside the gateway's own cgroup: restarting the fleet now would
+        # SIGUSR1-drain this updater's own gateway and systemd would SIGKILL the
+        # updater with it. Defer instead — the pending marker written above is
+        # kept for the next normal update. Skipping the restart phase also skips
+        # its stale-module purge: this live interpreter still serves pre-update
+        # code and must not have its sys.modules graph mutated mid-flight.
+        # Windows pause/resume still runs (paused gateways must be resumed onto
+        # pre-update code); only the fleet restart + verification are deferred.
+        # The resume outcome is RETAINED (not discarded): a failed resume must
+        # still make this update partial, exactly as on the normal path.
+        resume_outcome = _GatewayRestartOutcome(
+            incomplete=False, phase_errors=[], pre_restart_gateway_pids=[],
+            restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
+            externally_supervised_profiles=[], killed_pids=set(),
+        )
+        _resume_windows_gateways_and_merge_outcome(
+            resume_outcome, _windows_gateway_resume, gateway_mode)
+        _defer_fleet_restart_after_update(
+            update_complete=update_complete, resume_incomplete=resume_outcome.incomplete)
+        return
 
     _restart = _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode)
     _resume_windows_gateways_and_merge_outcome(
@@ -2610,7 +2598,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 active_lazy_features=opts.active_lazy_features,
                 active_tool_dependencies=opts.active_tool_dependencies,
                 _windows_gateway_resume=_windows_gateway_resume,
-            )
+                no_gateway_restart=opts.no_gateway_restart)
             return
 
         if commit_count > 0:
