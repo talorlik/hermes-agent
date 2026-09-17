@@ -24,12 +24,86 @@ _ALL_TOOLSETS = {"all", "*"}
 
 # Keys copied from the run result into the ``--usage-file`` report. ``service_tier`` is a
 # billing-audit field: the tier REQUESTED via request_overrides.extra_body (None when unset), so
-# batch pipelines can verify the tier they pay for went out on the wire.
+# batch pipelines can verify the tier they pay for went out on the wire. ``partial`` /
+# ``interrupted`` / ``turn_exit_reason`` say WHY ``completed`` is false, so a pipeline can tell
+# an iteration-budget stop from a Ctrl-C without parsing stderr (#111770).
 _USAGE_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens", "api_calls",
-    "model", "provider", "session_id", "completed",
+    "model", "provider", "session_id", "completed", "partial", "interrupted", "turn_exit_reason",
 )
+
+# Counters summed per auxiliary task (vision, compression, title_generation, ...) into the
+# ``auxiliary`` block of the report. The main-loop keys above stay main-loop-only (backward
+# compatible); ``total_including_auxiliary`` carries the grand total pipelines bill on (#112848).
+_AUX_COUNTERS = (
+    "api_calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "estimated_cost_usd",
+)
+
+
+def _auxiliary_usage(session_db, session_id: Optional[str]) -> dict[str, dict]:
+    """Per-task aux usage recorded for *session_id*'s lineage (``{}`` without a store / session)."""
+    if session_db is None or not session_id:
+        return {}
+    try:
+        return session_db.auxiliary_usage_by_task(session_id)
+    except Exception:
+        logging.debug("oneshot: auxiliary usage read failed", exc_info=True)
+        return {}
+
+
+def _attach_auxiliary_usage(result: dict, session_db, before: dict[str, dict],
+                            fallback_session_id: Optional[str] = None) -> None:
+    """Store this run's auxiliary usage on *result* as the delta against the pre-turn snapshot
+    (a resumed session already carries earlier runs' aux rows). Waits (bounded) for the auto-title
+    thread first: it bills from a daemon thread and can still be in flight when the turn returns.
+    Failed-turn dicts carry no ``session_id``; *fallback_session_id* keeps the delta readable then."""
+    from agent.title_generator import wait_for_title_upgrades
+
+    wait_for_title_upgrades()
+    after = _auxiliary_usage(session_db, result.get("session_id") or fallback_session_id)
+    by_task: dict[str, dict] = {}
+    for task, counters in after.items():
+        prior = before.get(task, {})
+        delta = {key: (counters.get(key) or 0) - (prior.get(key) or 0) for key in _AUX_COUNTERS}
+        if any(delta.values()):
+            by_task[task] = delta
+    result["auxiliary_usage"] = by_task
+
+
+def _auxiliary_report(report: dict, by_task: dict[str, dict]) -> None:
+    """Add the ``auxiliary`` breakdown and ``total_including_auxiliary`` to the ledger."""
+    totals = {key: sum(t.get(key) or 0 for t in by_task.values()) for key in _AUX_COUNTERS}
+    totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
+    report["auxiliary"] = {**totals, "by_task": by_task}
+    main_cost = report.get("estimated_cost_usd")
+    report["total_including_auxiliary"] = {
+        "estimated_cost_usd": None if main_cost is None else main_cost + totals["estimated_cost_usd"],
+        "total_tokens": (report.get("total_tokens") or 0) + totals["total_tokens"],
+        "api_calls": (report.get("api_calls") or 0) + totals["api_calls"],
+    }
+
+# Exit code for a turn stopped by an interrupt (SIGINT convention, same as ``chat -Q``).
+_INTERRUPTED_EXIT_CODE = 130
+
+
+def _oneshot_exit_code(response: Optional[str], result: dict) -> int:
+    """Map a finished ``-z`` turn onto its exit code: ``0`` only when the turn completed;
+    ``130`` interrupted; ``2`` failed or stopped partway (``partial``, ``completed: False`` such
+    as the iteration budget); ``1`` a completed turn that produced no text at all.
+
+    The outcome is judged from the result, not from whether text was printed: a partial or
+    failed turn usually leaves an explanation on stdout, and exiting 0 for it made scripts treat
+    a half-done job (or a provider error summary) as success (#111770).
+    """
+    if result.get("interrupted"):
+        return _INTERRUPTED_EXIT_CODE
+    if result.get("failed") or result.get("partial") or result.get("completed") is False:
+        return 2
+    if not (response or "").strip():
+        return 1
+    return 0
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -88,74 +162,9 @@ def _configured_mcp_servers() -> tuple[set[str], set[str]]:
         return set(), set()
 
 
-# Reserved oneshot-only sentinel: ``--toolsets none`` means an explicit empty
-# native/MCP tool set. It is not a real toolset name and only the exact
-# lowercase spelling is accepted alone.
-_TOOLSETS_NONE_SENTINEL = "none"
-
-# Process-scoped guard used by later startup slices to prevent import-time tool
-# discovery after the sentinel has been validated.
-_EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
-
-
-def _raw_toolset_tokens(toolsets: object = None) -> list[str]:
-    """Split explicit toolsets while preserving blank comma segments."""
-    if not toolsets:
-        return []
-    raw_items = [toolsets] if isinstance(toolsets, str) else toolsets
-    if not isinstance(raw_items, (list, tuple)):
-        raw_items = [raw_items]
-
-    tokens: list[str] = []
-    for item in raw_items:
-        if isinstance(item, str):
-            tokens.extend(part.strip() for part in item.split(","))
-        else:
-            tokens.append(str(item).strip())
-    return tokens
-
-
-def _precheck_explicit_toolsets(
-    toolsets: object = None,
-) -> tuple[list[str] | None, str | None] | None:
-    """Resolve sentinel and structurally invalid lists without discovery."""
+def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
-        return None
-
-    raw = _raw_toolset_tokens(toolsets)
-    if any(token.lower() == _TOOLSETS_NONE_SENTINEL for token in raw):
-        if raw != [_TOOLSETS_NONE_SENTINEL]:
-            return None, (
-                "hermes -z: --toolsets 'none' selects an explicit empty tool "
-                "set and must be the only toolset entry, spelled exactly "
-                f"lowercase; got: {', '.join(raw)}. Pass 'none' alone, or "
-                "remove it.\n"
-            )
-        return [], None
-
-    if any(token in _ALL_TOOLSETS for token in normalized) and len(normalized) > 1:
-        return None, (
-            "hermes -z: --toolsets 'all' enables every toolset and must be "
-            f"the only toolset entry; got: {', '.join(normalized)}. Pass "
-            "'all' alone, or list specific toolsets.\n"
-        )
-    return None
-
-
-def _validate_explicit_toolsets(
-    toolsets: object = None,
-) -> tuple[list[str] | None, str | None]:
-    """Validate explicit toolsets atomically without silently narrowing them."""
-    normalized = _normalize_toolsets(toolsets)
-    if normalized is None:
-        return None, None
-
-    early = _precheck_explicit_toolsets(toolsets)
-    if early is not None:
-        return early
-
-    if normalized[0] in _ALL_TOOLSETS:
         return None, None
 
     try:
@@ -163,47 +172,45 @@ def _validate_explicit_toolsets(
     except Exception as exc:
         return None, f"hermes -z: failed to validate --toolsets: {exc}\n"
 
-    unresolved = [name for name in normalized if not validate_toolset(name)]
+    built_in = [name for name in normalized if validate_toolset(name)]
+    unresolved = [name for name in normalized if name not in built_in]
+
     if unresolved:
         try:
             from hermes_cli.plugins import discover_plugins
 
             discover_plugins()
-            unresolved = [name for name in unresolved if not validate_toolset(name)]
+            plugin_valid = [name for name in unresolved if validate_toolset(name)]
         except Exception:
-            pass
+            plugin_valid = []
+        built_in.extend(plugin_valid)
+        unresolved = [name for name in unresolved if name not in plugin_valid]
 
-    mcp_names: set[str] = set()
-    mcp_disabled: set[str] = set()
-    if unresolved:
-        try:
-            mcp_names, mcp_disabled = _configured_mcp_servers()
-        except Exception:
-            mcp_names = set()
-            mcp_disabled = set()
-
-    disabled = [name for name in unresolved if name in mcp_disabled]
-    unknown = [
-        name
-        for name in unresolved
-        if name not in mcp_names and name not in mcp_disabled
-    ]
-    if unknown or disabled:
-        parts = []
-        if unknown:
-            parts.append(f"unknown entries: {', '.join(unknown)}")
-        if disabled:
-            parts.append(
-                "disabled MCP servers (set enabled: true in config.yaml to "
-                f"use): {', '.join(disabled)}"
+    if any(name in _ALL_TOOLSETS for name in built_in):
+        ignored = [name for name in normalized if name not in _ALL_TOOLSETS]
+        if ignored:
+            sys.stderr.write(
+                "hermes -z: --toolsets all enables every toolset; "
+                f"ignoring additional entries: {', '.join(ignored)}\n"
             )
-        return None, (
-            "hermes -z: --toolsets is all-or-nothing; "
-            + "; ".join(parts)
-            + ". No tools were enabled; fix or remove the listed entries.\n"
-        )
+        return None, None
 
-    return list(normalized), None
+    mcp_names, mcp_disabled = _configured_mcp_servers() if unresolved else (set(), set())
+    mcp_valid = [name for name in unresolved if name in mcp_names]
+    disabled = [name for name in unresolved if name in mcp_disabled]
+    unknown = [name for name in unresolved if name not in mcp_names and name not in mcp_disabled]
+    valid = built_in + mcp_valid
+
+    if unknown:
+        sys.stderr.write(f"hermes -z: ignoring unknown --toolsets entries: {', '.join(unknown)}\n")
+    if disabled:
+        sys.stderr.write(
+            "hermes -z: ignoring disabled MCP servers (set enabled: true in config.yaml to use): "
+            f"{', '.join(disabled)}\n"
+        )
+    if not valid:
+        return None, "hermes -z: --toolsets did not contain any valid toolsets.\n"
+    return valid, None
 
 
 def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] = None) -> None:
@@ -218,6 +225,8 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         report = {key: result.get(key) for key in _USAGE_KEYS}
         report["failed"] = bool(result.get("failed")) or failure is not None
         report["service_tier"] = result.get("service_tier")
+        if isinstance(result.get("auxiliary_usage"), dict):
+            _auxiliary_report(report, result["auxiliary_usage"])
         if failure is not None:
             report["failure"] = failure
         out = Path(path).expanduser()
@@ -225,14 +234,6 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     except Exception:
         pass
-
-
-def _restore_env_var(name: str, prior: str | None) -> None:
-    """Restore an environment variable, preserving absent versus empty."""
-    if prior is None:
-        os.environ.pop(name, None)
-    else:
-        os.environ[name] = prior
 
 
 def run_oneshot(
@@ -247,197 +248,99 @@ def run_oneshot(
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
-    Args:
-        prompt: The user message to send.
-        model: Optional model override. Falls back to HERMES_INFERENCE_MODEL
-            env var, then config.yaml's model.default / model.model.
-        provider: Optional provider override. Falls back to config.yaml's
-            model.provider, then "auto".
-        toolsets: Optional comma-separated string or iterable of toolsets.
-            The reserved token ``none``, passed alone, runs the agent with an
-            explicit empty tool set (no native and no MCP tools); combining
-            it with any other entry fails validation with exit 2.
-        skills: Optional repeated/comma-separated skill identifiers to preload.
-        usage_file: Optional path; when set, a JSON usage report (estimated
-            cost, token counts, model, api_calls) is written there after the
-            run — even when the run fails — so pipelines can account for
-            spend per invocation.
-
-    Returns the exit code.  The caller owns process termination.
-
-    Global-state contract: one outer transaction snapshots — before the
-    logging disable, validation, and every environment assignment below —
-    the exact prior presence and value of HERMES_YOLO_MODE,
-    HERMES_ACCEPT_HOOKS, and HERMES_ONESHOT_EXPLICIT_NO_TOOLS plus the
-    exact logging-disable integer, and restores all four on every return
-    and every exception path, BaseException included.  That makes the call
-    state-clean for those globals; it does NOT reverse tools.approval's
-    import-time _YOLO_MODE_FROZEN snapshot — an in-process caller that
-    already imported tools.approval keeps that frozen approval state
-    regardless of the environment restore.
+    Model/provider fall back to ``HERMES_INFERENCE_MODEL`` and config.yaml. ``usage_file`` gets a
+    JSON usage report even when the run fails. ``resume`` is a session id (already normalized by
+    the CLI layer: latest/title/--continue resolution) whose transcript is loaded and continued
+    by this turn. Returns the exit code; the caller owns process termination.
     """
-    prior_yolo = os.environ.get("HERMES_YOLO_MODE")
-    prior_accept_hooks = os.environ.get("HERMES_ACCEPT_HOOKS")
-    prior_guard = os.environ.get(_EXPLICIT_NO_TOOLS_ENV)
-    prior_logging_disable = logging.root.manager.disable
+    # Silence every stdlib logger: AIAgent, tools and provider adapters log to stderr through the
+    # root logger. File handlers from setup_logging() keep working (level-independent).
+    logging.disable(logging.CRITICAL)
 
-    devnull = None
-    body_failed = False
-    try:
-        # Silence every stdlib logger for the duration.  AIAgent, tools, and
-        # provider adapters all log to stderr through the root logger; file
-        # handlers added by setup_logging() keep working (they're attached to
-        # the root logger's handler list, not affected by level), but no
-        # bytes reach the terminal.
-        logging.disable(logging.CRITICAL)
+    # --provider without --model is ambiguous (the provider may not host the configured model, and
+    # picking its catalog default hides the mismatch). Validate BEFORE the stderr redirect.
+    env_model_early = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
+    if provider and not ((model or "").strip() or env_model_early):
+        sys.stderr.write(
+            "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
+            "Pass both explicitly, or neither to use your configured defaults.\n"
+        )
+        return 2
 
-        # --provider without --model is ambiguous: carrying the user's configured
-        # model across to a different provider is usually wrong (that provider may
-        # not host it), and silently picking the provider's catalog default hides
-        # the mismatch.  Require the caller to be explicit.  Validate BEFORE the
-        # stderr redirect so the message actually reaches the terminal.
-        env_model_early = os.getenv("HERMES_INFERENCE_MODEL", "").strip()
-        if provider and not ((model or "").strip() or env_model_early):
-            sys.stderr.write(
-                "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
-                "Pass both explicitly, or neither to use your configured defaults.\n"
-            )
-            return 2
+    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+    if toolsets_error:
+        sys.stderr.write(toolsets_error)
+        return 2
+    use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-        if toolsets_error:
-            sys.stderr.write(toolsets_error)
-            return 2
-        use_config_toolsets = _normalize_toolsets(toolsets) is None
+    # Non-interactive by definition — an approval prompt would hang forever.
+    os.environ["HERMES_YOLO_MODE"] = "1"
+    os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+    # Same finite-chat marker as `hermes chat -q` (cli.py): the session-source resolver uses it to drop an
+    # inherited tui/desktop transport label, and delegate dispatch to route detached results inline.
+    os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
 
-        # Auto-approve any shell / tool approvals.  Non-interactive by
-        # definition — a prompt would hang forever.  Only after side-effect-
-        # free validation succeeded: the exit-2 paths above must not mutate
-        # approval state at all.
-        os.environ["HERMES_YOLO_MODE"] = "1"
-        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+    # Nothing here drains process_registry.completion_queue (only cli.py's process_loop and the
+    # gateway watchers do), so left unbound delegate_task would be forced background and every
+    # subagent result discarded. Stateless routes it to the inline/synchronous path.
+    declare_stateless_channel()
 
-        # One-shot prints a single final response and exits: there is no later turn
-        # for a detached subagent's completion to re-enter, and nothing here drains
-        # process_registry.completion_queue (only cli.py's interactive process_loop
-        # and the gateway watchers do). Left unbound, async_delivery_supported()
-        # defaults True, delegate_task is forced background, and every subagent
-        # result is discarded. Declaring the channel stateless routes delegate_task
-        # to its inline/synchronous path. See declare_stateless_channel().
-        declare_stateless_channel()
+    # Redirect stderr AND stdout for the entire call tree; the final response goes to the real
+    # stdout at the end.
+    real_stdout = sys.stdout
+    real_stderr = sys.stderr
 
-        # Redirect stderr AND stdout to devnull for the entire call tree.
-        # We'll print the final response to the real stdout at the end.
-        real_stdout = sys.stdout
-        real_stderr = sys.stderr
-        devnull = open(os.devnull, "w", encoding="utf-8")
-
-        # Explicit-no-tools process guard: _run_agent imports run_agent, which
-        # transitively imports model_tools; that module runs plugin discovery at
-        # import time unless this guard is set.  Set it before the agent build so
-        # a `none` run stays side-effect free.  The outer finally restores the
-        # prior value exactly (guard last) so nested or subsequent runs in this
-        # process see an unchanged environment.
-        explicit_no_tools = explicit_toolsets == []
-        if explicit_no_tools:
-            os.environ[_EXPLICIT_NO_TOOLS_ENV] = "1"
-
-        response: Optional[str] = None
-        result: dict = {}
-        failure: BaseException | None = None
-        with redirect_stdout(devnull), redirect_stderr(devnull):
-            try:
-                response, result = _run_agent(
-                    prompt,
-                    model=model,
-                    provider=provider,
-                    toolsets=explicit_toolsets,
-                    use_config_toolsets=use_config_toolsets,
-                    skills=skills,
-                    resume=resume,
-                    reasoning=reasoning,
-                )
-            except BaseException as exc:  # noqa: BLE001
-                # Capture anything that escapes the agent (including OSError
-                # from prompt_toolkit/Vt100 when stdout is a non-TTY pipe,
-                # KeyboardInterrupt, SystemExit, etc.) so we can surface it on
-                # the real stderr instead of crashing past the redirect with a
-                # traceback that the caller never sees. A silent exit in a
-                # cron / SSH / subprocess context is the worst failure mode.
-                # See #30623.
-                failure = exc
-
-        if failure is not None:
-            # Re-raise control-flow exceptions so the parent handles them as usual
-            # (Ctrl-C / explicit sys.exit() inside the agent).
-            if isinstance(failure, (KeyboardInterrupt, SystemExit)):
-                _write_usage_file(usage_file, result, failure=repr(failure))
-                raise failure
-            _write_usage_file(usage_file, result, failure=str(failure))
-            real_stderr.write(f"hermes -z: agent failed: {failure}\n")
-            real_stderr.flush()
-            return 1
-
-        _write_usage_file(usage_file, result)
-
-        # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
-        # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
-        # exit 1 after the turn already completed — scrub to U+FFFD first.
-        # See #80366.
-        if response:
-            from agent.message_sanitization import _sanitize_surrogates
-
-            response = _sanitize_surrogates(response)
-
-        if response:
-            real_stdout.write(response)
-            if not response.endswith("\n"):
-                real_stdout.write("\n")
-            real_stdout.flush()
-
-        if (result.get("failed") or result.get("partial")) and not (response or "").strip():
-            return 2
-
-        if not (response or "").strip():
-            real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
-            real_stderr.flush()
-            return 1
-
-        return 0
-    except BaseException:
-        # Flag (not handle) an unwinding body failure so the finally below
-        # can rank it above a devnull-close failure without consulting
-        # ambient sys.exc_info(), which an enclosing except block in an
-        # in-process caller could pollute.
-        body_failed = True
-        raise
-    finally:
-        # Cleanup order (outer transaction): the stdout/stderr redirects and
-        # the agent/session/process cleanup owned by _run_agent have already
-        # unwound inside the try above; close devnull, then restore the
-        # named globals.  The explicit-no-tools guard is restored LAST so no
-        # cleanup import can trigger plugin discovery while teardown is
-        # still running.  close() is itself a failure boundary: an ordinary
-        # Exception stays swallowed as before, but a BaseException is
-        # captured so the nested finally still restores all four globals,
-        # then re-raised only when no body failure is already unwinding
-        # (the body failure must never be masked by cleanup).
-        close_failure: BaseException | None = None
+    response: Optional[str] = None
+    result: dict = {}
+    failure: BaseException | None = None
+    with open(os.devnull, "w", encoding="utf-8") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
         try:
-            if devnull is not None:
-                try:
-                    devnull.close()
-                except Exception:
-                    pass
-                except BaseException as exc:
-                    close_failure = exc
-        finally:
-            _restore_env_var("HERMES_ACCEPT_HOOKS", prior_accept_hooks)
-            _restore_env_var("HERMES_YOLO_MODE", prior_yolo)
-            logging.disable(prior_logging_disable)
-            _restore_env_var(_EXPLICIT_NO_TOOLS_ENV, prior_guard)
-        if close_failure is not None and not body_failed:
-            raise close_failure
+            response, result = _run_agent(
+                prompt,
+                model=model,
+                provider=provider,
+                toolsets=explicit_toolsets,
+                use_config_toolsets=use_config_toolsets,
+                skills=skills,
+                resume=resume,
+                reasoning=reasoning,
+                ledger=bool(usage_file),
+            )
+        except BaseException as exc:  # noqa: BLE001
+            # Capture anything escaping the agent (OSError from prompt_toolkit on a non-TTY pipe,
+            # KeyboardInterrupt, SystemExit, ...) so it reaches the real stderr instead of dying
+            # silently past the redirect — the worst failure mode in cron / SSH / subprocess use.
+            failure = exc
+
+    if failure is not None:
+        # Control-flow exceptions (Ctrl-C / sys.exit inside the agent) re-raise to the parent.
+        if isinstance(failure, (KeyboardInterrupt, SystemExit)):
+            _write_usage_file(usage_file, result, failure=repr(failure))
+            raise failure
+        _write_usage_file(usage_file, result, failure=str(failure))
+        real_stderr.write(f"hermes -z: agent failed: {failure}\n")
+        real_stderr.flush()
+        return 1
+
+    _write_usage_file(usage_file, result)
+
+    if response:
+        # Lone UTF-16 surrogates would raise UnicodeEncodeError on a real stdout and abort with
+        # exit 1 after the turn already completed — scrub to U+FFFD first.
+        # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). See #80366.
+        from agent.message_sanitization import _sanitize_surrogates
+
+        response = _sanitize_surrogates(response)
+        real_stdout.write(response)
+        if not response.endswith("\n"):
+            real_stdout.write("\n")
+        real_stdout.flush()
+
+    exit_code = _oneshot_exit_code(response, result)
+    if exit_code == 1:
+        real_stderr.write("hermes -z: no final response was produced; treating the run as failed.\n")
+        real_stderr.flush()
+    return exit_code
 
 
 def _create_session_db_for_oneshot():
@@ -593,9 +496,11 @@ def _run_agent(
     skills: object = None,
     resume: Optional[str] = None,
     reasoning: object = None,
+    ledger: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
-    ``(final_response, run_result)``. Imports are local to keep CLI startup cheap."""
+    ``(final_response, run_result)``. Imports are local to keep CLI startup cheap. *ledger* (set when
+    ``--usage-file`` is requested) attaches this run's auxiliary usage to the result."""
     from hermes_cli.config import load_config
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
@@ -629,7 +534,7 @@ def _run_agent(
             reasoning_config = parsed_reasoning
 
     # sorted() gives stable ordering for config-derived sets; explicit values preserve user order.
-    toolsets_list = [] if toolsets == [] else _normalize_toolsets(toolsets)
+    toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
@@ -639,12 +544,9 @@ def _run_agent(
     # Ensure MCP tools are discovered before building the agent. This helper starts discovery if needed
     # (idempotent) and bounded-waits with the larger single-query bound (default 15s) because there is only
     # ONE turn and no between-turns late-binding refresh (#38448).
-    if toolsets_list != []:
-        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-        ensure_mcp_discovery_before_agent_build(
-            logger=logging.getLogger(__name__), single_query=True
-        )
+    ensure_mcp_discovery_before_agent_build(logger=logging.getLogger(__name__), single_query=True)
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
@@ -678,7 +580,11 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
+        aux_before = _auxiliary_usage(session_db, resume_sid) if ledger else {}
         result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
+        if ledger:
+            _attach_auxiliary_usage(result, session_db, aux_before,
+                                    fallback_session_id=agent.session_id or resume_sid)
         return (result.get("final_response") or "", result)
     finally:
         _close_agent(agent, session_db)
