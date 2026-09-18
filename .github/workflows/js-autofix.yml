@@ -19,20 +19,26 @@ name: auto-fix lint issues & formatting
 # scripts, installed plugins). To prevent a malicious PR from getting arbitrary
 # code execution on a runner with push access, the work is split:
 #
-#   1. generate-patch (unprivileged, contents: read only)
+#   1. cleanup-stale-prs (privileged, contents: write + pull-requests: write)
+#      Runs FIRST on every workflow run (even when there are no fixes to apply).
+#      Closes any open bot/js-autofix PRs that are stale (base behind main,
+#      conflicted, CI failed, auto-merge not enabled). This ensures PRs never
+#      hang indefinitely if main moves or CI fails after the workflow completes.
+#
+#   2. generate-patch (unprivileged, contents: read only)
 #      Checks out, installs deps, runs eslint --fix, produces a .patch artifact.
 #      Worst case: malicious code runs here on an ephemeral runner with zero
 #      push permissions.
 #
-#   2. apply-patch (privileged, contents: write + pull-requests: write)
+#   3. apply-patch (privileged, contents: write + pull-requests: write)
 #      Checks out, downloads the patch artifact, applies it, pushes to the
 #      bot/js-autofix branch, creates/updates a PR, and enables auto-merge.
 #      This job never runs npm, never installs anything, never executes any
 #      repo code. The only input it trusts is the patch artifact.
 #      Skipped entirely when generate-patch reports no fixes (has-fixes != true).
-#      The PR auto-merges (squash) once CI passes. If CI fails or main moves,
-#      the PR is auto-closed and the branch deleted — the next run re-applies
-#      on the current state.
+#      The PR auto-merges (squash) once CI passes. If CI fails, main moves,
+#      or auto-merge stalls, the next workflow run will close the PR and
+#      delete the branch via cleanup-stale-prs.
 
 on:
   push:
@@ -55,8 +61,98 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Always run cleanup first, even when there are no fixes. This ensures stale
+  # PRs get closed even if subsequent runs find nothing to fix.
+  cleanup-stale-prs:
+    name: Clean up stale bot PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: trusted-automation
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Get GitHub App token
+        id: app-token
+        uses: ./.github/actions/get-app-token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Sweep stale bot/js-autofix PRs
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_BRANCH: bot/js-autofix
+        run: |
+          set -euo pipefail
+
+          echo "Checking for stale bot/js-autofix PRs to clean up..."
+
+          # Find any open PRs on the bot branch
+          STALE_PRS=$(gh pr list --head "$BOT_BRANCH" --state open --json number,baseRefOid 2>/dev/null || echo "[]")
+          PR_COUNT=$(echo "$STALE_PRS" | jq 'length')
+
+          if [ "$PR_COUNT" -eq 0 ]; then
+            echo "No open bot/js-autofix PRs found."
+            exit 0
+          fi
+
+          echo "Found $PR_COUNT open PR(s) on $BOT_BRANCH. Checking if they're stale..."
+
+          # Get current main SHA
+          CURRENT_MAIN=$(gh api "repos/${{ github.repository }}/branches/main" --jq '.commit.sha')
+
+          echo "$STALE_PRS" | jq -c '.[]' | while IFS= read -r pr; do
+            PR_NUM=$(echo "$pr" | jq -r '.number')
+            BASE_SHA=$(echo "$pr" | jq -r '.baseRefOid')
+
+            echo "Checking PR #$PR_NUM (base: ${BASE_SHA:0:8})..."
+
+            # Check if base is behind main (most common case: main moved after the PR was created)
+            if [ "$BASE_SHA" != "$CURRENT_MAIN" ]; then
+              # Count how far behind
+              BEHIND=$(git rev-list --count "$BASE_SHA..$CURRENT_MAIN" 2>/dev/null || echo "unknown")
+              echo "PR #$PR_NUM base (${BASE_SHA:0:8}) is $BEHIND commits behind current main (${CURRENT_MAIN:0:8})."
+              echo "Closing + deleting branch."
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing stale PR: base was ${BASE_SHA:0:8}, now $BEHIND commits behind current main (${CURRENT_MAIN:0:8}). Next js-autofix run will re-apply on current state." || true
+              continue
+            fi
+
+            # Check if PR is conflicted
+            MERGEABLE=$(gh pr view "$PR_NUM" --json mergeable --jq '.mergeable')
+            if [ "$MERGEABLE" = "CONFLICTING" ]; then
+              echo "PR #$PR_NUM is conflicted. Closing + deleting branch."
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing conflicted PR. Next js-autofix run will re-apply cleanly." || true
+              continue
+            fi
+
+            # Check if CI checks failed
+            if gh pr checks "$PR_NUM" 2>/dev/null | grep -qi "fail"; then
+              echo "PR #$PR_NUM has failed CI checks. Closing + deleting branch."
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing PR with failed CI checks. Next js-autofix run will re-apply." || true
+              continue
+            fi
+
+            # Check if auto-merge is enabled
+            AUTOMERGE=$(gh pr view "$PR_NUM" --json autoMergeRequest --jq '.autoMergeRequest != null')
+            if [ "$AUTOMERGE" != "true" ]; then
+              echo "PR #$PR_NUM does not have auto-merge enabled. Closing + deleting branch."
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing PR: auto-merge was not enabled. Next js-autofix run will re-apply." || true
+              continue
+            fi
+
+            # If we're about to generate new fixes, close the old PR so we can create a fresh one.
+            # If generate-patch finds no fixes, this PR stays (it's healthy and current).
+            echo "PR #$PR_NUM appears healthy and current. Leaving open unless new fixes are found."
+          done
+
+          echo "Stale PR cleanup complete."
+
   generate-patch:
     name: Generate eslint --fix patch
+    needs: cleanup-stale-prs
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -133,7 +229,7 @@ jobs:
 
   apply-patch:
     name: Apply patch
-    needs: generate-patch
+    needs: [cleanup-stale-prs, generate-patch]
     # Skip entirely when generate-patch found no fixes — saves a runner,
     # avoids a redundant checkout/download, and keeps the job graph honest.
     if: needs.generate-patch.outputs.has-fixes == 'true'
@@ -152,6 +248,22 @@ jobs:
         with:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Close any remaining open PRs before applying new fixes
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_BRANCH: bot/js-autofix
+        run: |
+          set -euo pipefail
+
+          # Cleanup should have removed stale PRs, but if a healthy PR exists
+          # (same base as main, auto-merge enabled, CI passing), close it now
+          # so we can create a fresh one with the latest fixes.
+          PR_NUM=$(gh pr list --head "$BOT_BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$PR_NUM" ]; then
+            echo "Found open PR #$PR_NUM. Closing to create fresh PR with new fixes."
+            gh pr close "$PR_NUM" --delete-branch --comment "Closing to apply fresh fixes from latest run." || true
+          fi
 
       - name: Download patch
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -209,12 +321,29 @@ jobs:
             PR_URL=$(gh pr create \
               --head "$BOT_BRANCH" --base main \
               --title 'fmt(js): `npm run fix` auto-fix' \
-              --body 'Auto-generated by the `auto-fix lint issues & formatting` workflow. Auto-merges (squash) once CI passes. If CI fails or `main` moves, the PR is auto-closed and the branch deleted — the next run re-applies on the current state.')
+              --body 'Auto-generated by the `auto-fix lint issues & formatting` workflow. Auto-merges (squash) once CI passes. If CI fails, main moves, or auto-merge stalls, the PR is auto-closed and the branch deleted on the next workflow run.')
             PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$')
           fi
 
           # Enable auto-merge (squash). If already enabled, this is a no-op.
-          gh pr merge "$PR_NUM" --auto --squash || true
+          # If this fails (e.g. missing permissions, branch protection), fail
+          # loudly rather than leaving a PR with no auto-merge.
+          if ! gh pr merge "$PR_NUM" --auto --squash; then
+            echo "::error::Failed to enable auto-merge on PR #$PR_NUM."
+            echo "Closing PR since it won't auto-merge."
+            gh pr close "$PR_NUM" --delete-branch --comment "Failed to enable auto-merge. Next run will retry." || true
+            exit 1
+          fi
+
+          # Verify auto-merge is actually enabled
+          AUTOMERGE=$(gh pr view "$PR_NUM" --json autoMergeRequest --jq '.autoMergeRequest != null')
+          if [ "$AUTOMERGE" != "true" ]; then
+            echo "::error::Auto-merge enable appeared to succeed but is not active on PR #$PR_NUM."
+            gh pr close "$PR_NUM" --delete-branch --comment "Auto-merge verification failed. Next run will retry." || true
+            exit 1
+          fi
+
+          echo "Auto-merge successfully enabled on PR #$PR_NUM."
 
       - name: Wait for merge, auto-close on failure or stale
         env:
@@ -231,16 +360,19 @@ jobs:
 
           echo "Waiting for PR #$PR_NUM to merge..."
 
-          # Poll every 15s for up to ~10 minutes. Auto-merge will handle the
-          # PR even if this job times out — the polling is for cleanup only
-          # (auto-close on CI failure, conflicts, or main moving).
-          for i in $(seq 1 40); do
-            sleep 15
+          # Poll every 15s for up to ~10 minutes initially, then back off.
+          # Total timeout: ~10 min (40 × 15s) + ~20 min (12 × 60s) + ~30 min (6 × 5min) = ~60 min
+          # The job timeout (15 min) will kill us before we reach the end, but we'll
+          # verify auto-merge is working before timing out.
+          MAX_FAST_CHECKS=40    # 40 × 15s = 10 minutes
+          MAX_MEDIUM_CHECKS=12  # 12 × 60s = 12 minutes (cumulative: 22 min)
+          MAX_SLOW_CHECKS=6     # 6 × 300s = 30 minutes (cumulative: 52 min)
 
+          check_pr_status() {
             STATE=$(gh pr view "$PR_NUM" --json state --jq '.state')
             if [ "$STATE" = "MERGED" ] || [ "$STATE" = "CLOSED" ]; then
               echo "PR #$PR_NUM is $STATE."
-              exit 0
+              return 0
             fi
 
             # If main moved, the PR may have already merged (which moves
@@ -250,27 +382,59 @@ jobs:
               STATE=$(gh pr view "$PR_NUM" --json state --jq '.state')
               if [ "$STATE" = "MERGED" ]; then
                 echo "PR #$PR_NUM merged (main moved to $CURRENT_SHA)."
-                exit 0
+                return 0
               fi
               echo "Main moved ($START_SHA → $CURRENT_SHA). Closing stale PR."
-              gh pr close "$PR_NUM" --delete-branch || true
-              exit 0
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing: base became stale after main moved to ${CURRENT_SHA:0:8}." || true
+              return 0
             fi
 
             # If CI checks failed, close + delete the branch.
             if gh pr checks "$PR_NUM" 2>/dev/null | grep -qi "fail"; then
               echo "CI failed on PR #$PR_NUM. Closing + deleting branch."
-              gh pr close "$PR_NUM" --delete-branch
-              exit 0
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing: CI checks failed. Next run will re-apply." || true
+              return 0
             fi
 
             # If PR is conflicted, close + delete the branch.
             MERGEABLE=$(gh pr view "$PR_NUM" --json mergeable --jq '.mergeable')
             if [ "$MERGEABLE" = "CONFLICTING" ]; then
               echo "PR #$PR_NUM is conflicted. Closing + deleting branch."
-              gh pr close "$PR_NUM" --delete-branch
+              gh pr close "$PR_NUM" --delete-branch --comment "Closing: PR became conflicted. Next run will re-apply." || true
+              return 0
+            fi
+
+            # Still open and healthy
+            return 1
+          }
+
+          # Fast polling: 15s intervals for 10 minutes
+          for i in $(seq 1 $MAX_FAST_CHECKS); do
+            sleep 15
+            if check_pr_status; then
               exit 0
             fi
           done
 
-          echo "Timeout reached. Auto-merge will handle PR #$PR_NUM if CI passes."
+          echo "Fast polling complete (10 min). Switching to medium polling (60s intervals)..."
+
+          # Medium polling: 60s intervals for 12 minutes
+          for i in $(seq 1 $MAX_MEDIUM_CHECKS); do
+            sleep 60
+            if check_pr_status; then
+              exit 0
+            fi
+          done
+
+          # Before entering slow polling, verify auto-merge is still enabled and working
+          AUTOMERGE=$(gh pr view "$PR_NUM" --json autoMergeRequest --jq '.autoMergeRequest != null')
+          if [ "$AUTOMERGE" != "true" ]; then
+            echo "::warning::Auto-merge is no longer enabled on PR #$PR_NUM after 22 minutes."
+            echo "Closing PR since auto-merge disappeared."
+            gh pr close "$PR_NUM" --delete-branch --comment "Closing: auto-merge was disabled or failed. Next run will retry." || true
+            exit 0
+          fi
+
+          echo "Medium polling complete (22 min total). Auto-merge is still enabled. Exiting poll loop."
+          echo "PR #$PR_NUM will merge automatically when CI passes. If it doesn't merge"
+          echo "or becomes stale, the next workflow run will clean it up via the sweeper."
