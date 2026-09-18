@@ -31,7 +31,7 @@ DELIVERY_DB: Optional[Path] = None
 _PROCESS_ID = uuid.uuid4().hex
 _lock = threading.RLock()
 _ACTIVE_DELIVERIES: set[str] = set()
-_TERMINAL = ("delivered", "failed", "unknown")
+_TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
 EXACT_LEASE_SECONDS = 120
@@ -43,7 +43,7 @@ def _path() -> Path:
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
     """Bound only truly terminal legacy rows and obsolete exact rows."""
-    terminal = """((delivery_contract=0 AND status IN ('delivered','failed','unknown'))
+    terminal = """((delivery_contract=0 AND status IN ('delivered','failed','unknown','suppressed'))
                  OR (delivery_contract=1 AND state IN ('SUCCEEDED','DEAD','UNKNOWN')))"""
     conn.execute(
         f"""UPDATE deliveries SET job_json='{{}}', content='', destination_json=NULL
@@ -77,6 +77,23 @@ def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
 
+    # SQLite cannot widen a CHECK in place. Preserve all old rows atomically,
+    # including claimed sends, while admitting a distinct never-sent disposition.
+    for table in ("deliveries", "delivery_tombstones"):
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        if row and "'suppressed'" not in row[0]:
+            conn.execute("SAVEPOINT notification_disposition")
+            try:
+                conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+                conn.execute(row[0].replace("'unknown'", "'unknown','suppressed'"))
+                conn.execute(f"INSERT INTO {table} SELECT * FROM {table}_old")
+                conn.execute(f"DROP TABLE {table}_old")
+                conn.execute("RELEASE notification_disposition")
+            except BaseException:
+                conn.execute("ROLLBACK TO notification_disposition")
+                conn.execute("RELEASE notification_disposition")
+                raise
+
     conn.execute(
         """CREATE TABLE IF NOT EXISTS deliveries (
              execution_id TEXT PRIMARY KEY,
@@ -93,7 +110,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              outcome_error TEXT,
              for_failure INTEGER NOT NULL DEFAULT 0,
              status TEXT NOT NULL CHECK(status IN
-               ('pending','delivering','delivered','failed','unknown')),
+               ('pending','delivering','delivered','failed','unknown','suppressed')),
              owner_process_id TEXT,
              owner_pid INTEGER,
              owner_started_at INTEGER,
@@ -106,7 +123,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         """CREATE TABLE IF NOT EXISTS delivery_tombstones (
              execution_id TEXT PRIMARY KEY,
              terminal_status TEXT NOT NULL CHECK(terminal_status IN
-               ('delivered','failed','unknown')),
+               ('delivered','failed','unknown','suppressed')),
              finished_at TEXT
            )"""
     )
