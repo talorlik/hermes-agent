@@ -120,6 +120,7 @@ describe('routing', () => {
     const { rounds } = await loadRoom()
 
     const local: GroupMember = { name: 'reviewer' }
+
     const remote: GroupMember = {
       connectionId: 'mini',
       handle: 'reviewer-mini',
@@ -127,6 +128,7 @@ describe('routing', () => {
       remoteSource: true,
       sourceScoped: true
     }
+
     const members = [local, remote]
 
     for (const member of members) {
@@ -278,9 +280,11 @@ describe('round lifecycle', () => {
 
   it('does not retry an ambiguous submit from prequeued same-thread or cross-thread sends', async () => {
     let reject!: (error: Error) => void
+
     const held = new Promise<string>((_resolve, fail) => {
       reject = fail
     })
+
     const room = await loadRoom({ turn: ({ n }) => (n === 1 ? held : '(pass)') })
     const members = [MEMBERS[0]]
     const thread = room.rounds.sendToGroupChat('Failure', members, 'first')!
@@ -301,9 +305,11 @@ describe('round lifecycle', () => {
 
   it('attributes a queued drive failure to the thread whose harvest failed', async () => {
     let finish!: (reply: string) => void
+
     const held = new Promise<string>(resolve => {
       finish = resolve
     })
+
     const room = await loadRoom({ turn: () => held })
     const first = room.rounds.sendToGroupChat('Failure', MEMBERS.slice(0, 2), '@research first')!
     await drain(() => room.gateway.calls.length < 1)
@@ -396,9 +402,11 @@ describe('round lifecycle', () => {
 describe('per-member delta', () => {
   it('retained-log trimming cannot acknowledge messages appended during inference', async () => {
     let release!: (reply: string) => void
+
     const held = new Promise<string>(resolve => {
       release = resolve
     })
+
     const room = await loadRoom({ turn: ({ n }) => (n === 1 ? held : '(pass)') })
     const members = [MEMBERS[0]]
     const thread = room.rounds.sendToGroupChat('Trim', members, 'delivered')!
