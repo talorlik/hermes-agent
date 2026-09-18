@@ -392,12 +392,15 @@ describe('SkillsView toolset management', { timeout: 60_000 }, () => {
     )
     let finishFirst!: () => void
     let finishSecond!: () => void
+
     const firstInstall = new Promise<void>(resolve => {
       finishFirst = resolve
     })
+
     const secondInstall = new Promise<void>(resolve => {
       finishSecond = resolve
     })
+
     vi.mocked(installHubSkill).mockReturnValueOnce(firstInstall).mockReturnValueOnce(secondInstall)
 
     const scopedView = (connectionId: string, profile: string) => (

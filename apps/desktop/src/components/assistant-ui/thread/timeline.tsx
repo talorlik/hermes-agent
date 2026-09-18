@@ -86,6 +86,7 @@ const ActiveThreadTimeline: FC = () => {
 
   const railEntries = useMemo(() => {
     const indexed = indexedEntries ?? []
+
     const selected = history.isHistorical
       ? deriveTimelineEntries(
           (history.currentMessages ?? []).map(message => ({
@@ -96,9 +97,11 @@ const ActiveThreadTimeline: FC = () => {
           }))
         )
       : []
+
     const loaded = new Map(
       [...entries, ...selected].filter(entry => entry.rowId !== undefined).map(entry => [entry.rowId, entry])
     )
+
     const seen = new Set(indexed.map(entry => entry.rowId))
 
     const merged = [
@@ -173,12 +176,14 @@ const ActiveThreadTimeline: FC = () => {
 
           const timeout = window.setTimeout(() => finish(false), 15000)
           controller.signal.addEventListener('abort', () => finish(false), { once: true })
+
           const detail: TimelineRevealRequest = {
             id,
             rowId: railEntries.find(entry => entry.id === id)?.rowId,
             signal: controller.signal,
             complete: finish
           }
+
           viewport.dispatchEvent(new CustomEvent(TIMELINE_REVEAL_EVENT, { detail }))
         })
 

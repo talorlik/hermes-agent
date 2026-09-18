@@ -93,11 +93,13 @@ export function useHistoryWindow({ scopeKey, storedId, scope, isCurrent }: Histo
       if (signal.aborted || !Number.isSafeInteger(rowId) || rowId <= 0) {
         return null
       }
+
       const captured = latest.current
 
       if (!captured.storedId || !captured.isCurrent()) {
         return null
       }
+
       const controller = new AbortController()
       pending.current = controller
       const abort = () => controller.abort()
@@ -129,6 +131,7 @@ export function useHistoryWindow({ scopeKey, storedId, scope, isCurrent }: Histo
         if (!target) {
           return null
         }
+
         setSelection({ lifetime: captured.lifetime, page: next })
 
         return target.id
