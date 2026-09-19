@@ -41,8 +41,10 @@ function mount(storedId = 'stored') {
   const $messages = atom(Array.from({ length: 120 }, (_, index) => message(10_000 + index)))
 
   const view = {
-    ...PRIMARY_SESSION_VIEW, $messages,
-    $runtimeId: atom<string | null>('runtime'), $storedId: atom<string | null>(storedId)
+    ...PRIMARY_SESSION_VIEW,
+    $messages,
+    $runtimeId: atom<string | null>('runtime'),
+    $storedId: atom<string | null>(storedId)
   }
 
   let window!: Required<TranscriptWindowValue>
@@ -247,13 +249,17 @@ describe('paging earlier from an open history window', () => {
     const mounted = mount()
     const live = mounted.view.$messages.get()
 
-    await act(async () => { await mounted.window.revealRow(4000, new AbortController().signal) })
+    await act(async () => {
+      await mounted.window.revealRow(4000, new AbortController().signal)
+    })
     // The row was reached from the rail, but everything before it is still
     // back there: the transcript's own entry point must not retire.
     expect(mounted.window.olderAvailable).toBe(true)
 
     let grew = false
-    await act(async () => { grew = (await mounted.window.expandWindow()) === true })
+    await act(async () => {
+      grew = (await mounted.window.expandWindow()) === true
+    })
     expect(grew).toBe(true)
 
     const rows = mounted.window.currentMessages?.map(message => message.rowId) ?? []
@@ -281,10 +287,14 @@ describe('paging earlier from an open history window', () => {
       .mockResolvedValueOnce(page(3700))
     const mounted = mount('stored-gap')
 
-    await act(async () => { await mounted.window.revealRow(4000, new AbortController().signal) })
+    await act(async () => {
+      await mounted.window.revealRow(4000, new AbortController().signal)
+    })
     const beforePrepend = vi.fn()
     let grew = false
-    await act(async () => { grew = (await mounted.window.expandWindow(beforePrepend)) === true })
+    await act(async () => {
+      grew = (await mounted.window.expandWindow(beforePrepend)) === true
+    })
 
     expect(grew).toBe(true)
     const rows = mounted.window.currentMessages?.map(message => message.rowId) ?? []
@@ -302,11 +312,15 @@ describe('paging earlier from an open history window', () => {
 
     const mounted = mount('stored-unlisted')
 
-    await act(async () => { await mounted.window.revealRow(4000, new AbortController().signal) })
+    await act(async () => {
+      await mounted.window.revealRow(4000, new AbortController().signal)
+    })
     expect(mounted.window.olderAvailable).toBe(true)
 
     let grew = true
-    await act(async () => { grew = (await mounted.window.expandWindow()) === true })
+    await act(async () => {
+      grew = (await mounted.window.expandWindow()) === true
+    })
     expect(grew).toBe(false)
     // No page can ever arrive: stop offering one instead of failing forever.
     expect(mounted.window.olderAvailable).toBe(false)

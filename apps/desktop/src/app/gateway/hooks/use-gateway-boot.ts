@@ -510,7 +510,14 @@ export function useGatewayBoot({
     }
 
     function scheduleReconnect(manual?: { profile: string; activationEpoch: number }) {
-      if (cancelled || primaryReauthError || reconnecting || reconnectTimer !== null || gatewayOpen() || $gatewaySwitching.get()) {
+      if (
+        cancelled ||
+        primaryReauthError ||
+        reconnecting ||
+        reconnectTimer !== null ||
+        gatewayOpen() ||
+        $gatewaySwitching.get()
+      ) {
         return
       }
 
