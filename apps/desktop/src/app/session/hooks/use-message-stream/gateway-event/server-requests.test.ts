@@ -112,7 +112,7 @@ describe('preview action request routing', () => {
     }
   })
 
-  it('answers pane reads for a session hosted in one of this window\'s tiles', async () => {
+  it("answers pane reads for a session hosted in one of this window's tiles", async () => {
     // The tile session is not the active one, but this window hosts it: its
     // panes are here, so an 'ignore' would stall the tool until its deadline.
     $sessionTiles.set([{ runtimeId: 'session-a', storedSessionId: 'stored-a' } as never])

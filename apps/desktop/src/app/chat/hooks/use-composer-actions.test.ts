@@ -418,22 +418,33 @@ describe('useComposerActions generated paste title metadata', () => {
     const savePastedText = vi.fn(async () => '/tmp/composer-pastes/pasted-content.txt')
     const add = vi.fn<(attachment: ComposerAttachment) => void>()
     Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: { savePastedText } })
-    const { result } = renderHook(() => useComposerActions({
-      activeSessionId: null,
-      currentCwd: '/test',
-      requestGateway: vi.fn(),
-      scope: { add, remove: vi.fn(() => null), target: 'main', update: vi.fn(() => true), updateIfCurrent: vi.fn(() => true) }
-    }))
+
+    const { result } = renderHook(() =>
+      useComposerActions({
+        activeSessionId: null,
+        currentCwd: '/test',
+        requestGateway: vi.fn(),
+        scope: {
+          add,
+          remove: vi.fn(() => null),
+          target: 'main',
+          update: vi.fn(() => true),
+          updateIfCurrent: vi.fn(() => true)
+        }
+      })
+    )
 
     const pasted = `Database migration incident\n${'x'.repeat(1_500)}`
     await expect(result.current.attachPastedText(pasted)).resolves.toBe(true)
 
-    expect(add).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'file',
-      path: '/tmp/composer-pastes/pasted-content.txt',
-      refText: '@file:/tmp/composer-pastes/pasted-content.txt',
-      titlePreview: pasted.slice(0, 1_000)
-    }))
+    expect(add).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'file',
+        path: '/tmp/composer-pastes/pasted-content.txt',
+        refText: '@file:/tmp/composer-pastes/pasted-content.txt',
+        titlePreview: pasted.slice(0, 1_000)
+      })
+    )
   })
 })
 

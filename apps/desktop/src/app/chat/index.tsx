@@ -323,7 +323,9 @@ export function ChatRuntimeBoundary({
     async (beforePrepend?: () => void) => {
       // A historical page is not the live tail: its older neighbours come from
       // the prompt range the rail already draws, never from store backfill.
-      if (history.page) {return history.revealOlder(beforePrepend)}
+      if (history.page) {
+        return history.revealOlder(beforePrepend)
+      }
 
       // Network latency is not scroll intent. Capture at arrival, immediately
       // before the store prepend, and only grow a window that has a page to show.
