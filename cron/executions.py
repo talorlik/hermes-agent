@@ -373,7 +373,8 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?, outcome=?,
+                   handoff_started_at=NULL, delivery_outcome=?,
+                   delivery_status=COALESCE(?, delivery_status), outcome=?,
                    occurrence_key=COALESCE(?, occurrence_key)
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
@@ -381,6 +382,7 @@ def finish_execution(
                 status,
                 now,
                 detail,
+                delivery_outcome,
                 delivery_outcome,
                 outcome or status,
                 occurrence_key,

@@ -5,7 +5,9 @@ by ``(job_id, error signature)`` so the same job failing with the same error doe
 operator every run once acknowledged. Lifecycle: ``detected`` → ``alerted`` → ``closed``. The same
 job + same normalized error resolves to the SAME incident id, so a closed incident stays closed
 until the error text changes and mints a new one. ``alerted`` means a failure ping actually reached
-the operator. Incidents share ``cron/executions.db`` with ``cron.executions`` (one ledger file).
+the operator (``alerted_at`` = when the latest one did; the scheduler withholds repeats until
+``cron.failure_repeat_alert_hours`` have passed). Incidents share ``cron/executions.db`` with
+``cron.executions`` (one ledger file).
 """
 
 from __future__ import annotations
@@ -74,6 +76,8 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_cli.sqlite_util import add_column_if_missing
+
     conn.execute(
         """CREATE TABLE IF NOT EXISTS cron_incidents (
              id            TEXT PRIMARY KEY,
@@ -84,17 +88,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              first_seen_at TEXT NOT NULL,
              last_seen_at  TEXT NOT NULL,
              acked_at      TEXT,
+             alerted_at    TEXT,
              closed_at     TEXT,
+             recovered_at  TEXT,
              error         TEXT NOT NULL,
              output_file   TEXT
            )"""
     )
+    # Ledgers created before the alert-once gate lack ``alerted_at``; add it in place.
+    add_column_if_missing(conn, "cron_incidents", "alerted_at", "alerted_at TEXT")
     # Additive lifecycle column (durable-outcomes upgrade): when the
     # underlying failure healed on its own. Nullable so pre-upgrade rows
     # and writers keep working unchanged.
-    existing = {r[1] for r in conn.execute("PRAGMA table_info(cron_incidents)")}
-    if "recovered_at" not in existing:
-        conn.execute("ALTER TABLE cron_incidents ADD COLUMN recovered_at TEXT")
+    add_column_if_missing(conn, "cron_incidents", "recovered_at", "recovered_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_cron_incidents_job "
         "ON cron_incidents(job_id)"
@@ -191,12 +197,14 @@ def upsert_incident_in(
         # A repeat of an auto-healed signature re-opens the SAME incident
         # (idempotent dedup — never a duplicate row); only a `resolved`
         # re-open alerts the operator again. A closed (acknowledged)
-        # incident stays closed forever.
+        # incident stays closed forever. Upstream's alerted_at reset rides
+        # on the resolved re-open so the alert-once gate can fire again.
         reopen = row["state"] == "resolved"
         conn.execute(
             """UPDATE cron_incidents
                SET last_seen_at=?, error=?, output_file=?,
                    state=CASE WHEN state IN ('resolved', 'recovered') THEN 'detected' ELSE state END,
+                   alerted_at=CASE WHEN state='resolved' THEN NULL ELSE alerted_at END,
                    closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END,
                    recovered_at=CASE WHEN state='recovered' THEN NULL ELSE recovered_at END
                WHERE id=?""",
@@ -245,7 +253,8 @@ def upsert_incident(
 def set_incident_state(incident_id: str, state: str) -> bool:
     """Transition an incident's lifecycle state; return whether it changed. ``closed`` is terminal
     for that signature (re-open happens by a changed error minting a NEW incident). Unknown states
-    are rejected (no-op, ``False``)."""
+    are rejected (no-op, ``False``). ``alerted`` also stamps ``alerted_at`` — every time, so the
+    cooldown reminder (see ``cron.scheduler._upsert_incident_for_failure``) restarts its window."""
     if state not in INCIDENT_STATES:
         return False
     now = _hermes_now().isoformat()
@@ -253,7 +262,15 @@ def set_incident_state(incident_id: str, state: str) -> bool:
         row = conn.execute(
             "SELECT state FROM cron_incidents WHERE id=?", (incident_id,)
         ).fetchone()
-        if row is None or row["state"] in (state, "closed"):
+        if row is None or row["state"] == "closed":
+            return False
+        if state == "alerted":
+            conn.execute(
+                "UPDATE cron_incidents SET state='alerted', alerted_at=? WHERE id=?",
+                (now, incident_id),
+            )
+            return True
+        if row["state"] == state:
             return False
         if state == "closed":
             conn.execute(

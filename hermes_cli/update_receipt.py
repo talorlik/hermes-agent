@@ -373,6 +373,10 @@ def finalize_update_receipt(
             receipt.data["stop_reason"] = stop_reason
         if fleet is not None:
             receipt.data["fleet"] = fleet
+        from hermes_cli.update_serve_obligations import retain_receipt_manual_serves
+        pending = retain_receipt_manual_serves(read_latest_receipt() or {})
+        if pending:
+            receipt.data["pending_manual_serves"] = pending
         directory = _receipt_dir()
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"update_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.json"
@@ -483,22 +487,24 @@ def _socket_identity(home: Path) -> Optional[tuple[int, dict]]:
 
 
 def _fleet_row(
-    profile: str,
-    pid: int,
-    code_sha: Any,
-    code_version: Any,
-    expected_sha: Any,
-    state: str = "unknown",
+    profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any,
+    state: str = "unknown", served_profiles: Any = None,
 ) -> dict[str, Any]:
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
-    return {
-        "profile": profile,
-        "pid": pid,
-        "code_sha": str(code_sha) if code_sha else None,
-        "code_version": code_version,
-        "state": state,
+    row = {
+        "profile": profile, "pid": pid, "code_sha": str(code_sha) if code_sha else None,
+        "code_version": code_version, "state": state,
     }
+    # A live, identity-verified multiplexer represents every profile in this
+    # list. Keep the field only when its shape is usable: callers use it to
+    # discharge per-profile restart obligations, so corrupt status must not
+    # widen coverage.
+    if isinstance(served_profiles, list) and served_profiles and all(
+        isinstance(name, str) and name for name in served_profiles
+    ):
+        row["served_profiles"] = list(dict.fromkeys(served_profiles))
+    return row
 
 
 # Runtime-status states that do not describe a gateway that should be running now — no down row.
@@ -540,11 +546,8 @@ def collect_fleet_versions(
             if sock is not None:
                 pid, identity = sock
                 row = _fleet_row(
-                    profile,
-                    pid,
-                    identity.get("code_sha"),
-                    identity.get("code_version"),
-                    expected_sha,
+                    profile, pid, identity.get("code_sha"), identity.get("code_version"), expected_sha,
+                    served_profiles=identity.get("served_profiles"),
                 )
                 results.append({**row, "source": "socket"})
                 continue
@@ -561,11 +564,8 @@ def collect_fleet_versions(
             if live_gateway_pid_for_home(home) == pid:
                 results.append(
                     _fleet_row(
-                        profile,
-                        pid,
-                        record.get("code_sha"),
-                        record.get("code_version"),
-                        expected_sha,
+                        profile, pid, record.get("code_sha"), record.get("code_version"), expected_sha,
+                        served_profiles=record.get("served_profiles"),
                     )
                 )
                 continue

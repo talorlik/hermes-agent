@@ -12,7 +12,7 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
     source = tmp_path / "custom-home"
     monkeypatch.setenv("HERMES_HOME", str(source))
     subprocess_run = Mock(side_effect=AssertionError("live owner must not spawn CLI"))
-    monkeypatch.setattr(delivery.subprocess, "run", subprocess_run)
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", subprocess_run)
     from hermes_cli.profiles import get_profile_dir
 
     for profile, home in [("", source), ("research", get_profile_dir("research"))]:
@@ -91,9 +91,7 @@ def test_result_records_pending_until_terminal_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: owner)
     monkeypatch.setattr(delivery._sched, "load_config", lambda: {})
     monkeypatch.setattr(config, "load_gateway_config", lambda: None)
-    monkeypatch.setattr(
-        delivery.subprocess, "run", Mock(side_effect=AssertionError("CLI"))
-    )
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", Mock(side_effect=AssertionError("CLI")))
     updates = []
     monkeypatch.setattr(
         "cron.outbox.get_job_delivery_projection",
