@@ -220,6 +220,20 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream applies equivalent fixture/mutex isolation.
 - Disposition: active
 
+## G-DESKTOP-SESSION-HISTORY: keep earlier prompts and profile-default new sessions
+- Commits: none
+- Owned-Files:
+  - apps/desktop/src/app/chat/history-window.test.tsx
+  - apps/desktop/src/app/chat/index.tsx
+  - apps/desktop/src/app/session/hooks/default-new-session.test.tsx
+  - apps/desktop/src/app/session/new-session-route.ts
+  - apps/desktop/src/plugins/hermes-bots/group-round-members.ts
+- Intent: Own the fork-only desktop extras that blocked `cc_resolve_upstream_conflict` prepare as `unknown_fork_change` (INC-HU / 5721ceec). Keep earlier prompts reachable in open history windows, offer Start new session on the stranded-resume dead end, and apply profile defaults to new chats. `group-round-members.ts` is retained as a historical conflict-ownership record; it currently matches upstream.
+- Protected-Invariant: Upstream merges must not drop the history-window keep-earlier-prompts behavior or the profile-default new-session route without an explicit ledger retirement.
+- Tests: apps/desktop/src/app/chat/history-window.test.tsx, apps/desktop/src/app/session/hooks/default-new-session.test.tsx
+- Retirement-Condition: Upstream carries equivalent history-window and profile-default new-session behavior.
+- Disposition: active
+
 ## G-ELECTRON-PATCH: Electron patched-release bump
 - Commits: 63a29f4ca9f11bbc25e8cac0bfcf732939a2bcb4
 - Owned-Files:
@@ -281,7 +295,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 25
+- Ledger-Revision: 26
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
