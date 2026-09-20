@@ -234,6 +234,38 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream carries equivalent history-window and profile-default new-session behavior.
 - Disposition: active
 
+## G-DESKTOP-SKILLS-CATALOG: desktop skills catalog, deeplink install, and host confirm
+- Commits: none
+- Owned-Files:
+  - apps/desktop/src/app/capabilities/index.test.tsx
+  - apps/desktop/src/app/chat/route-tile.tsx
+  - apps/desktop/src/app/contrib/hooks/use-desktop-integrations.test.tsx
+  - apps/desktop/src/app/master-detail.tsx
+  - apps/desktop/src/app/skills/capability-tabs.tsx
+  - apps/desktop/src/app/skills/catalog-browser.test.tsx
+  - apps/desktop/src/app/skills/catalog-browser.tsx
+  - apps/desktop/src/app/skills/catalog-data.test.ts
+  - apps/desktop/src/app/skills/catalog-data.ts
+  - apps/desktop/src/app/skills/index.tsx
+  - apps/desktop/src/app/skills/plugins-tab.test.tsx
+  - apps/desktop/src/app/skills/plugins-tab.tsx
+  - apps/desktop/src/app/skills/skill-catalog.tsx
+  - apps/desktop/src/app/skills/update-skills-button.tsx
+  - apps/desktop/src/components/confirm-host.test.tsx
+  - apps/desktop/src/components/ui/segmented-control.tsx
+  - apps/desktop/src/i18n/ja.ts
+  - apps/desktop/src/lib/catalog-install.test.ts
+  - apps/desktop/src/lib/deeplink-routes.test.ts
+  - apps/desktop/src/lib/deeplink-routes.ts
+  - apps/desktop/src/lib/error-surface.test.ts
+  - apps/desktop/src/store/skill-deeplink-install.test.ts
+  - apps/desktop/src/store/skill-deeplink-install.ts
+- Intent: Own the fork-only desktop extras that blocked the 2026-09-21 live `cc_resolve_upstream_conflict` prepare (`inc-hu-verify-20260921`) as `unknown_fork_change` after G-DESKTOP-SESSION-HISTORY took the Sep 19 conflict set. Keep the skills catalog browser, capability tabs, deeplink install, host-confirm, and Japanese catalog copy during upstream merges.
+- Protected-Invariant: Upstream merges must not drop the desktop skills catalog, deeplink install, or host-confirm surfaces without an explicit ledger retirement.
+- Tests: apps/desktop/src/app/skills/catalog-browser.test.tsx, apps/desktop/src/lib/deeplink-routes.test.ts, apps/desktop/src/store/skill-deeplink-install.test.ts, apps/desktop/src/components/confirm-host.test.tsx
+- Retirement-Condition: Upstream carries equivalent catalog, deeplink-install, and host-confirm behavior.
+- Disposition: active
+
 ## G-ELECTRON-PATCH: Electron patched-release bump
 - Commits: 63a29f4ca9f11bbc25e8cac0bfcf732939a2bcb4
 - Owned-Files:
@@ -295,7 +327,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 26
+- Ledger-Revision: 27
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
