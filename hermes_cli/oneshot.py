@@ -162,9 +162,72 @@ def _configured_mcp_servers() -> tuple[set[str], set[str]]:
         return set(), set()
 
 
-def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
+# Reserved oneshot-only sentinel: ``--toolsets none`` means an explicit empty
+# native/MCP tool set. It is not a real toolset name and only the exact
+# lowercase spelling is accepted alone.
+_TOOLSETS_NONE_SENTINEL = "none"
+
+# Process-scoped guard used by later startup slices to prevent import-time tool
+# discovery after the sentinel has been validated.
+_EXPLICIT_NO_TOOLS_ENV = "HERMES_ONESHOT_EXPLICIT_NO_TOOLS"
+
+
+def _raw_toolset_tokens(toolsets: object = None) -> list[str]:
+    """Split explicit toolsets while preserving blank comma segments."""
+    if not toolsets:
+        return []
+    raw_items = [toolsets] if isinstance(toolsets, str) else toolsets
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = [raw_items]
+
+    tokens: list[str] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            tokens.extend(part.strip() for part in item.split(","))
+        else:
+            tokens.append(str(item).strip())
+    return tokens
+
+
+def _precheck_explicit_toolsets(
+    toolsets: object = None,
+) -> tuple[list[str] | None, str | None] | None:
+    """Resolve sentinel and structurally invalid lists without discovery."""
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
+        return None
+
+    raw = _raw_toolset_tokens(toolsets)
+    if any(token.lower() == _TOOLSETS_NONE_SENTINEL for token in raw):
+        if raw != [_TOOLSETS_NONE_SENTINEL]:
+            return None, (
+                "hermes -z: --toolsets 'none' selects an explicit empty tool "
+                "set and must be the only toolset entry, spelled exactly "
+                f"lowercase; got: {', '.join(raw)}. Pass 'none' alone, or "
+                "remove it.\n"
+            )
+        return [], None
+
+    if any(token in _ALL_TOOLSETS for token in normalized) and len(normalized) > 1:
+        return None, (
+            "hermes -z: --toolsets 'all' enables every toolset and must be "
+            f"the only toolset entry; got: {', '.join(normalized)}. Pass "
+            "'all' alone, or list specific toolsets.\n"
+        )
+    return None
+
+
+def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
+    """Validate explicit toolsets atomically without silently narrowing them."""
+    normalized = _normalize_toolsets(toolsets)
+    if normalized is None:
+        return None, None
+
+    early = _precheck_explicit_toolsets(toolsets)
+    if early is not None:
+        return early
+
+    if normalized[0] in _ALL_TOOLSETS:
         return None, None
 
     try:
@@ -172,45 +235,48 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     except Exception as exc:
         return None, f"hermes -z: failed to validate --toolsets: {exc}\n"
 
-    built_in = [name for name in normalized if validate_toolset(name)]
-    unresolved = [name for name in normalized if name not in built_in]
-
+    unresolved = [name for name in normalized if not validate_toolset(name)]
     if unresolved:
         try:
             from hermes_cli.plugins import discover_plugins
 
             discover_plugins()
-            plugin_valid = [name for name in unresolved if validate_toolset(name)]
+            unresolved = [name for name in unresolved if not validate_toolset(name)]
         except Exception:
-            plugin_valid = []
-        built_in.extend(plugin_valid)
-        unresolved = [name for name in unresolved if name not in plugin_valid]
+            pass
 
-    if any(name in _ALL_TOOLSETS for name in built_in):
-        ignored = [name for name in normalized if name not in _ALL_TOOLSETS]
-        if ignored:
-            sys.stderr.write(
-                "hermes -z: --toolsets all enables every toolset; "
-                f"ignoring additional entries: {', '.join(ignored)}\n"
-            )
-        return None, None
+    mcp_names: set[str] = set()
+    mcp_disabled: set[str] = set()
+    if unresolved:
+        try:
+            mcp_names, mcp_disabled = _configured_mcp_servers()
+        except Exception:
+            mcp_names = set()
+            mcp_disabled = set()
 
-    mcp_names, mcp_disabled = _configured_mcp_servers() if unresolved else (set(), set())
-    mcp_valid = [name for name in unresolved if name in mcp_names]
     disabled = [name for name in unresolved if name in mcp_disabled]
-    unknown = [name for name in unresolved if name not in mcp_names and name not in mcp_disabled]
-    valid = built_in + mcp_valid
-
-    if unknown:
-        sys.stderr.write(f"hermes -z: ignoring unknown --toolsets entries: {', '.join(unknown)}\n")
-    if disabled:
-        sys.stderr.write(
-            "hermes -z: ignoring disabled MCP servers (set enabled: true in config.yaml to use): "
-            f"{', '.join(disabled)}\n"
+    unknown = [
+        name
+        for name in unresolved
+        if name not in mcp_names and name not in mcp_disabled
+    ]
+    if unknown or disabled:
+        parts = []
+        if unknown:
+            parts.append(f"unknown entries: {', '.join(unknown)}")
+        if disabled:
+            parts.append(
+                "disabled MCP servers (set enabled: true in config.yaml to "
+                f"use): {', '.join(disabled)}"
+            )
+        return None, (
+            "hermes -z: --toolsets is all-or-nothing; "
+            + "; ".join(parts)
+            + ". No tools were enabled; fix or remove the listed entries.\n"
         )
-    if not valid:
-        return None, "hermes -z: --toolsets did not contain any valid toolsets.\n"
-    return valid, None
+
+    return list(normalized), None
+
 
 
 def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] = None) -> None:
@@ -543,19 +609,23 @@ def _run_agent(
             reasoning_config = parsed_reasoning
 
     # sorted() gives stable ordering for config-derived sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
+    # An explicit empty list (--toolsets none) must not pass through _normalize_toolsets:
+    # that helper treats [] as omitted and returns None, which AIAgent reads as default tools.
+    toolsets_list = [] if toolsets == [] else _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     # Oneshot builds AIAgent directly, bypassing cli.py's MCP background discovery and
     # _init_agent's wait, so the construction-time tool snapshot would miss late MCP servers.
     # Idempotent start + bounded wait with the single-query bound (there is no later turn).
-    # Ensure MCP tools are discovered before building the agent. This helper starts discovery if needed
-    # (idempotent) and bounded-waits with the larger single-query bound (default 15s) because there is only
-    # ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    # Skip MCP entirely for the explicit empty set: discovery would populate tools the
+    # sentinel forbids.
+    if toolsets_list != []:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(logger=logging.getLogger(__name__), single_query=True)
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__), single_query=True
+        )
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
