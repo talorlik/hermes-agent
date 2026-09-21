@@ -276,6 +276,20 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream carries equivalent sidebar profile-switcher behavior.
 - Disposition: active
 
+## G-DESKTOP-CONNECTORS: desktop connector and MCP setup extras
+- Commits: none
+- Owned-Files:
+  - apps/desktop/electron/main.ts
+  - apps/desktop/src/components/assistant-ui/connector-tool.tsx
+  - apps/desktop/src/components/assistant-ui/mcp-setup-tool.tsx
+  - apps/desktop/src/components/onboarding-chat/onboarding-recommendations-runbook.test.ts
+  - apps/desktop/src/store/connection-request.ts
+- Intent: Own the remaining unowned conflict paths that blocked the 2026-09-21 live `cc_resolve_upstream_conflict` prepare (`bee437ed-75c5-3676-ab04-019f937b3606`) as `unknown_fork_change` after G-DESKTOP-PROFILE-SWITCHER. Keep fork desktop connector/MCP setup extras, Electron main-process wiring, connection-request store, and the onboarding recommendations runbook test during upstream merges.
+- Protected-Invariant: Upstream merges must not drop those desktop connector/MCP setup extras without an explicit ledger retirement.
+- Tests: apps/desktop/src/components/onboarding-chat/onboarding-recommendations-runbook.test.ts
+- Retirement-Condition: Upstream carries equivalent connector/MCP setup behavior and the runbook test, or the extras are explicitly retired.
+- Disposition: active
+
 ## G-ELECTRON-PATCH: Electron patched-release bump
 - Commits: 63a29f4ca9f11bbc25e8cac0bfcf732939a2bcb4
 - Owned-Files:
@@ -337,7 +351,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 28
+- Ledger-Revision: 29
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
