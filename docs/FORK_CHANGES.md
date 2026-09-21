@@ -266,6 +266,16 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream carries equivalent catalog, deeplink-install, and host-confirm behavior.
 - Disposition: active
 
+## G-DESKTOP-PROFILE-SWITCHER: desktop sidebar profile switcher
+- Commits: none
+- Owned-Files:
+  - apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.tsx
+- Intent: Own the remaining unowned conflict path that blocked the 2026-09-21 live `cc_resolve_upstream_conflict` prepare (`inc-hu-verify-20260921-r27b`, `f4680448-0887-37e0-92f5-b40cc9d4aa24`) as `unknown_fork_change` after G-DESKTOP-SKILLS-CATALOG took the catalog/deeplink set. Keep the desktop sidebar profile switcher during upstream merges.
+- Protected-Invariant: Upstream merges must not drop the desktop sidebar profile switcher without an explicit ledger retirement.
+- Tests: apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.test.tsx
+- Retirement-Condition: Upstream carries equivalent sidebar profile-switcher behavior.
+- Disposition: active
+
 ## G-ELECTRON-PATCH: Electron patched-release bump
 - Commits: 63a29f4ca9f11bbc25e8cac0bfcf732939a2bcb4
 - Owned-Files:
@@ -327,7 +337,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 27
+- Ledger-Revision: 28
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
