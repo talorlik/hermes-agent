@@ -349,9 +349,51 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream carries equivalent test updates and removes the documentation marker.
 - Disposition: active
 
+## G-DESKTOP-UPDATE-20260921: desktop and TUI test/component extras
+- Commits: none
+- Owned-Files:
+  - apps/desktop/electron/command-screenshot-monitor.test.ts
+  - apps/desktop/electron/command-screenshot.test.ts
+  - apps/desktop/electron/command-screenshot.ts
+  - apps/desktop/electron/github-api-auth.test.ts
+  - apps/desktop/electron/pool-retirement-live-fixture/main.ts
+  - apps/desktop/electron/update-api-check.ts
+  - apps/desktop/src/api/config.ts
+  - apps/desktop/src/app/chat/history-window.ts
+  - apps/desktop/src/app/chat/hooks/use-composer-actions.test.ts
+  - apps/desktop/src/app/contrib/hooks/restore-late-plugin-route.test.tsx
+  - apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts
+  - apps/desktop/src/app/settings/toolset-config-panel.test.tsx
+  - apps/desktop/src/components/assistant-ui/thread/response-group.test.tsx
+  - apps/desktop/src/components/assistant-ui/thread/timeline-rail.test.tsx
+  - apps/desktop/src/components/assistant-ui/thread/timeline.tsx
+  - apps/desktop/src/components/assistant-ui/thread/use-timeline-reveal.ts
+  - apps/desktop/src/components/boot-failure-cause.test.ts
+  - apps/desktop/src/components/desktop-install-overlay.tsx
+  - apps/desktop/src/components/onboarding/free-tier-setup-notice.test.tsx
+  - apps/desktop/src/lib/onboarding-recommendations.ts
+  - apps/desktop/src/plugins/hermes-bots/bot-row.test.tsx
+  - apps/desktop/src/plugins/hermes-bots/create-dialog.tsx
+  - apps/desktop/src/plugins/hermes-bots/group-activity.test.ts
+  - apps/desktop/src/plugins/hermes-bots/group-chat-view-members.test.ts
+  - apps/desktop/src/plugins/hermes-bots/group-chat-view.tsx
+  - apps/desktop/src/plugins/hermes-bots/group-chat.test.ts
+  - apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts
+  - apps/desktop/src/plugins/hermes-bots/relay.test.ts
+  - apps/desktop/src/store/gateway-connection-lifecycle.test.ts
+  - apps/desktop/src/store/gateway.test.ts
+  - apps/desktop/src/store/hub-actions.blocked.test.ts
+  - apps/desktop/src/store/suggestion-providers/mcp.test.ts
+  - ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+- Intent: Own the fork-only desktop and TUI extras that blocked live `cc_resolve_upstream_conflict` prepare (`9570d49b-788b-3f5d-802a-d67bd9af9080`) as `unknown_fork_change` after pin fixes. Keep fork desktop components, tests, bot features, and TUI gateway event handlers during upstream merges.
+- Protected-Invariant: Upstream merges must not drop these desktop/TUI extras without an explicit ledger retirement.
+- Tests: apps/desktop/electron/command-screenshot-monitor.test.ts, apps/desktop/electron/command-screenshot.test.ts, apps/desktop/electron/github-api-auth.test.ts, apps/desktop/src/app/chat/hooks/use-composer-actions.test.ts, apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts, apps/desktop/src/app/settings/toolset-config-panel.test.tsx, apps/desktop/src/components/assistant-ui/thread/response-group.test.tsx, apps/desktop/src/components/assistant-ui/thread/timeline-rail.test.tsx, apps/desktop/src/components/boot-failure-cause.test.ts, apps/desktop/src/components/onboarding/free-tier-setup-notice.test.tsx, apps/desktop/src/plugins/hermes-bots/bot-row.test.tsx, apps/desktop/src/plugins/hermes-bots/group-activity.test.ts, apps/desktop/src/plugins/hermes-bots/group-chat-view-members.test.ts, apps/desktop/src/plugins/hermes-bots/group-chat.test.ts, apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts, apps/desktop/src/plugins/hermes-bots/relay.test.ts, apps/desktop/src/store/gateway-connection-lifecycle.test.ts, apps/desktop/src/store/gateway.test.ts, apps/desktop/src/store/hub-actions.blocked.test.ts, apps/desktop/src/store/suggestion-providers/mcp.test.ts, ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+- Retirement-Condition: Upstream carries equivalent desktop/TUI behavior, or the extras are explicitly retired.
+- Disposition: active
+
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 29
+- Ledger-Revision: 30
 - History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
 - Owned-Files:
   - docs/FORK_CHANGES.md
