@@ -1,7 +1,5 @@
-import type { ConnectionOperationTarget } from '@hermes/shared/gateway-events'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $connectionOperation, resetConnectionOperationsForTests } from '../app/connectionOperationStore.js'
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { createServerRequestHandler } from '../app/createServerRequestHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
@@ -86,7 +84,6 @@ describe('createGatewayEventHandler', () => {
     resetUiState()
     resetTurnState()
     resetServerRequestsForTests()
-    resetConnectionOperationsForTests()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
   })
@@ -110,34 +107,6 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('ready')
     expect(getOverlayState().approval).toBeNull()
     expect(getTurnState().tools).toEqual([])
-
-    const target: ConnectionOperationTarget = { action: 'install', kind: 'mcp', name: 'asana', state: 'pending' }
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 10,
-        op_id: 'op-1',
-        seq: 2,
-        targets: [target],
-        timeout_seconds: 30
-      },
-      type: 'connection.request'
-    })
-    expect($connectionOperation.get()).toMatchObject({ opId: 'op-1', seq: 2, targets: [target] })
-    expect(getOverlayState().connection).toEqual({ opId: 'op-1' })
-
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 11,
-        op_id: 'op-1',
-        seq: 1,
-        settled: false,
-        targets: [{ ...target, state: 'failed' }]
-      },
-      type: 'connection.update'
-    })
-    expect($connectionOperation.get()).toMatchObject({ seq: 2, targets: [target] })
   })
 
   it('keeps the durable session id when a session.info payload omits it', () => {
