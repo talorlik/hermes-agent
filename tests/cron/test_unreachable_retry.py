@@ -72,3 +72,21 @@ def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home
     assert mark_job_run(once["id"], False, "ConnectError: dns", model_unreachable=True)
     remaining = get_job(once["id"])
     assert remaining is None or remaining.get(ur.STATE_KEY) is None
+
+
+def test_retry_yields_to_nearer_natural_run(tmp_cron_home, monkeypatch):
+    """The durable store mutation leaves a nearer natural occurrence intact."""
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(ur, "_hermes_now", lambda: now)
+    natural_next = (now + timedelta(minutes=1)).isoformat()
+    job = {
+        "id": "near-natural",
+        "name": "near natural",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "state": "scheduled",
+        "next_run_at": natural_next,
+    }
+
+    assert ur.plan_retry(job) is False
+    assert job.get(ur.STATE_KEY) is None
+    assert job["next_run_at"] == natural_next
