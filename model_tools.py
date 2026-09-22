@@ -150,17 +150,19 @@ discover_builtin_tools()
 # MCP discovery is deliberately NOT run here: it blocks up to 120 s and the
 # gateway lazy-imports this module inside its event loop; each entry point
 # (gateway/run.py, cli.py, tui_gateway, acp_adapter) runs it at startup.
-try:  # plugin tool discovery (user/project/pip plugins)
-    # MCP tool discovery (external MCP servers from config) used to run here as a module-level side effect.
-    # It was removed because discover_mcp_tools() internally uses a blocking future.result(timeout=120)
-    # wait, and the gateway lazy-imports this module from inside the asyncio event loop on the first user
-    # message — freezing Discord/Telegram heartbeats for up to 120s whenever any configured MCP server was
-    # slow or unreachable (#16856). - gateway/run.py            -> start_gateway() uses run_in_executor -
-    # acp_adapter/server.py     -> asyncio.to_thread on session init
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+if os.environ.get("HERMES_ONESHOT_EXPLICIT_NO_TOOLS") != "1":
+    try:  # plugin tool discovery (user/project/pip plugins)
+        # MCP tool discovery (external MCP servers from config) used to run here as a module-level side effect.
+        # It was removed because discover_mcp_tools() internally uses a blocking future.result(timeout=120)
+        # wait, and the gateway lazy-imports this module from inside the asyncio event loop on the first user
+        # message — freezing Discord/Telegram heartbeats for up to 120s whenever any configured MCP server was
+        # slow or unreachable (#16856). - gateway/run.py            -> start_gateway() uses run_in_executor -
+        # acp_adapter/server.py     -> asyncio.to_thread on session init
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # Backward-compat constants (built once after discovery)
@@ -326,11 +328,6 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools.update(resolve_toolset(ts_name))
-    # A role-reserved toolset (``setup``) reaches only a profile carrying that role, whatever the config,
-    # CLI flag, env pin or "all" asked for; this is the one point every surface's selection passes.
-    from toolsets import profile_role_toolsets
-    for ts_name in profile_role_toolsets()[1]:
-        tools.difference_update(resolve_toolset(ts_name))
     # Disabled toolsets are always subtracted LAST, so a tool in a disabled
     # toolset is stripped even when a composite (hermes-cli) re-enables it.
     # This ensures that even if a composite toolset (like hermes-cli) is enabled, any tools belonging to a
