@@ -169,7 +169,7 @@ Returns a JSON object with:
   "stop_reason": "end_turn",
   "terminal_reason": "completed",
   "usage": { "input_tokens": 5, "output_tokens": 603, ... },
-  "modelUsage": { "claude-sonnet-4-6": { "costUSD": 0.078, "contextWindow": 200000 } }
+  "modelUsage": { "claude-fable-5": { "costUSD": 0.078, "contextWindow": 1000000 } }
 }
 ```
 
@@ -218,10 +218,10 @@ Parse `structured_output` from the JSON result. Claude validates output against 
 ### Session Continuation
 ```
 # Start a task
-terminal(command="claude -p 'Start refactoring the database layer' --output-format json --max-turns 10 > ~/.hermes/cache/scratch/session.json", workdir="/project", timeout=180)
+terminal(command="claude -p 'Start refactoring the database layer' --output-format json --max-turns 10 > /tmp/session.json", workdir="/project", timeout=180)
 
 # Resume with session ID
-terminal(command="claude -p 'Continue and add connection pooling' --resume $(cat ~/.hermes/cache/scratch/session.json | python -c 'import json,sys; print(json.load(sys.stdin)[\"session_id\"])') --max-turns 5", workdir="/project", timeout=120)
+terminal(command="claude -p 'Continue and add connection pooling' --resume $(cat /tmp/session.json | python -c 'import json,sys; print(json.load(sys.stdin)[\"session_id\"])') --max-turns 5", workdir="/project", timeout=120)
 
 # Or resume the most recent session in the same directory
 terminal(command="claude -p 'What did you do last time?' --continue --max-turns 1", workdir="/project", timeout=30)
@@ -273,7 +273,7 @@ Automatically falls back to the specified model when the default is overloaded (
 ### Model & Performance
 | Flag | Effect |
 |------|--------|
-| `--model <alias>` | Model selection: `sonnet`, `opus`, `haiku`, or full name like `claude-sonnet-4-6` |
+| `--model <alias>` | Model selection: `fable`, `sonnet`, `opus`, `haiku`, or a full name such as `claude-fable-5`, `claude-sonnet-5`, or `claude-opus-4-8` |
 | `--effort <level>` | Reasoning depth: `low`, `medium`, `high`, `xhigh`, `max` |
 | `--max-turns <n>` | Limit agentic loops (print mode only; prevents runaway) |
 | `--max-budget-usd <n>` | Cap API spend in dollars (print mode only) |
@@ -608,7 +608,7 @@ Configure in `.claude/settings.json` (project) or `~/.claude/settings.json` (glo
       "hooks": [{"type": "command", "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'rm -rf'; then echo 'Blocked!' && exit 2; fi"}]
     }],
     "Stop": [{
-      "hooks": [{"type": "command", "command": "echo 'Claude finished a response' >> ~/.hermes/cache/scratch/claude-activity.log"}]
+      "hooks": [{"type": "command", "command": "echo 'Claude finished a response' >> /tmp/claude-activity.log"}]
     }]
   }
 }
@@ -738,7 +738,8 @@ Use `/context` in interactive mode to see a colored grid of context usage. Key t
 9. **Background tmux sessions persist** — always clean up with `tmux kill-session -t <name>` when done.
 10. **Slash commands (like `/commit`) only work in interactive mode** — in `-p` mode, describe the task in natural language instead.
 11. **`--bare` skips OAuth** — requires `ANTHROPIC_API_KEY` env var or an `apiKeyHelper` in settings.
-12. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
+12. **`claude auth status` can be stale after token revocation** — it may report a valid Claude Max login while the first real API call fails with `401 OAuth access token has been revoked`. Before a long delegated build, run a one-turn probe such as `claude -p 'Respond with OK only.' --max-turns 1`. On 401, record that no implementation turn ran, use `claude auth login` to restore the CLI session when user interaction is available, or fall back once to the independently configured Hermes Anthropic provider/current model per adaptive routing policy.
+13. **Context degradation is real** — AI output quality measurably degrades above 70% context window usage. Monitor with `/context` and proactively `/compact`.
 
 ## Rules for Hermes Agents
 
