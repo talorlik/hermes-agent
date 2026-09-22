@@ -1,97 +1,32 @@
 """Cron job argument normalization, validation and result shaping (re-exported by
 tools/cronjob_tools.py)."""
 
-import contextlib
 import logging
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
 from cron.jobs import effective_job_state
 
-import hermes_time
-
 # Logger parity with the origin module.
 logger = logging.getLogger("tools.cronjob_tools")
 
-# A one-shot firing within this many minutes is still part of the conversation that created it:
-# with platforms.slack.extra.reply_in_thread at its default true, the whole exchange under a
-# top-level message lives in the thread keyed on that message's own id.
-_THREAD_HORIZON_MINUTES = 60
 
-
-def _first_fire_within_thread_horizon(
-    schedule: Union[str, Dict[str, Any], None],
-) -> bool:
-    """True when the job's first fire is close enough that the creating conversation is still
-    alive when it happens. Only near one-shots qualify; recurring jobs and one-shots beyond the
-    horizon outlive the conversation, which is what the synthetic-drop rule protects."""
-    if not schedule:
-        return False
-    parsed: Optional[Dict[str, Any]]
-    if isinstance(schedule, dict):
-        parsed = schedule
-    else:
-        parsed = None
-        with contextlib.suppress(Exception):
-            from cron.jobs import parse_schedule
-
-            parsed = parse_schedule(schedule)
-    if not isinstance(parsed, dict) or parsed.get("kind") != "once":
-        return False
-    run_at = parsed.get("run_at")
-    if not run_at:
-        return False
-    try:
-        fire_at = datetime.fromisoformat(str(run_at).replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    now = hermes_time.now()
-    if fire_at.tzinfo is None:
-        fire_at = fire_at.replace(tzinfo=now.tzinfo)
-    # Bounded interval: an already-expired run_at gives a negative delta that would
-    # otherwise sail through a bare upper bound — a conversation that is already over
-    # must fail closed to the channel-level drop, while a fire at this instant still
-    # happens inside the live conversation and keeps the thread.
-    delta = fire_at - now
-    return timedelta(0) <= delta <= timedelta(minutes=_THREAD_HORIZON_MINUTES)
-
-
-def _origin_from_env(
-    schedule: Union[str, Dict[str, Any], None] = None,
-) -> Optional[Dict[str, str]]:
-    from gateway.session_context import async_delivery_supported, get_session_env
+def _origin_from_env() -> Optional[Dict[str, str]]:
+    from gateway.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
     if not (origin_platform and origin_chat_id):
         return None
-    # A non-push surface (api_server: request/response, ``send()`` is a stub) cannot receive a
-    # fire-time report, so an origin stamp would make ``deliver=origin`` fail silently on every
-    # fire (#69304). No origin => the home-channel fallback + creation-time notice apply.
-    if not async_delivery_supported():
-        return None
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
     # Slack stamps every TOP-LEVEL message's own id as the session thread (a per-message
     # KEY, not a location); persisting it would pin all future deliveries inside an
-    # ephemeral thread, so thread == creating message id is synthetic and dropped — unless
-    # the job's first fire is within the conversation's remaining lifetime: under the
-    # default reply_in_thread the exchange under a top-level message lives in exactly that
-    # thread, so a near one-shot must deliver back into it.
+    # ephemeral thread, so thread == creating message id is synthetic and dropped.
     if thread_id and origin_platform == "slack":
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID") or None
         if message_id and str(thread_id) == str(message_id):
-            if _first_fire_within_thread_horizon(schedule):
-                logger.debug(
-                    "Cron origin: keeping synthetic Slack thread_id=%s — first fire is "
-                    "within the conversation horizon",
-                    thread_id,
-                )
-            else:
-                logger.debug(
-                    "Cron origin: dropping synthetic per-message Slack "
-                    "thread_id=%s (== creation message id)",
-                    thread_id,
-                )
-                thread_id = None
+            logger.debug(
+                "Cron origin: dropping synthetic per-message Slack "
+                "thread_id=%s (== creation message id)", thread_id)
+            thread_id = None
     if thread_id:
         logger.debug(
             "Cron origin captured thread_id=%s for %s:%s",
@@ -123,16 +58,7 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
         return None
     try:
         from cron.scheduler import _resolve_delivery_targets
-        targets = _resolve_delivery_targets(job)
-        if targets:
-            # _origin_from_env() dropped a non-push origin (api_server) and the job rerouted to a
-            # home channel: tell the creating client where the report goes (#69304).
-            from gateway.session_context import async_delivery_supported, get_session_env
-            fallback = [t for t in targets if t.get("_resolved_from") == "origin_fallback"]
-            if fallback and get_session_env("HERMES_SESSION_PLATFORM") and not async_delivery_supported():
-                return ("Note: this stateless HTTP API session cannot receive cron delivery, so this "
-                        f"job will report to the home channel {fallback[0]['platform']}:"
-                        f"{fallback[0]['chat_id']} instead of back here.")
+        if _resolve_delivery_targets(job):
             return None
     except Exception:  # resolution unavailable — fall back to the origin signal
         if job.get("origin"):
@@ -140,7 +66,7 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
     return (
         "This is a local-only cron job: its output is saved (view it with "
         "cronjob(action='list')) but will NOT be delivered back into this "
-        "session — CLI/TUI and stateless HTTP API sessions have no live-delivery channel. To be "
+        "session — CLI/TUI sessions have no live-delivery channel. To be "
         "notified when it runs, recreate or update the job with deliver set to "
         "a gateway-connected platform, e.g. deliver='telegram' or deliver='all'.")
 
@@ -422,6 +348,48 @@ _FORMAT_JOB_OPTIONAL_KEYS = (
     "monitor_state", "no_agent", "enabled_toolsets", "workdir")
 
 
+_EXECUTION_PUBLIC_FIELDS = (
+    "id", "status", "outcome", "source",
+    "claimed_at", "started_at", "finished_at", "error",
+    "occurrence_key", "retry_at",
+    "delivery_target", "delivery_status", "delivery_attempts",
+    "delivery_error",
+    "detached_run_id", "detached_status", "detached_worker",
+    "lease_expires_at",
+)
+
+
+def _redact_execution_error(text: Any) -> Any:
+    if text is None:
+        return None
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            str(text), force=True, redact_url_credentials=True
+        )
+    except Exception:
+        return "[REDACTED - error unavailable]"
+
+
+def _format_latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return the newest durable execution projected to the public schema."""
+    try:
+        from cron.executions import latest_execution
+
+        record = latest_execution(job_id)
+    except Exception:
+        return None
+    if not record:
+        return None
+    projected = {key: record.get(key) for key in _EXECUTION_PUBLIC_FIELDS}
+    projected["error"] = _redact_execution_error(projected.get("error"))
+    projected["delivery_error"] = _redact_execution_error(
+        projected.get("delivery_error")
+    )
+    return projected
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     from agent.redact import redact_sensitive_text
 
@@ -437,8 +405,6 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
         "model": job.get("model"),
         "provider": job.get("provider"),
-        # Locked to its own model; unpinned jobs follow cron.model, then the main agent model.
-        "pinned": bool(str(job.get("model") or "").strip()),
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
         "repeat": _repeat_display(job),
@@ -446,6 +412,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
+        "last_defer": job.get("last_defer"),
+        "latest_execution": _format_latest_execution(job_id),
         "last_delivery_error": job.get("last_delivery_error"),
         "last_delivery_unverified": job.get("last_delivery_unverified"),
         "last_fire_error": job.get("last_fire_error"),
@@ -461,6 +429,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]
+    if job.get("script"):
+        result["script_failure_policy"] = job.get(
+            "script_failure_policy", "continue"
+        )
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]

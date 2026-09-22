@@ -12,8 +12,9 @@ which has to answer for one-shot dispatch accounting and mid-run side effects. R
 jobs only: finite one-shots are pre-claimed by ``claim_dispatch`` (at-most-times, #38758)
 and must not regain a consumed dispatch here.
 
-While a retry is pending the failure notice is suppressed (Cowork re-runs silently); a
-run that reaches the model — success or not — resets the ladder. Disable with
+The failure notice is delivered before the retry is planned: suppression would be unsafe
+until the jobs-store mutation is durable. A run that reaches the model — success or not —
+resets the ladder. Disable with
 ``cron.retry_unreachable: false`` in config.yaml.
 """
 
@@ -66,17 +67,6 @@ def _is_recurring(job: Dict[str, Any]) -> bool:
     return job.get("schedule", {}).get("kind") in {"cron", "interval"}
 
 
-def will_retry(job: Dict[str, Any]) -> bool:
-    """Predict whether ``plan_retry`` will schedule a re-run for this flagged failure —
-    used by the scheduler to suppress the interim failure notice."""
-    if not _is_recurring(job) or job.get("state") == "paused":
-        return False
-    state = job.get(STATE_KEY) or {}
-    if int(state.get("attempt") or 0) >= len(RETRY_DELAYS_SECONDS):
-        return False
-    return retry_enabled()
-
-
 def clear_state(job: Dict[str, Any]) -> None:
     """A run reached the model (any outcome): the ladder resets."""
     job.pop(STATE_KEY, None)
@@ -108,8 +98,6 @@ def plan_retry(job: Dict[str, Any]) -> bool:
 
     natural_next = _parse_aware(job.get("next_run_at"))
     if natural_next is not None and natural_next <= retry_dt:
-        # The schedule fires again sooner than the ladder would — no point consuming an
-        # attempt; the natural occurrence IS the retry.
         clear_state(job)
         return False
     retry_at = retry_dt.isoformat()
