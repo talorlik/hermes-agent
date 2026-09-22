@@ -33,14 +33,28 @@ def _make_run_side_effect(
 ):
     """Minimal subprocess.run side_effect for the update flow."""
 
+    pre_sha = "a" * 40
+    post_sha = "b" * 40
+    state = {"head": pre_sha}
+
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
         if "rev-parse" in joined and "--verify" in joined:
             return subprocess.CompletedProcess(
                 cmd, 0 if verify_ok else 128, stdout="", stderr=""
+            )
+        if "rev-parse" in joined and joined.endswith(" origin/main"):
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{post_sha}\n", stderr="")
+        if "rev-parse" in joined and joined.endswith(" HEAD"):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{state['head']}\n", stderr=""
             )
         if "rev-list" in joined:
             return subprocess.CompletedProcess(
@@ -55,6 +69,8 @@ def _make_run_side_effect(
         # actually patch in tests that exercise restore, so this is a catch-all.
         if "stash" in joined and "list" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if " pull " in f" {joined} " or " merge --ff-only " in f" {joined} ":
+            state["head"] = post_sha
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
