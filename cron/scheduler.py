@@ -38,8 +38,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from cron.env_settings import cron_env_setting
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.config import (
-    load_config, load_config_readonly, resolve_cron_model_drift_defaults)
+
+# Compat-aware import: try hermes_cli.config first (canonical when present), fall back to
+# cron.model_drift_compat when upstream removes resolve_cron_model_drift_defaults.
+try:
+    from hermes_cli.config import (
+        load_config, load_config_readonly, resolve_cron_model_drift_defaults)
+    _USING_MODEL_DRIFT_COMPAT = False
+except ImportError:
+    from hermes_cli.config import load_config, load_config_readonly
+    from cron.model_drift_compat import resolve_cron_model_drift_defaults
+    _USING_MODEL_DRIFT_COMPAT = True
+
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
@@ -48,6 +58,15 @@ from agent.delegation_context import (
 from agent.memory_provider import ctx_bound
 
 logger = logging.getLogger(__name__)
+
+# Log recovery notice once when falling back to compat (ops sees recovery; user action available).
+if _USING_MODEL_DRIFT_COMPAT:
+    logger.warning(
+        "resolve_cron_model_drift_defaults not found in hermes_cli.config; using cron.model_drift_compat fallback. "
+        "This is expected during upstream merge windows when the function is removed upstream but still needed by the fork. "
+        "Cron remains operational."
+    )
+
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:

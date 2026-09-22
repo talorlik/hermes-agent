@@ -85,6 +85,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - cron/incidents.py
   - cron/jobs.py
   - cron/monitor.py
+  - cron/model_drift_compat.py
   - cron/outbox.py
   - cron/scheduler.py
   - cron/scheduler_delivery.py
@@ -112,12 +113,13 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/cron/test_recurring_eagain_redispatch.py
   - tests/cron/test_cron_script_failure_policy.py
   - tests/cron/test_cronjob_schema.py
+  - tests/cron/test_model_drift_compat.py
   - tests/cron/test_script_claim_heartbeat.py
   - tests/cron/test_unreachable_retry.py
   - tests/hermes_cli/test_cron.py
   - tests/hermes_cli/test_cron_exit_code_propagation.py
   - website/docs/user-guide/features/cron.md
-- Intent: Typed durable outcomes and an execution ledger for scheduled jobs, detached runs that survive gateway restarts with propagated finalization exit codes, delivery outbox, incident lifecycle, and fail-closed handling of script errors (a failing pre/post script fails the run instead of silently passing).
+- Intent: Typed durable outcomes and an execution ledger for scheduled jobs, detached runs that survive gateway restarts with propagated finalization exit codes, delivery outbox, incident lifecycle, fail-closed handling of script errors (a failing pre/post script fails the run instead of silently passing), and a merge-safe fallback for resolve_cron_model_drift_defaults (cron/model_drift_compat.py) so gateway bootstrap remains operational when upstream removes the function from hermes_cli.config.
 - Protected-Invariant: A scheduled job's outcome is always durably recorded; script failure never reports success; detached finalization exit codes reach the caller; upstream schema migrations must not drop the executions ledger.
 - Tests: tests/cron/, tests/hermes_cli/test_cron.py, tests/hermes_cli/test_cron_exit_code_propagation.py
 - Retirement-Condition: Conductor cutover completes and P6-B retires `cron/deferrals.py` and `cron/outcomes.py` after confirming no remaining caller; the rest retires if upstream ships equivalent durable-outcome semantics.

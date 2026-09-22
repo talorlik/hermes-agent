@@ -1807,44 +1807,6 @@ def split_model_config_default(raw_default: Any) -> tuple[str, str]:
     return (str(raw_default or "").strip(), "")
 
 
-
-
-def _model_assignment_text(value: Any) -> str:
-    """Return a trimmed scalar model/provider value, or empty for malformed data."""
-    return value.strip() if isinstance(value, str) else ""
-
-
-def resolve_cron_model_drift_defaults(
-    config: Any,
-    *,
-    environ: Optional[Dict[str, str]] = None,
-) -> Tuple[str, str]:
-    """Resolve the global provider/model values cron compares against snapshots.
-
-    Mirrors the scheduler's global-model precedence: a truthy configured model
-    wins ``HERMES_MODEL``; the environment is only a fallback. Per-job and cron
-    fleet defaults are handled by the caller/classifier because they suppress a
-    drift axis rather than changing the global assignment.
-    """
-    env = os.environ if environ is None else environ
-    provider = ""
-    model = _model_assignment_text(env.get("HERMES_MODEL", ""))
-    model_config = config.get("model") if isinstance(config, dict) else None
-    if isinstance(model_config, str):
-        configured_model = model_config.strip()
-        if configured_model:
-            model = configured_model
-    elif isinstance(model_config, dict):
-        provider = _model_assignment_text(model_config.get("provider"))
-        configured_model = _model_assignment_text(
-            model_config.get("default")
-            or model_config.get("model")
-            or model_config.get("name")
-        )
-        if configured_model:
-            model = configured_model
-    return provider, model
-
 def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     """Canonicalize the ``model`` section at the single load/save chokepoint.
     Root-level ``provider``/``base_url``/``context_length`` (older layouts) are moved under
