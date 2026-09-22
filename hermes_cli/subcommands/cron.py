@@ -18,7 +18,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_subparsers = cron_parser.add_subparsers(dest="cron_command")
 
     cron_list = cron_subparsers.add_parser("list", help="List scheduled jobs")
-    _flag(cron_list, "--all", help="Include disabled and completed jobs")
+    _flag(cron_list, "--all", help="Include disabled jobs")
 
     cron_create = cron_subparsers.add_parser(
         "create", aliases=["add"], help="Create a scheduled job")
@@ -44,6 +44,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "With --no-agent: the script IS the job and its stdout is "
             "delivered verbatim. .sh/.bash files run via bash, everything "
             "else via Python.")
+    cron_create.add_argument(
+        "--script-failure-policy",
+        choices=["continue", "fail_closed"],
+        default="continue",
+        help=(
+            "Behavior when an agent pre-run script fails: continue injects the "
+            "error into the prompt (legacy default); fail_closed fails the run "
+            "before the agent starts and requires --script."),
+    )
     _flag(cron_create, "--no-agent", dest="no_agent", default=False,
         help="Skip the LLM entirely — run --script on schedule and deliver "
             "its stdout directly. Empty stdout = silent. Classic watchdog "
@@ -66,10 +75,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument("--model",
         help="Pin this job to a specific inference model (user-owned; the "
             "agent's cronjob tool cannot set this). Omit to follow "
-            "cron.model, then the main agent model (`hermes model`), at fire time.")
-    cron_create.add_argument("--pin", dest="pinned", action="store_true", default=None,
-        help="Lock the CURRENT main agent model (and its provider) onto this job so later "
-            "`hermes model` changes never touch it. Ignored when --model is given.")
+            "cron.model / model.default from config.yaml.")
     cron_create.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').")
     cron_create.add_argument("--reasoning-effort", dest="reasoning_effort",
@@ -110,6 +116,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "With --no-agent the script IS the job; otherwise its stdout is "
             "injected into the agent's prompt each run.")
     cron_edit.add_argument(
+        "--script-failure-policy",
+        choices=["continue", "fail_closed"],
+        default=None,
+        help=(
+            "Set agent pre-run script failure behavior. fail_closed requires an "
+            "effective script; use continue in the same edit when clearing one."),
+    )
+    cron_edit.add_argument(
         "--no-agent", dest="no_agent", action="store_const", const=True, default=None,
         help="Enable no-agent mode on this job (requires --script or an "
             "existing script on the job).")
@@ -132,12 +146,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--model",
         help="Pin this job to a specific inference model (user-owned; the "
             "agent's cronjob tool cannot set this). Pass empty string to "
-            "clear the pin and follow cron.model, then the main agent model.")
-    _pin = cron_edit.add_mutually_exclusive_group()
-    _pin.add_argument("--pin", dest="pinned", action="store_true", default=None,
-        help="Lock the CURRENT main agent model (and its provider) onto this job.")
-    _pin.add_argument("--unpin", dest="pinned", action="store_false",
-        help="Release the job's model pin so it follows the main agent model again.")
+            "clear the pin and follow cron.model / model.default.")
     cron_edit.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.")
     cron_edit.add_argument("--reasoning-effort", dest="reasoning_effort",
@@ -162,6 +171,23 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "remove", aliases=["rm", "delete"], help="Remove a scheduled job")
     cron_remove.add_argument("job_id", help="Job ID to remove")
 
+    cron_resnap = cron_subparsers.add_parser(
+        "resnap",
+        help=(
+            "Adopt the current global inference resolution for unpinned jobs "
+            "without pinning them (they keep tracking future global changes). "
+            "Use after deliberately changing the default model."
+        ),
+    )
+    cron_resnap.add_argument(
+        "job_id", nargs="?", help="Job ID to resnap (omit with --all)"
+    )
+    cron_resnap.add_argument(
+        "--all",
+        action="store_true",
+        help="Resnap every unpinned agent job to the current global resolution",
+    )
+
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
@@ -173,12 +199,31 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron incidents — durable failure incidents (list/ack)
     cron_incidents = cron_subparsers.add_parser(
         "incidents", help="List or acknowledge durable cron failure incidents")
-    cron_incidents.add_argument("--state", choices=["detected", "alerted", "resolved", "closed"],
+    cron_incidents.add_argument(
+        "--state", choices=["detected", "alerted", "resolved", "recovered", "closed"],
         help="Filter incidents by lifecycle state")
     cron_incidents.add_argument(
         "incident_action", nargs="?", default="list", choices=["list", "ack"],
         help="Action (default: list)")
     cron_incidents.add_argument("incident_id", nargs="?", help="Incident ID to acknowledge (ack)")
+
+    cron_finalize = cron_subparsers.add_parser(
+        "finalize-detached",
+        help="Finalize a detached cron run by correlation id",
+    )
+    cron_finalize.add_argument(
+        "run_id", help="Correlation id from the RUN_STARTED directive"
+    )
+    finalize_result = cron_finalize.add_mutually_exclusive_group(required=True)
+    finalize_result.add_argument(
+        "--success", action="store_true", help="Report the run succeeded"
+    )
+    finalize_result.add_argument(
+        "--failed", action="store_true", help="Report the run failed"
+    )
+    cron_finalize.add_argument(
+        "--error", help="Failure evidence (stored redacted; used with --failed)"
+    )
 
     # notepad: per-job durable KV, injected into the job prompt each run.
     cron_notepad = cron_subparsers.add_parser(

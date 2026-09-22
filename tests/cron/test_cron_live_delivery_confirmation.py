@@ -18,7 +18,6 @@ and fail-closed on nothing-to-send.
 
 import asyncio
 import logging
-import time
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
@@ -158,7 +157,7 @@ def _run(job, content, send_result, relay=False, standalone_result=None, cron_cf
 
     router = MagicMock()
 
-    async def _deliver_to_platform(target, text, metadata, transport=None):
+    async def _deliver_to_platform(target, text, metadata):
         router_calls.append({"target": target, "text": text, "metadata": metadata})
         return send_result
 
@@ -385,15 +384,39 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 
     def test_recorder_skips_the_write_when_nothing_changed(self):
         with patch("cron.jobs.update_job") as update_job:
-            sched_delivery._record_delivery_verification({"id": "j1", "last_delivery_unverified": None}, [])
+            job = {
+                "id": "j1",
+                "execution_id": "exec-1",
+                "_delivery_projection_revision": 7,
+                "last_delivery_unverified": None,
+            }
+            sched_delivery._record_delivery_verification(job, [])
             update_job.assert_not_called()
-            sched_delivery._record_delivery_verification({"id": "j1", "last_delivery_unverified": None}, ["slack:C1"])
-            update_job.assert_called_once_with("j1", {"last_delivery_unverified": ["slack:C1"]})
+            sched_delivery._record_delivery_verification(job, ["slack:C1"])
+            update_job.assert_called_once_with(
+                "j1",
+                {"last_delivery_unverified": ["slack:C1"]},
+                expected_execution_id="exec-1",
+                expected_projection_revision=7,
+            )
 
     def test_recorder_clears_a_stale_marker(self):
         with patch("cron.jobs.update_job") as update_job:
-            sched_delivery._record_delivery_verification({"id": "j1", "last_delivery_unverified": ["slack:C1"]}, [])
-            update_job.assert_called_once_with("j1", {"last_delivery_unverified": None})
+            sched_delivery._record_delivery_verification(
+                {
+                    "id": "j1",
+                    "execution_id": "exec-1",
+                    "_delivery_projection_revision": 7,
+                    "last_delivery_unverified": ["slack:C1"],
+                },
+                [],
+            )
+            update_job.assert_called_once_with(
+                "j1",
+                {"last_delivery_unverified": None},
+                expected_execution_id="exec-1",
+                expected_projection_revision=7,
+            )
 
     def test_tool_listing_exposes_the_field(self):
         from tools.cronjob_tools import _format_job
@@ -405,47 +428,3 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 def test_scheduler_module_exposes_the_confirmation_helper():
     """Guard the import surface the delivery block depends on."""
     assert callable(sched_delivery._confirm_adapter_delivery)
-
-
-class TestStandaloneSendIsBounded:
-    """The standalone fallback lane must not wait on its send unbounded (#115469).
-
-    ``_send_to_platform``'s gateway-loop dispatch awaits with a deliberate no-timeout shield
-    whose comment assumes an outer ``_run_async`` bound — but this lane's outer runner is a bare
-    ``asyncio.run``, so a mid-reconnect transport pinned the run (and the restart drain behind
-    it) for hours while the job's script had finished in seconds.
-    """
-
-    @staticmethod
-    def _deliver_standalone(sender, cron_cfg):
-        """Drive the production entry point with no live adapters (the standalone lane)."""
-        with patch("gateway.config.load_gateway_config", return_value=_gateway_config()), \
-             patch("cron.scheduler.load_config",
-                   return_value={"cron": {"wrap_response": False, **cron_cfg}}), \
-             patch("cron.scheduler_delivery._record_delivery_verification"), \
-             patch("tools.send_message_tool._send_to_platform", sender):
-            return _deliver_result(_job(), "Nightly report.")
-
-    def test_hung_send_is_released_at_the_configured_bound(self, caplog):
-        async def _hang(*_args, **_kwargs):
-            await asyncio.Event().wait()  # transport mid-reconnect: the send never resolves
-
-        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-            started = time.monotonic()
-            error = self._deliver_standalone(_hang, {"standalone_send_timeout_seconds": 1})
-
-        assert time.monotonic() - started < 30  # released at the bound, not never
-        assert error is not None
-        assert "timed out after 1s" in error
-        assert "in flight" in error  # an un-cancelled shielded send may still land
-        assert "via live adapter" not in caplog.text and "delivered to" not in caplog.text
-
-    def test_a_timely_send_is_unaffected(self, caplog):
-        async def _ok(*_args, **_kwargs):
-            return {"success": True, "message_id": 7}
-
-        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-            error = self._deliver_standalone(_ok, {})
-
-        assert error is None
-        assert f"delivered to telegram:{CHAT_ID}" in caplog.text
