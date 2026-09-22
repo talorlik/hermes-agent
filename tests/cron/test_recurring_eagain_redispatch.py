@@ -22,11 +22,12 @@ This file drives the REAL `tick()` end-to-end against a throwaway HERMES_HOME:
   tick 1 -> script EAGAINs (subprocess.run raises OSError 11) -> failed exec row
   tick 2 -> substrate recovered (script runs clean) -> job MUST fire again
 """
+
 from __future__ import annotations
 
 import json
 import os
-import subprocess
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -35,6 +36,7 @@ import pytest
 
 # Ensure project root importable
 import sys
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
@@ -49,6 +51,7 @@ def wedge_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     import cron.jobs as jobs_mod
+
     monkeypatch.setattr(jobs_mod, "HERMES_DIR", hermes_home)
     monkeypatch.setattr(jobs_mod, "CRON_DIR", hermes_home / "cron")
     monkeypatch.setattr(jobs_mod, "JOBS_FILE", hermes_home / "cron" / "jobs.json")
@@ -63,7 +66,9 @@ def wedge_env(tmp_path, monkeypatch):
     )
     # Force it due now.
     now = datetime.now(timezone.utc)
-    jobs_mod.update_job(job["id"], {"next_run_at": (now - timedelta(minutes=1)).isoformat()})
+    jobs_mod.update_job(
+        job["id"], {"next_run_at": (now - timedelta(minutes=1)).isoformat()}
+    )
 
     script = hermes_home / "scripts" / "probe.py"
     script.write_text("print('ok')\n")
@@ -73,44 +78,36 @@ def wedge_env(tmp_path, monkeypatch):
 
 class TestEAGAINRecurringRedispatches:
     def _make_script_eagain(self, env, monkeypatch):
-        """Make the next subprocess.Popen raise EAGAIN once, then pass.
-
-        The script runner spawns via Popen (polling loop for cancel/timeout),
-        so the substrate-failure injection point is the Popen constructor.
-        """
+        """Make the next scheduler-owned script launch raise EAGAIN once."""
         import cron.scheduler as sched_mod
+
         state = {"n": 0}
 
-        class _OkProc:
-            def __init__(self, argv, **kwargs):
-                self.returncode = 0
-
-            def poll(self):
-                return self.returncode
-
-            def communicate(self, timeout=None):
-                return ("ok\n", "")
-
-            def wait(self, timeout=None):
-                return 0
-
-        def fake_popen(argv, **kwargs):
+        def fake_script_run(job, script_path, workdir=None, cancel_event=None):
             state["n"] += 1
             if state["n"] == 1:
                 raise OSError(11, "Resource temporarily unavailable")
-            return _OkProc(argv, **kwargs)
+            return True, "ok\n"
 
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            sched_mod,
+            "_run_job_script_with_claim_heartbeat",
+            fake_script_run,
+        )
         return state
 
-    def test_eagain_then_redispatched_on_next_tick(self, wedge_env, monkeypatch, tmp_path):
+    def test_eagain_then_redispatched_on_next_tick(
+        self, wedge_env, monkeypatch, tmp_path
+    ):
         """Tick 1 records a failed execution (EAGAIN); tick 2 must re-fire."""
         from cron import scheduler as S
         from cron import executions as E
 
         env = wedge_env
         # Point the executions ledger at the throwaway home.
-        monkeypatch.setattr(E, "EXECUTIONS_FILE", env["home"] / "cron" / "executions.db")
+        monkeypatch.setattr(
+            E, "EXECUTIONS_FILE", env["home"] / "cron" / "executions.db"
+        )
         monkeypatch.setattr(S, "_hermes_home", env["home"])
         monkeypatch.setattr(S, "get_due_jobs", S.get_due_jobs)  # no-op, keep real
 
@@ -125,6 +122,7 @@ class TestEAGAINRecurringRedispatches:
 
         # The job must still be scheduled (recurring), next_run_at advanced.
         import cron.jobs as J
+
         job = J.get_job(env["job_id"])
         assert job["enabled"] is True
         assert job["state"] == "scheduled"
@@ -132,7 +130,9 @@ class TestEAGAINRecurringRedispatches:
 
         # Force next_run_at due again (simulate the substrate recovery tick).
         now = datetime.now(timezone.utc)
-        J.update_job(env["job_id"], {"next_run_at": (now - timedelta(minutes=1)).isoformat()})
+        J.update_job(
+            env["job_id"], {"next_run_at": (now - timedelta(minutes=1)).isoformat()}
+        )
 
         # Tick 2: script passes -> job must fire (completed execution).
         n2 = S.tick(verbose=False, sync=True)
@@ -143,7 +143,9 @@ class TestEAGAINRecurringRedispatches:
         )
         assert state["n"] >= 2
 
-    def test_trigger_job_unwedges_persisted_state(self, wedge_env, monkeypatch, tmp_path):
+    def test_trigger_job_unwedges_persisted_state(
+        self, wedge_env, monkeypatch, tmp_path
+    ):
         """The incident force-run (`cron run <id>` -> trigger_job) resets the
         persisted due state so the next tick fires the job. This is the
         operator escape that cleared each wedge."""
@@ -152,7 +154,9 @@ class TestEAGAINRecurringRedispatches:
         from cron.jobs import trigger_job, update_job
 
         env = wedge_env
-        monkeypatch.setattr(E, "EXECUTIONS_FILE", env["home"] / "cron" / "executions.db")
+        monkeypatch.setattr(
+            E, "EXECUTIONS_FILE", env["home"] / "cron" / "executions.db"
+        )
         monkeypatch.setattr(S, "_hermes_home", env["home"])
 
         self._make_script_eagain(env, monkeypatch)
@@ -162,6 +166,7 @@ class TestEAGAINRecurringRedispatches:
         # future (job not due) but still enabled/scheduled — the observed
         # wedge where get_due_jobs never returns it.
         from datetime import timezone as tz
+
         far = datetime.now(tz.utc) + timedelta(days=1)
         update_job(env["job_id"], {"next_run_at": far.isoformat()})
         n2 = S.tick(verbose=False, sync=True)  # not due -> no dispatch
