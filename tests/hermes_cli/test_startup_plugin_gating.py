@@ -8,11 +8,8 @@ This saves 500-650ms on ``hermes --help``, ``hermes --version``,
 
 Two invariants:
 
-1. ``_BUILTIN_SUBCOMMANDS`` must contain every subcommand that is actually
-   registered by ``main()``.  If an entry is missing, plugin discovery
-   runs unnecessarily for that command (correctness-safe, just slow).
-   If an entry is PRESENT but the subcommand doesn't exist, a plugin
-   could shadow the name — also bad.
+1. The capability-free built-in command catalog must exactly equal the
+   root choices registered by the full parser, including aliases.
 
 2. ``_plugin_cli_discovery_needed()`` returns the right answer for the
    flag/positional parsing cases it's meant to handle.
@@ -20,51 +17,21 @@ Two invariants:
 
 from __future__ import annotations
 
-import io
-import re
 import sys
-from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import pytest
 
-from hermes_cli._parser import build_top_level_parser, top_level_value_flag_sets
+from hermes_cli._parser import (
+    BUILTIN_COMMAND_TOKENS,
+    build_top_level_parser,
+    top_level_value_flag_sets,
+)
 from hermes_cli.main import (
-    _BUILTIN_SUBCOMMANDS,
     _first_positional_argv,
     _plugin_cli_discovery_needed,
     _resolve_deferred_platform_cli_command,
 )
-
-
-# ── helper: grab the live set of top-level subcommands from argparse ───────
-
-
-def _live_subcommand_names() -> set[str]:
-    """Run ``hermes --help`` in-process and parse the subcommand block.
-
-    We patch ``_plugin_cli_discovery_needed`` to always return False so
-    plugin-registered commands aren't included — we're validating the
-    built-in-only set.
-    """
-    from hermes_cli import main as _main
-
-    argv_backup = sys.argv[:]
-    sys.argv = ["hermes", "--help"]
-    buf = io.StringIO()
-    try:
-        with patch.object(_main, "_plugin_cli_discovery_needed", return_value=False):
-            with redirect_stdout(buf):
-                with pytest.raises(SystemExit):
-                    _main.main()
-    finally:
-        sys.argv = argv_backup
-
-    text = buf.getvalue()
-    # argparse prints "{chat,model,...}" somewhere in the help output
-    m = re.search(r"\{([a-zA-Z0-9_,\-]+)\}", text)
-    assert m, f"Could not find subcommand group in --help output:\n{text[:500]}"
-    return set(m.group(1).split(","))
 
 
 # ── _first_positional_argv ─────────────────────────────────────────────────
@@ -96,9 +63,31 @@ def test_reasoning_value_is_not_misclassified_as_subcommand(monkeypatch):
 # ── _plugin_cli_discovery_needed ───────────────────────────────────────────
 
 
-# ── _BUILTIN_SUBCOMMANDS ↔ argparse registration parity ────────────────────
+# ── capability-free catalog ↔ argparse registration parity ────────────────
 
 
+def test_builtin_command_catalog_matches_full_parser_root_choices(monkeypatch):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "_register_plugin_cli_commands", lambda _subparsers: None
+    )
+    _parser, subparsers = main_mod._build_cli_parser()
+
+    assert set(BUILTIN_COMMAND_TOKENS) == set(subparsers.choices)
+
+
+def test_every_builtin_root_choice_skips_plugin_discovery(monkeypatch):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "_register_plugin_cli_commands", lambda _subparsers: None
+    )
+    _parser, subparsers = main_mod._build_cli_parser()
+    for command in subparsers.choices:
+        monkeypatch.setattr(sys, "argv", ["hermes", command])
+        assert _first_positional_argv() == command
+        assert _plugin_cli_discovery_needed() is False
 
 
 # ── _resolve_deferred_platform_cli_command (issue #54678) ──────────────────
