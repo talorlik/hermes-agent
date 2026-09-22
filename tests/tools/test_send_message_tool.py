@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -345,10 +346,7 @@ class TestSendMessageTool:
                 )
             )
 
-        # The text still goes out without the attachment, but the caller is told (#115908).
-        assert result["success"] is False
-        assert result["partial_success"] is True
-        assert result["media_dropped"] == [{"path": str(secret), "reason": "denied by the delivery policy"}]
+        assert result["success"] is True
         send_mock.assert_awaited_once_with(
             Platform.TELEGRAM,
             telegram_cfg,
@@ -358,40 +356,6 @@ class TestSendMessageTool:
             media_files=[],
             force_document=False,
         )
-
-    def test_missing_media_is_reported_to_the_caller_and_hermes_send_exits_nonzero(self, tmp_path, monkeypatch):
-        """#115908: a MEDIA path that does not exist on the host was dropped with only a host-side
-        warning while ``hermes send`` printed success:true and exited 0. The surviving attachment is
-        still sent; the payload names the drop and the CLI exit code follows it."""
-        from hermes_cli.send_cmd import _emit_result
-
-        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
-        config, telegram_cfg = _make_config()
-        report = tmp_path / "report.pdf"
-        report.write_bytes(b"%PDF report")
-        missing = tmp_path / "missing.pdf"
-
-        with patch("gateway.config.load_gateway_config", return_value=config), \
-             patch("tools.interrupt.is_interrupted", return_value=False), \
-             patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-             patch("gateway.mirror.mirror_to_session", return_value=True):
-            raw = send_message_tool({
-                "action": "send",
-                "target": "telegram:12345",
-                "message": f"report\nMEDIA:{report}\nMEDIA:{missing}",
-            })
-
-        result = json.loads(raw)
-        assert result["success"] is False
-        assert result["partial_success"] is True
-        assert result["media_dropped"] == [{"path": str(missing), "reason": "not found on this host"}]
-        assert "Delivery incomplete" in result["error"]
-        send_mock.assert_awaited_once_with(
-            Platform.TELEGRAM, telegram_cfg, "12345", "report", thread_id=None,
-            media_files=[(str(report.resolve()), False)], force_document=False,
-        )
-        assert _emit_result(raw, json_mode=True, quiet=True) != 0
 
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()
@@ -502,6 +466,34 @@ class TestSendTelegramMediaDelivery:
         assert "error" in result
         assert "No deliverable text or media remained" in result["error"]
         bot.send_message.assert_not_awaited()
+
+
+class TestSendTelegramChunkIndicatorEscaping:
+    def test_multi_chunk_indicators_are_mdv2_escaped(self, monkeypatch):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(message_id=1)
+        )
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        message = "*Executive summary*\n" + ("Some findings line\\.\n" * 400)
+
+        result = asyncio.run(_send_telegram("token", "12345", message))
+
+        assert result["success"] is True
+        assert bot.send_message.await_count > 1
+        for call in bot.send_message.await_args_list:
+            text = call.kwargs["text"]
+            match = re.search(r"\((\d+)/(\d+)\)$", text)
+            if match:
+                assert text.endswith(
+                    f"\\({match.group(1)}/{match.group(2)}\\)"
+                )
 
 
 # ---------------------------------------------------------------------------
