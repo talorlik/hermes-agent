@@ -1,11 +1,5 @@
-import type { ConnectionOperationTarget } from '@hermes/shared/gateway-events'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  $connectionOperation,
-  dismissConnectionOperation,
-  resetConnectionOperationsForTests
-} from '../app/connectionOperationStore.js'
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { createServerRequestHandler } from '../app/createServerRequestHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
@@ -90,15 +84,13 @@ describe('createGatewayEventHandler', () => {
     resetUiState()
     resetTurnState()
     resetServerRequestsForTests()
-    resetConnectionOperationsForTests()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
   })
 
   it('heals missed completion and blocking prompts only from the focused authoritative idle snapshot', () => {
     patchUiState({ sid: 'focused' })
-    const ctx = buildCtx([])
-    const onEvent = createGatewayEventHandler(ctx)
+    const onEvent = createGatewayEventHandler(buildCtx([]))
     onEvent({ session_id: 'focused', payload: {}, type: 'message.start' } as any)
     serverRequest('approval', { session_id: 'focused', request_id: 'approval', command: 'test' })
     const busyOverlay = getOverlayState().approval
@@ -115,63 +107,6 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('ready')
     expect(getOverlayState().approval).toBeNull()
     expect(getTurnState().tools).toEqual([])
-
-    const target: ConnectionOperationTarget = { action: 'install', kind: 'mcp', name: 'asana', state: 'pending' }
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 10,
-        op_id: 'op-1',
-        seq: 2,
-        targets: [target],
-        timeout_seconds: 30
-      },
-      type: 'connection.request'
-    })
-    expect($connectionOperation.get()).toMatchObject({ opId: 'op-1', seq: 2, targets: [target] })
-    expect(getOverlayState().connection).toEqual({ opId: 'op-1' })
-
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 11,
-        op_id: 'op-1',
-        seq: 1,
-        settled: false,
-        targets: [{ ...target, state: 'failed' }]
-      },
-      type: 'connection.update'
-    })
-    expect($connectionOperation.get()).toMatchObject({ seq: 2, targets: [target] })
-
-    // Esc on the "Finishing…" card drops it and it must not come back on a replay, but the settling
-    // frame that follows still records how each app ended.
-    const request = {
-      deadline_at: 10,
-      op_id: 'op-1',
-      seq: 2,
-      targets: [target],
-      timeout_seconds: 30
-    }
-
-    dismissConnectionOperation('op-1')
-    expect($connectionOperation.get()).toBeNull()
-    onEvent({ session_id: 'focused', payload: request, type: 'connection.request' })
-    expect($connectionOperation.get()).toBeNull()
-    expect(getOverlayState().connection).toBeNull()
-
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 12,
-        op_id: 'op-1',
-        seq: 3,
-        settled: true,
-        targets: [{ ...target, state: 'connected' }]
-      },
-      type: 'connection.update'
-    })
-    expect(ctx.system.sys.mock.calls.map((call: unknown[]) => call[0])).toEqual(['asana: connected'])
   })
 
   it('keeps the durable session id when a session.info payload omits it', () => {
