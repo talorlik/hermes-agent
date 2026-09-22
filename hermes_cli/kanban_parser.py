@@ -38,20 +38,23 @@ def _json_flag(**kw):
     return _arg("--json", action="store_true", **kw)
 
 
+def _positive_run_id(value: str) -> int:
+    """Argparse validator for an explicit run-ownership guard."""
+    try:
+        run_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "--expected-run-id must be a positive integer"
+        ) from exc
+    if run_id <= 0:
+        raise argparse.ArgumentTypeError(
+            "--expected-run-id must be a positive integer"
+        )
+    return run_id
+
+
 def _reason(help: str):
     return _arg("--reason", help=help)
-
-
-def _nonnegative_int(value: str) -> int:
-    """argparse type for retention days: a negative window builds a future cutoff
-    that matches every row, so reject it at the CLI boundary before any sweep."""
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("retention days must be >= 0 (0 disables that sweep)")
-    return parsed
 
 
 def _run_state_args(type_help: str):
@@ -160,10 +163,6 @@ _SPECS = [
     _cmd("create", [
         _arg("title", help="Task title"),
         _arg("--body", help="Optional opening post"),
-        _arg("--body-file", metavar="PATH",
-             help="Read the opening post from a file ('-' = stdin), so bodies with embedded "
-                  "newlines or flag-like lines survive shell quoting. "
-                  "Mutually exclusive with --body."),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--workspace",
@@ -276,12 +275,19 @@ _SPECS = [
     _cmd("claim", [
         _TASK_ID,
         _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
+        _arg("--claimer", help="Explicit claim identity; matching retries are idempotent"),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Atomically claim a ready task (prints resolved workspace path)"),
     _cmd("comment", [
         _TASK_ID,
         _arg("text", nargs="+", help="Comment body"),
         _arg("--author", help="Author name (default: $HERMES_PROFILE or 'user')"),
         _arg("--max-len", type=int, help="Trim the stored comment body to this many characters"),
+        _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
+             help="Only comment if the task still has this exact status."),
+        _arg("--if-absent", action="store_true",
+             help="Succeed without writing when this exact author and comment body already exist."),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Append a comment"),
     _cmd("attach", [
         _TASK_ID,
@@ -303,15 +309,23 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
+        _arg(
+            "--expected-status",
+            choices=sorted(kb.VALID_STATUSES),
+            help="Only complete if the task still has this exact status.",
+        ),
+        _arg(
+            "--expected-run-id",
+            type=_positive_run_id,
+            help="Only complete if this exact positive owning run is still current.",
+        ),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
-        _arg("--title", help="Replace the task title"),
-        _arg("--body", help="Replace the task body"),
-        _arg("--priority", type=int, help="Replace the task priority"),
-        _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--result", required=True, help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
-    ], help="Edit task fields or recovery fields on an already-completed task"),
+    ], help="Edit recovery fields on an already-completed task"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
@@ -322,6 +336,15 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
+             help="Only block if the task still has this exact status."),
+        _arg("--author", help="Explicit author for the transactional BLOCKED reason comment."),
+        _arg(
+            "--expected-run-id",
+            type=_positive_run_id,
+            help="Only block if this exact positive owning run is still current.",
+        ),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
@@ -330,7 +353,11 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--expected-block-kind", choices=sorted(kb.VALID_UNBLOCK_EXPECTED_KINDS),
+             help="Only unblock a blocked task with this exact typed block kind."),
+        _arg("--author", help="Explicit author for the transactional UNBLOCK reason comment."),
         _TASK_IDS,
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,
@@ -340,6 +367,14 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
+        _arg("--expected-status", choices=sorted(kb.VALID_STATUSES),
+             help="Only request review if the task still has this exact status."),
+        _arg(
+            "--expected-run-id",
+            type=_positive_run_id,
+            help="Only request review if this exact positive owning run is still current.",
+        ),
+        _json_flag(help="Print a versioned lifecycle receipt instead of prose"),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
@@ -435,10 +470,9 @@ _SPECS = [
               "to specify-style single-task promotion when the task "
               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
     _cmd("gc", [
-        _arg("--event-retention-days", type=_nonnegative_int, default=30,
-             help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
-        _arg("--log-retention-days", type=_nonnegative_int, default=30,
-             help="Delete worker log files older than N days (default: 30; 0 disables)"),
+        _arg("--event-retention-days", type=int, default=30,
+             help="Delete task_events older than N days for terminal tasks (default: 30)"),
+        _arg("--log-retention-days", type=int, default=30, help="Delete worker log files older than N days (default: 30)"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
          help="Check kanban.db integrity and auto-repair index-only corruption",
