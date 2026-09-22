@@ -301,6 +301,26 @@
     } catch (_e) { /* ignore quota / private mode */ }
   }
 
+  // Deep-link params: /kanban?board=<slug>&task=<id>. Read once at page
+  // construction — the URL is the user's explicit intent for THIS load, so
+  // it wins over the localStorage board pin (which stays untouched: opening
+  // a shared link must not silently re-pin the recipient's own board).
+  // Blank values ("?board=&task=") count as absent so trailing empty params
+  // keep the stored-pin behavior. URLSearchParams percent-decodes values
+  // here; the fetch layer re-encodes with encodeURIComponent, so encoded
+  // slugs/ids round-trip without double-encoding or injection.
+  function readDeepLinkParams() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      return {
+        board: (params.get("board") || "").trim() || null,
+        task: (params.get("task") || "").trim() || null,
+      };
+    } catch (_e) {
+      return { board: null, task: null };
+    }
+  }
+
   function withBoard(url, board) {
     // Always append ?board=<slug> when we have one picked — including
     // "default". Omitting the param would fall through to the backend's
@@ -468,44 +488,15 @@
 
   function attachTouchDrag(el, taskId) {
     if (!el) return;
-    // A finger drifts a few px on every real tap; without a movement threshold ANY touch
-    // pointerdown armed a drag and called preventDefault(), which suppresses the synthesized
-    // click the card relies on to open (#115568). Defer the drag proxy + preventDefault until
-    // the pointer has actually moved past DRAG_THRESHOLD_PX; a tap that never crosses it falls
-    // through to the native click, same as it already does for a mouse.
-    const DRAG_THRESHOLD_PX = 8;
     function onDown(e) {
       if (e.pointerType !== "touch") return;
-      const startX = e.clientX;
-      const startY = e.clientY;
-      let proxy = null;
+      e.preventDefault();
+      const proxy = el.cloneNode(true);
+      proxy.classList.add("hermes-kanban-touch-proxy");
+      document.body.appendChild(proxy);
       let lastTarget = null;
-      let dragging = false;
-
-      function startDrag() {
-        dragging = true;
-        proxy = el.cloneNode(true);
-        proxy.classList.add("hermes-kanban-touch-proxy");
-        document.body.appendChild(proxy);
-        proxy.style.position = "fixed";
-        proxy.style.pointerEvents = "none";
-        proxy.style.opacity = "0.85";
-        proxy.style.zIndex = "9999";
-        proxy.style.width = `${el.offsetWidth}px`;
-        proxy.style.left = `${startX - el.offsetWidth / 2}px`;
-        proxy.style.top = `${startY - 24}px`;
-      }
 
       function move(ev) {
-        if (!dragging) {
-          const dx = ev.clientX - startX;
-          const dy = ev.clientY - startY;
-          if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
-          startDrag();
-        }
-        // Only now, once a drag is actually underway, does it claim the gesture — a stationary
-        // tap never reaches preventDefault() and its click event fires normally.
-        ev.preventDefault();
         proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
         proxy.style.top = `${ev.clientY - 24}px`;
         proxy.style.display = "none";
@@ -524,7 +515,6 @@
         document.removeEventListener("pointermove", move);
         document.removeEventListener("pointerup", up);
         document.removeEventListener("pointercancel", up);
-        if (!dragging) return;
         if (lastTarget) {
           lastTarget.classList.remove("hermes-kanban-column--drop");
           const status = lastTarget.getAttribute("data-kanban-column");
@@ -543,6 +533,14 @@
         }
         proxy.remove();
       }
+      // Kick off proxy at the pointer origin.
+      proxy.style.position = "fixed";
+      proxy.style.pointerEvents = "none";
+      proxy.style.opacity = "0.85";
+      proxy.style.zIndex = "9999";
+      proxy.style.width = `${el.offsetWidth}px`;
+      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
+      proxy.style.top = `${e.clientY - 24}px`;
       document.addEventListener("pointermove", move);
       document.addEventListener("pointerup", up);
       document.addEventListener("pointercancel", up);
@@ -619,13 +617,93 @@
   }
 
   // -------------------------------------------------------------------------
+  // Published orchestration summary
+  // -------------------------------------------------------------------------
+
+  function OrchestrationSummaryPanel(props) {
+    const { t } = useI18n();
+    if (props.unavailable) {
+      return h(Card, { className: "hermes-kanban-summary hermes-kanban-summary--unavailable" },
+        h(CardContent, { className: "hermes-kanban-summary-content" },
+          h("div", { className: "hermes-kanban-summary-title" },
+            tx(t, "summaryUnavailable", "Orchestration summary unavailable")),
+          h("div", { className: "hermes-kanban-summary-subtitle" },
+            tx(t, "summaryUnavailableHint", "The board remains available while the published summary is repaired.")),
+        ),
+      );
+    }
+    const summary = props.summary;
+    if (!summary) return null;
+    const counts = summary.counts || {};
+    const cron = summary.cron || {};
+    const totals = summary.schedule_totals || {};
+    const metrics = [
+      tx(t, "summaryRunning", "Running {n}", { n: counts.running_count || 0 }),
+      tx(t, "summaryFailed", "Failed {n}", { n: counts.failed_count || 0 }),
+      tx(t, "summaryBlocked", "Blocked {n}", { n: counts.blocked_count || 0 }),
+      tx(t, "summaryCron", "Cron {n}", { n: cron.jobs_remaining || 0 }),
+      tx(t, "summarySchedulesPaused", "Schedules paused {paused}/{total}", {
+        paused: totals.paused || 0,
+        total: totals.configured || 0,
+      }),
+      tx(t, "summaryFindings", "Findings {n}", { n: summary.findings_count || 0 }),
+    ];
+    return h(Card, { className: "hermes-kanban-summary" },
+      h(CardContent, { className: "hermes-kanban-summary-content" },
+        h("div", { className: "hermes-kanban-summary-header" },
+          h("div", null,
+            h("div", { className: "hermes-kanban-summary-title" },
+              tx(t, "summaryTitle", "Orchestration summary")),
+            h("div", { className: "hermes-kanban-summary-subtitle" },
+              summary.stale
+                ? tx(t, "summaryExpired", "Expired {timestamp}", {
+                  timestamp: summary.expires_at || "unknown",
+                })
+                : tx(t, "summaryGenerated", "Generated {timestamp}", {
+                  timestamp: summary.generated_at || "unknown",
+                })),
+          ),
+          h("div", { className: "hermes-kanban-summary-status" },
+            h(Badge, { className: "hermes-kanban-summary-badge" }, summary.status || "unknown"),
+            summary.stale ? h(Badge, {
+              className: "hermes-kanban-summary-badge hermes-kanban-summary-badge--stale",
+            }, tx(t, "summaryStale", "Stale")) : null,
+          ),
+        ),
+        h("div", { className: "hermes-kanban-summary-metrics" },
+          metrics.map(function (metric) {
+            return h("span", { className: "hermes-kanban-summary-metric", key: metric }, metric);
+          }),
+        ),
+        Array.isArray(summary.lanes) && summary.lanes.length > 0
+          ? h("div", { className: "hermes-kanban-summary-lanes" },
+            summary.lanes.map(function (lane) {
+              return h("div", { className: "hermes-kanban-summary-lane", key: lane.name },
+                h("span", { className: "hermes-kanban-summary-lane-name" }, lane.name),
+                h("span", { className: "hermes-kanban-summary-lane-counts" },
+                  tx(t, "summaryLaneCounts", "run {running} · fail {failed} · ok {success}", {
+                    running: lane.running_count || 0,
+                    failed: lane.failed_count || 0,
+                    success: lane.terminal_successes || 0,
+                  })),
+              );
+            }),
+          )
+          : null,
+      ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // Root page
   // -------------------------------------------------------------------------
 
   function KanbanPage() {
     const { t } = useI18n();
     const kanbanDialogs = useKanbanDialogs(t);
-    const [board, setBoard] = useState(() => readSelectedBoard() || null);
+    // Lazy initializer: the URL is read once on mount, not on re-renders.
+    const [deepLink] = useState(readDeepLinkParams);
+    const [board, setBoard] = useState(() => deepLink.board || readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -642,6 +720,8 @@
     const [config, setConfig] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [boardSummary, setBoardSummary] = useState(null);
+    const [boardSummaryUnavailable, setBoardSummaryUnavailable] = useState(false);
 
     const [tenantFilter, setTenantFilter] = useState("");
     const [assigneeFilter, setAssigneeFilter] = useState("");
@@ -650,7 +730,10 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(null);
+    // ?task= opens that task's drawer on first paint. An unknown id is fine:
+    // the drawer's own 404 handling shows the error inline and stays
+    // closable while the board renders normally behind it.
+    const [selectedTaskId, setSelectedTaskId] = useState(deepLink.task);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
@@ -668,6 +751,7 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+    const summaryRequestRef = useRef(0);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -684,8 +768,31 @@
         .catch(function () { setConfig({ render_markdown: true }); });
     }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
+    // --- fetch published summary without coupling it to board availability ---
+    const loadBoardSummary = useCallback(function () {
+      const request = ++summaryRequestRef.current;
+      if (!board) {
+        setBoardSummary(null);
+        setBoardSummaryUnavailable(false);
+        return Promise.resolve();
+      }
+      return SDK.fetchJSON(`${API}/board-summary?board=${encodeURIComponent(board)}`)
+        .then(function (summary) {
+          if (request !== summaryRequestRef.current) return;
+          setBoardSummary(summary);
+          setBoardSummaryUnavailable(false);
+        })
+        .catch(function (err) {
+          if (request !== summaryRequestRef.current) return;
+          const message = String(err && err.message ? err.message : err || "");
+          setBoardSummary(null);
+          setBoardSummaryUnavailable(!/^404(?:\s|:)/.test(message));
+        });
+    }, [board]);
+
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
+      loadBoardSummary();
       const qs = new URLSearchParams();
       if (tenantFilter) qs.set("tenant", tenantFilter);
       if (includeArchived) qs.set("include_archived", "true");
@@ -700,7 +807,7 @@
           setError(String(err && err.message ? err.message : err));
         })
         .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
+    }, [tenantFilter, includeArchived, board, loadBoardSummary]);
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
@@ -713,16 +820,18 @@
             setBoard(data.current);
             return;
           }
-          // If the stored slug isn't in the list any longer (board was
-          // deleted in the CLI while dashboard was open), fall back to
-          // default so the UI doesn't hang on a 404.
+          // If the selected slug isn't in the list any longer, fall back to
+          // an existing saved board or default so the UI doesn't hang on a
+          // 404. A deep-link fallback is transient: opening a shared link must
+          // never overwrite the recipient's dashboard pin.
           if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
-            setBoard("default");
-            writeSelectedBoard("default");
+            const savedExists = storedBoard && boards.find(function (b) { return b.slug === storedBoard; });
+            setBoard(deepLink.board && savedExists ? storedBoard : "default");
+            if (!deepLink.board) writeSelectedBoard("default");
           }
         })
         .catch(function () { /* non-fatal */ });
-    }, [board]);
+    }, [board, deepLink.board]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
 
@@ -1166,6 +1275,9 @@
       // event cursor so the WS reopens aligned to the new board's
       // latest_event_id on the next loadBoard.
       setBoardData(null);
+      summaryRequestRef.current += 1;
+      setBoardSummary(null);
+      setBoardSummaryUnavailable(false);
       cursorRef.current = 0;
       setLoading(true);
       setBoard(nextSlug);
@@ -1306,6 +1418,10 @@
             return updateBoard(board, payload).then(function () { setShowBoardSettings(false); });
           },
         }) : null,
+        h(OrchestrationSummaryPanel, {
+          summary: boardSummary,
+          unavailable: boardSummaryUnavailable,
+        }),
         h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,
