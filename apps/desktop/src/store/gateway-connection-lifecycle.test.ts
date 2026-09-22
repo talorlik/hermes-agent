@@ -960,9 +960,11 @@ it('does not let a removed connection repopulate the auth rejection', async () =
   }))
 
   let rejectTicket!: (error: Error) => void
+
   const ticket = new Promise<never>((_resolve, reject) => {
     rejectTicket = reject
   })
+
   const getGatewayWsUrlFor = vi.fn(() => ticket)
   installDesktop({ getConnectionFor, getGatewayWsUrlFor })
   const pending = requestGatewayForAgent('cloud', 'default', 'session.list')
