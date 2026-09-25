@@ -1,42 +1,18 @@
 """Structured update receipts + post-update fleet version verification.
 
-Phase 1 of the fleet-update reliability plan (#91277): the updater must
-*prove* its outcome instead of assuming it.
-
-Two additive capabilities, both designed so a failure inside them can never
-break an update (every public entry point is exception-swallowing):
-
-1. **Update receipt** — a machine-readable JSON record of what one
-   ``hermes update`` run discovered, did, skipped (and why), written to
-   ``<HERMES_HOME>/logs/update_receipts/``. Silent-failure classes this
-   makes visible: #88848 (helper died after "success" printed), #74973
-   (restart silently skipped), #85753 (restart phase never ran), #81193
-   (desktop shows failure for a successful update).
-
-2. **Fleet version verification** — after the restart phase, read every
-   profile's ``gateway_state.json``, compare each live gateway's stamped
-   ``code_sha`` (written by ``gateway/status.py`` on every runtime-status
-   write) against the freshly-updated checkout's HEAD, and print a fleet
-   version matrix. Mixed-version fleets (#88654, #69754, #77553, #56717)
-   become a loud, actionable report instead of a latent state.
-
-Deployment-kind awareness (docker/image-managed installs) rides on
-``hermes_cli.version_info.get_code_identity()``: a packaged build reports
-its install-stamp provenance (``source="docker"``/``"nix"``/…) and the
-receipt records that the install is not in-place updatable.
+The updater must *prove* its outcome instead of assuming it. Every public entry point is
+exception-swallowing so a failure inside receipts can never break an update.
 """
 
 from __future__ import annotations
 
-import contextvars
-import copy
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
-import uuid
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -46,36 +22,152 @@ logger = logging.getLogger(__name__)
 _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 COMMAND_BOUNDARY_STOP_REASON = "completed at command boundary"
 
-# Receipt state is per-CONTEXT, not a module global: a nested
-# ``hermes update`` receipt (or one in another thread) must never clobber
-# the outer one, and the boundary finalize must see exactly its own
-# process's receipt. Same pattern as pm.receipt's ContextVars — no
-# manager object.
-_current: contextvars.ContextVar[Optional["UpdateReceipt"]] = contextvars.ContextVar(
-    "update_receipt_current", default=None
-)
+
+UPDATE_QUARANTINE_FILE = ".update-quarantine.json"
 
 
-@contextmanager
-def update_receipt_scope():
-    """Keep the command's finalization guard away from an enclosing update."""
-    token = _current.set(None)
+class UpdateQuarantineResolutionError(RuntimeError):
+    """Raised when a checkout's repository-common quarantine owner is unprovable."""
+
+
+def _metadata_path(parent: Path, raw: str, *, label: str) -> Path:
+    value = raw.strip()
+    if not value or "\x00" in value:
+        raise UpdateQuarantineResolutionError(f"invalid {label}")
+    path = Path(value)
+    return (path if path.is_absolute() else parent / path).resolve()
+
+
+def _read_metadata_path(path: Path, *, parent: Path, label: str) -> Path:
     try:
-        yield
-    finally:
-        _current.reset(token)
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise UpdateQuarantineResolutionError(f"unreadable {label}: {exc}") from exc
+    return _metadata_path(parent, raw, label=label)
 
 
-def current_correlation_id() -> Optional[str]:
-    """The update correlation id in force in this context, or None.
+def _common_dir_from_metadata(checkout_root: Path) -> Path:
+    git_entry = checkout_root / ".git"
+    if git_entry.is_dir():
+        commondir = git_entry / "commondir"
+        if commondir.exists():
+            common = _read_metadata_path(
+                commondir, parent=git_entry, label="Git commondir"
+            )
+            if not common.is_dir():
+                raise UpdateQuarantineResolutionError(
+                    "Git commondir is not a directory"
+                )
+            return common
+        return git_entry.resolve()
 
-    Derived from the OPEN update receipt itself — one source of truth, no
-    duplicate id variable: a nested update's begin replaces the current
-    receipt (so syncs begun under it capture the nested id), and its
-    finalize RESTORES the outer receipt via the ContextVar token (so the
-    outer id comes back for the rest of the outer update)."""
-    current = _current.get()
-    return current.correlation_id if current is not None else None
+    if git_entry.is_file():
+        try:
+            pointer = git_entry.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise UpdateQuarantineResolutionError(
+                f"unreadable .git pointer: {exc}"
+            ) from exc
+        prefix = "gitdir:"
+        if not pointer.startswith(prefix):
+            raise UpdateQuarantineResolutionError("invalid .git pointer")
+        git_dir = _metadata_path(
+            checkout_root, pointer.removeprefix(prefix), label=".git pointer"
+        )
+        if not git_dir.is_dir():
+            raise UpdateQuarantineResolutionError(
+                ".git pointer target is not a directory"
+            )
+        commondir = git_dir / "commondir"
+        if commondir.exists():
+            common = _read_metadata_path(
+                commondir, parent=git_dir, label="Git commondir"
+            )
+            if not common.is_dir():
+                raise UpdateQuarantineResolutionError(
+                    "Git commondir is not a directory"
+                )
+            return common
+        if (git_dir / "HEAD").is_file() and (git_dir / "objects").is_dir():
+            return git_dir
+        raise UpdateQuarantineResolutionError(
+            "linked-worktree Git metadata has no resolvable commondir"
+        )
+
+    if (checkout_root / "HEAD").is_file() and (checkout_root / "objects").is_dir():
+        return checkout_root.resolve()
+    raise UpdateQuarantineResolutionError(
+        "checkout Git common directory is unresolvable"
+    )
+
+
+def update_quarantine_path(checkout_root: Path) -> Path:
+    """Return a marker path shared by every profile using this checkout."""
+    checkout_root = Path(checkout_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout_root), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            check=False,
+        )
+        common_text = result.stdout.strip()
+        if result.returncode == 0 and common_text and "\n" not in common_text:
+            common = _metadata_path(
+                checkout_root, common_text, label="git --git-common-dir output"
+            )
+            if common.is_dir():
+                return common / UPDATE_QUARANTINE_FILE
+    except (Exception, UnicodeError):
+        pass
+    return _common_dir_from_metadata(checkout_root) / UPDATE_QUARANTINE_FILE
+
+
+def write_sync_quarantine(evidence: dict[str, Any], checkout_root: Path) -> Path:
+    """Atomically persist mode-0600 synchronization quarantine evidence."""
+    path = update_quarantine_path(checkout_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"schema": 1, **evidence}, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink()
+        raise
+    return path
+
+
+def read_sync_quarantine(checkout_root: Path) -> dict[str, Any] | None:
+    """Read an existing quarantine marker, returning opaque evidence on corruption."""
+    try:
+        path = update_quarantine_path(checkout_root)
+    except UpdateQuarantineResolutionError as exc:
+        return {"error": f"cannot resolve updater quarantine marker: {exc}"}
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            payload
+            if isinstance(payload, dict)
+            else {"error": "invalid marker payload"}
+        )
+    except Exception as exc:
+        return {"error": f"unreadable quarantine marker: {exc}"}
+
+
+# ``hermes update`` is a single-threaded CLI command; a module singleton lets the 7k-line updater
+# record steps from any depth without threading a handle through every helper.
+_current: Optional["UpdateReceipt"] = None
 
 
 def _utc_now_iso() -> str:
@@ -85,13 +177,15 @@ def _utc_now_iso() -> str:
 def _code_identity(refresh: bool = False) -> dict[str, Any]:
     """Running-code identity, or ``{}`` when the probe fails."""
     with suppress(Exception):
-        from hermes_cli.version_info import get_code_identity
+        from hermes_cli.build_info import get_code_identity
 
         return get_code_identity(refresh=refresh) or {}
     return {}
 
 
-def _str_records(entries: Any, keys: tuple[str, ...], *, pid: bool = False) -> list[dict[str, Any]]:
+def _str_records(
+    entries: Any, keys: tuple[str, ...], *, pid: bool = False
+) -> list[dict[str, Any]]:
     """Dict entries reduced to stringified ``keys`` (plus an int ``pid`` first when requested)."""
     records = []
     for entry in entries:
@@ -108,33 +202,53 @@ class UpdateReceipt:
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {
-            "schema": 1, "started_at": _utc_now_iso(), "finished_at": None,
-            "argv": list(sys.argv), "pid": os.getpid(),
+            "schema": 1,
+            "started_at": _utc_now_iso(),
+            "finished_at": None,
+            "argv": list(sys.argv),
+            "pid": os.getpid(),
             "outcome": "running",  # running | success | partial | failed
-            "pre_update": _code_identity(), "post_update": {},
-            "steps": [], "skips": [], "gateway_restart": {}, "fleet": [],
+            "pre_update": _code_identity(),
+            "post_update": {},
+            "steps": [],
+            "skips": [],
+            "gateway_restart": {},
+            "fleet": [],
         }
-        # The id binds this update to the pm sync receipts begun under it
-        # (pm.receipt captures it via the _correlation ContextVar).
-        self.correlation_id = uuid.uuid4().hex
-        self.data["update_id"] = self.correlation_id
 
     def step(self, name: str, ok: bool, detail: str = "") -> None:
-        self.data["steps"].append({"name": name, "ok": bool(ok), "detail": detail, "at": _utc_now_iso()})
+        self.data["steps"].append({
+            "name": name,
+            "ok": bool(ok),
+            "detail": detail,
+            "at": _utc_now_iso(),
+        })
 
     def skip(self, name: str, reason: str) -> None:
-        self.data["skips"].append({"name": name, "reason": reason, "at": _utc_now_iso()})
+        self.data["skips"].append({
+            "name": name,
+            "reason": reason,
+            "at": _utc_now_iso(),
+        })
 
     def gateway_restart_result(
-        self, *, restarted_services: list | None = None, relaunched_profiles: list | None = None,
-        externally_supervised_profiles: list | None = None, killed_pids: list | None = None,
-        failed_units: list | None = None, incomplete: bool = False, phase_error: str = "",
+        self,
+        *,
+        restarted_services: list | None = None,
+        relaunched_profiles: list | None = None,
+        externally_supervised_profiles: list | None = None,
+        killed_pids: list | None = None,
+        failed_units: list | None = None,
+        incomplete: bool = False,
+        phase_error: str = "",
         fresh_recovery: dict[str, Any] | None = None,
     ) -> None:
         result: dict[str, Any] = {
             "restarted_services": list(restarted_services or []),
             "relaunched_profiles": list(relaunched_profiles or []),
-            "externally_supervised_profiles": list(externally_supervised_profiles or []),
+            "externally_supervised_profiles": list(
+                externally_supervised_profiles or []
+            ),
             "killed_pids": [int(p) for p in (killed_pids or [])],
             "failed_units": [str(u) for u in (failed_units or [])],
             "incomplete": bool(incomplete),
@@ -150,7 +264,8 @@ class UpdateReceipt:
                 for key in ("requested", "verified", "relaunch_attempted", "failed")
             }
             persisted["skipped"] = _str_records(
-                fresh_recovery.get("skipped", []), ("profile", "kind", "supervisor", "reason")
+                fresh_recovery.get("skipped", []),
+                ("profile", "kind", "supervisor", "reason"),
             )
             # ``hermes serve`` hosts tui_gateway and is not a gateway profile, so neither the
             # per-profile buckets above nor the fleet-version matrix can describe it. Persist its
@@ -158,10 +273,13 @@ class UpdateReceipt:
             # receipt keeps claiming a clean recovery the operator's box contradicts.
             serve_units = fresh_recovery.get("serve_units") or {}
             persisted["serve_units"] = {
-                key: [str(unit) for unit in (serve_units.get(key) or [])] for key in ("verified", "failed")
+                key: [str(unit) for unit in (serve_units.get(key) or [])]
+                for key in ("verified", "failed")
             }
             persisted["stale_runtimes"] = _str_records(
-                fresh_recovery.get("stale_runtimes", []), ("kind", "profile", "supervisor"), pid=True
+                fresh_recovery.get("stale_runtimes", []),
+                ("kind", "profile", "supervisor"),
+                pid=True,
             )
             result["fresh_recovery"] = persisted
         self.data["gateway_restart"] = result
@@ -181,43 +299,42 @@ def _receipt_dir() -> Path:
     return get_hermes_home() / "logs" / "update_receipts"
 
 
-def begin_update_receipt(*, previous: dict | None = None, correlation_id: str | None = None) -> None:
-    """Start recording a new update receipt.
-
-    Nested updates are safe: the previous receipt (if any) is preserved
-    behind the ContextVar token and comes back when this one finalizes —
-    a nested begin/finalize never drops the outer update's receipt or
-    correlation. Never raises."""
+def begin_update_receipt() -> None:
+    """Start recording a new update receipt. Never raises."""
+    global _current
     try:
-        receipt = UpdateReceipt()
-        if previous:
-            receipt.data.update(copy.deepcopy(previous))
-        receipt.correlation_id = correlation_id or receipt.correlation_id
-        receipt.data.update(update_id=receipt.correlation_id, outcome="running", finished_at=None)
+        _current = UpdateReceipt()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
-        return
-    receipt.current_token = _current.set(receipt)
+        _current = None
+
+
+def detach_update_receipt() -> Optional[dict[str, Any]]:
+    """Hand the open receipt to another process: return its data and forget it here.
+
+    The post-swap child resumes it via :func:`resume_update_receipt`; the parent's
+    command-boundary finalize then no-ops, so the run still produces exactly one receipt.
+    """
+    global _current
+    receipt, _current = _current, None
+    return None if receipt is None else receipt.data
+
+
+def resume_update_receipt(data: dict[str, Any]) -> None:
+    """Continue a receipt detached by the pre-swap interpreter (``started_at``, ``pre_update``,
+    ``argv``, steps and plan intact); records this process as the one that finished it."""
+    global _current
+    receipt = UpdateReceipt()
+    receipt.data = data
+    receipt.data["post_swap_pid"] = os.getpid()
+    _current = receipt
 
 
 def _record(method: str, what: str, *args: Any, **kwargs: Any) -> None:
-    """Invoke ``method`` on the active receipt; no-op when none, never raises.
-
-    Copy-on-write, same rule as pm.receipt: a copied context (copy_context,
-    asyncio.to_thread) inherits the SAME receipt object — mutate a clone
-    and re-set it in THIS context only, so a child's records never leak
-    into (or corrupt) the parent's receipt.
-    """
+    """Invoke ``method`` on the active receipt; no-op when none, never raises."""
     try:
-        import copy
-
-        current = _current.get()
-        if current is None:
-            return
-        clone = copy.copy(current)
-        clone.data = copy.deepcopy(current.data)
-        getattr(clone, method)(*args, **kwargs)
-        _current.set(clone)
+        if _current is not None:
+            getattr(_current, method)(*args, **kwargs)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not record %s: %s", what, exc)
 
@@ -237,83 +354,36 @@ def record_gateway_restart(**kwargs: Any) -> None:
     _record("gateway_restart_result", "gateway restart result", **kwargs)
 
 
-def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason: str = "") -> Optional[Path]:
+def finalize_update_receipt(
+    outcome: str, fleet: list | None = None, stop_reason: str = ""
+) -> Optional[Path]:
     """Finalize + persist the receipt (``success``/``partial``/``failed``/``refused``); path or None.
 
-    Exactly-once by construction: the context's receipt is popped first, so a second call (e.g. the
+    Exactly-once by construction: the module singleton is popped first, so a second call (e.g. the
     command-boundary safety net after an inner path already finalized) is a no-op returning None.
-    The receipt is popped via its OWN begin token, so a nested update's finalize RESTORES the outer
-    update's open receipt and correlation instead of discarding them.
     """
-    current = _current.get()
-    if current is None:
+    global _current
+    receipt = _current
+    _current = None
+    if receipt is None:
         return None
-    receipt = copy.copy(current)
-    receipt.data = copy.deepcopy(current.data)
-    token = getattr(receipt, "current_token", None)
-    try:
-        if token is not None:
-            _current.reset(token)
-        else:  # pragma: no cover - receipts begun before token binding
-            _current.set(None)
-    except ValueError:
-        # Token from another context (finalize ran in a copied context) —
-        # pop THIS context only, so exactly-once still holds.
-        _current.set(None)
     try:
         receipt.finalize(outcome)
         if stop_reason:
             receipt.data["stop_reason"] = stop_reason
         if fleet is not None:
             receipt.data["fleet"] = fleet
-        # Manual serve restart obligations outlive one receipt rotation: carry the previous
-        # receipt's still-pending rows forward so the startup warning survives (see
-        # update_serve_obligations).
         from hermes_cli.update_serve_obligations import retain_receipt_manual_serves
         pending = retain_receipt_manual_serves(read_latest_receipt() or {})
         if pending:
             receipt.data["pending_manual_serves"] = pending
-        # EMBED the pm sync sections (the settled receipts contract): the
-        # update's rebuild/bisect ran through pm's own sync receipt, which
-        # finalizes before this one. Fold in only the completion filed
-        # under THIS update's correlation id (pm.receipt.last_for_update,
-        # per-context, never latest.json) — a sync from before this update
-        # began, a standalone sync, or one in a concurrent thread cannot
-        # be misattributed, and a nested update's sync cannot displace
-        # this update's own. ONE file still carries the whole story
-        # (desktop reads a single latest.json).
-        try:
-            from pm import receipt as pm_receipt
-
-            sync = pm_receipt.last_for_update(receipt.correlation_id, consume=True)
-            if isinstance(sync, dict):
-                for key in ("venv_rebuild", "plugin_bisect", "feature_list", "steps", "exit_code"):
-                    if sync.get(key) is not None:
-                        receipt.data[f"pm_{key}"] = sync[key]
-                if sync.get("outcome") is not None:
-                    receipt.data["pm_sync_outcome"] = sync.get("outcome")
-                if sync.get("warnings"):
-                    receipt.data["pm_warnings"] = sync["warnings"]
-                if sync.get("refusal") is not None:
-                    receipt.data["pm_refusal"] = sync["refusal"]
-        except Exception as exc:  # pragma: no cover — embedding is additive
-            logger.debug("pm sync-section embed skipped: %s", exc)
         directory = _receipt_dir()
         directory.mkdir(parents=True, exist_ok=True)
-        # Unique name: stamp+pid collides for nested/concurrent receipts in
-        # the same process+second — the correlation id makes the name unique
-        # per update run. Atomic write for BOTH the stamped receipt and the
-        # latest.json pointer (no torn readers).
-        from hermes_cli.runtime_state import _atomic_bytes
-
-        path = directory / (
-            f"update_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}_"
-            f"{receipt.correlation_id}.json"
-        )
-        payload = (json.dumps(receipt.data, indent=2, default=str) + "\n").encode("utf-8")
-        _atomic_bytes(path, payload)
-        with suppress(Exception):  # stable pointer for the dashboard/desktop
-            _atomic_bytes(directory / "latest.json", payload)
+        path = directory / f"update_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.json"
+        body = json.dumps(receipt.data, indent=2, default=str)
+        path.write_text(body, encoding="utf-8")
+        with suppress(OSError):  # stable pointer for the dashboard/desktop
+            (directory / "latest.json").write_text(body, encoding="utf-8")
         _prune_old_receipts(directory)
         return path
     except Exception as exc:
@@ -324,7 +394,9 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
         return None
 
 
-def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason: str = "") -> Optional[Path]:
+def finalize_pending_update_receipt(
+    exit_code: Optional[int] = None, stop_reason: str = ""
+) -> Optional[Path]:
     """Command-boundary safety net: persist a still-open receipt, if any. Never raises.
 
     ``hermes update`` has many early ``sys.exit`` paths (preflight refusals, venv-holder refusal,
@@ -333,77 +405,50 @@ def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason
     (preflight convention), else → ``failed``.
 
     No-op when no receipt is open (the inner paths already finalized — exactly-once via the popped
-    per-context receipt) or when recording was never started. See #91283.
+    singleton) or when recording was never started. See #91283.
     """
-    current = _current.get()
-    if current is None:
+    if _current is None:
         return None
-    outcome = "success" if exit_code in (0, None) else "refused" if exit_code == 2 else "failed"
+    outcome = (
+        "success"
+        if exit_code in (0, None)
+        else "refused"
+        if exit_code == 2
+        else "failed"
+    )
     if exit_code is not None:
         with suppress(Exception):
-            clone = copy.copy(current)
-            clone.data = copy.deepcopy(current.data)
-            clone.data["exit_code"] = int(exit_code)
-            _current.set(clone)
+            _current.data["exit_code"] = int(exit_code)
     return finalize_update_receipt(outcome, stop_reason=stop_reason)
 
 
 def _prune_old_receipts(directory: Path) -> None:
     with suppress(Exception):
         receipts = (p for p in directory.glob("update_*.json") if p.is_file())
-        for stale in sorted(receipts, key=lambda p: p.stat().st_mtime, reverse=True)[_RECEIPT_KEEP:]:
+        for stale in sorted(receipts, key=lambda p: p.stat().st_mtime, reverse=True)[
+            _RECEIPT_KEEP:
+        ]:
             with suppress(OSError):
                 stale.unlink()
-
-
-def settle_latest_receipt_fleet(fleet: list[dict[str, Any]], *, discharges) -> bool:
-    """Record on ``latest.json`` that the fleet it still reports as owed now serves the checkout.
-
-    A failed receipt whose plan rows cannot be matched to a live gateway (unknown identity,
-    pre-pull SHAs) keeps ``hermes update`` exiting 1 and every CLI start warning about mixed
-    modules, long after the operator's ``hermes gateway restart`` fixed the fleet (#117051). The
-    caller has just verified every live row is current at the checkout SHA; persisting that
-    matrix as the receipt's post-restart ``fleet`` (and un-flagging ``gateway_restart``) is what
-    lets the stale-runtime readers see the recovery. ``discharges(settled_receipt)`` decides on
-    the in-memory copy; ``latest.json`` is rewritten only when it answers True, so a catch-up
-    that still exits 1 leaves the receipt byte-identical. Only the ``latest.json`` pointer is
-    rewritten; the archived per-run file keeps the original outcome. Never raises.
-    """
-    try:
-        path = _receipt_dir() / "latest.json"
-        receipt = json.loads(path.read_text(encoding="utf-8-sig"))
-        if not isinstance(receipt, dict):
-            return False
-        receipt["fleet"] = list(fleet)
-        gateway_restart = receipt.get("gateway_restart")
-        if not isinstance(gateway_restart, dict):
-            gateway_restart = {}
-        gateway_restart.update({"incomplete": False, "phase_error": ""})
-        gateway_restart["settled_from_live_fleet_at"] = _utc_now_iso()
-        receipt["gateway_restart"] = gateway_restart
-        if not discharges(receipt):
-            return False
-        path.write_text(json.dumps(receipt, indent=2, default=str), encoding="utf-8")
-        return True
-    except Exception as exc:
-        logger.debug("Could not settle latest update receipt from the live fleet: %s", exc)
-        return False
 
 
 def read_latest_receipt() -> Optional[dict[str, Any]]:
     """Read the most recent update receipt, or None. Never raises."""
     with suppress(Exception):
         path = _receipt_dir() / "latest.json"
-        if not path.is_file():
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        return payload if isinstance(payload, dict) else None
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else None
     return None
 
 
 def _profile_homes() -> list[tuple[str, Path]]:
     """``(profile, home)`` for the default home plus every valid named profile dir, sorted."""
-    from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root, _PROFILE_ID_RE
+    from hermes_cli.profiles import (
+        _get_default_hermes_home,
+        _get_profiles_root,
+        _PROFILE_ID_RE,
+    )
 
     homes: list[tuple[str, Path]] = []
     default_home = _get_default_hermes_home()
@@ -414,7 +459,9 @@ def _profile_homes() -> list[tuple[str, Path]]:
         homes.extend(
             (entry.name, entry)
             for entry in sorted(root.iterdir())
-            if entry.is_dir() and entry.name != "default" and _PROFILE_ID_RE.match(entry.name)
+            if entry.is_dir()
+            and entry.name != "default"
+            and _PROFILE_ID_RE.match(entry.name)
         )
     return homes
 
@@ -429,6 +476,8 @@ def _socket_identity(home: Path) -> Optional[tuple[int, dict]]:
     try:
         # Prefer the gateway-owned control socket (#92091): identity declared by the process itself,
         # including its own supervisor provenance — no argv/PID inference. Scan fallback below.
+        # Prefer the gateway-owned control socket (#92091): a live `identify` answer is authoritative — no
+        # PID-reuse or stale-file heuristics.
         from gateway.control_socket import identify_gateway
 
         identity = identify_gateway(home)
@@ -437,89 +486,15 @@ def _socket_identity(home: Path) -> Optional[tuple[int, dict]]:
         return None
 
 
-_CODE_ROOT_MAX_DEPTH = 8
-
-
-def _code_root_for_path(raw: Any) -> Optional[Path]:
-    """Return the Hermes checkout containing an absolute process path."""
-    if not isinstance(raw, str) or not raw:
-        return None
-    with suppress(Exception):
-        candidate = Path(raw)
-        if not candidate.is_absolute():
-            return None
-        for parent in [candidate, *candidate.parents][:_CODE_ROOT_MAX_DEPTH]:
-            if (parent / "hermes_cli" / "main.py").is_file():
-                return parent.resolve()
-    return None
-
-
-def _updater_code_root() -> Optional[Path]:
-    return _code_root_for_path(str(Path(__file__).resolve()))
-
-
-def _gateway_code_root(pid: int, home: Path) -> Optional[Path]:
-    """Resolve the checkout served by a verified live gateway when possible."""
-    # Older gateways cannot publish a new identity field, but their pid-guarded
-    # status record already carries sys.argv (whose first item is the resolved
-    # module path for ``python -m`` launches).
-    with suppress(Exception):
-        from gateway.status import read_runtime_status
-
-        record = read_runtime_status(home / "gateway_state.json") or {}
-        if int(record.get("pid")) == pid:
-            for probe in record.get("argv") or []:
-                root = _code_root_for_path(probe)
-                if root:
-                    return root
-
-    with suppress(Exception):
-        import psutil  # type: ignore
-
-        process = psutil.Process(pid)
-        with suppress(Exception):
-            root = _code_root_for_path((process.environ() or {}).get("VIRTUAL_ENV"))
-            if root:
-                return root
-        probes: list[Any] = []
-        with suppress(Exception):
-            probes.append(process.exe())
-        with suppress(Exception):
-            probes.extend(process.cmdline() or [])
-        for probe in probes:
-            root = _code_root_for_path(probe)
-            if root:
-                return root
-    return None
-
-
-EXTERNAL_STATE = "external"
-# A gateway this updater runs INSIDE that accepted a self-restart request: it is still on the
-# pre-update code by construction and restarts once the updater exits (#100179 / #119597).
-RESTART_PENDING_STATE = "restart_pending"
-
-
-def row_is_external(row: Any) -> bool:
-    """Whether a fleet row serves a checkout this update did not touch."""
-    return isinstance(row, dict) and row.get("state") == EXTERNAL_STATE
-
-
 def _fleet_row(
     profile: str, pid: int, code_sha: Any, code_version: Any, expected_sha: Any,
-    state: str = "unknown", code_root: Optional[Path] = None,
-    expected_root: Optional[Path] = None, served_profiles: Any = None,
-    self_restart_pending: Optional[set] = None,
+    state: str = "unknown", served_profiles: Any = None,
 ) -> dict[str, Any]:
-    if state == "unknown" and code_root and expected_root and code_root != expected_root:
-        state = EXTERNAL_STATE
     if state == "unknown" and code_sha and expected_sha:
         state = "current" if str(code_sha) == str(expected_sha) else "stale"
-    if state == "stale" and self_restart_pending and pid in self_restart_pending:
-        state = RESTART_PENDING_STATE
     row = {
         "profile": profile, "pid": pid, "code_sha": str(code_sha) if code_sha else None,
         "code_version": code_version, "state": state,
-        "code_root": str(code_root) if code_root else None,
     }
     # A live, identity-verified multiplexer represents every profile in this
     # list. Keep the field only when its shape is usable: callers use it to
@@ -537,15 +512,9 @@ _NOT_EXPECTED_STATES = {"stopped", "startup_failed"}
 
 
 def collect_fleet_versions(
-    *, pre_restart_pids: Optional[list[int]] = None, self_restart_pending: Optional[set] = None,
+    *, pre_restart_pids: Optional[list[int]] = None
 ) -> list[dict[str, Any]]:
     """Snapshot every profile's gateway code identity vs. the current tree.
-
-    ``self_restart_pending`` — pids of gateways that are ancestors of this updater and accepted a
-    self-restart request (cron update inside the gateway tree, #100179). They can only restart after
-    this process exits, so their pre-update ``code_sha`` is expected: such a row is
-    ``restart_pending`` instead of ``stale`` and does not fail the matrix (#119597). Every other
-    live gateway on the old sha keeps its ``stale`` verdict.
 
     Rollout safety: ``down`` requires membership in ``pre_restart_pids`` — a stale state file from a
     long-dead gateway (machine reboot, manual kill weeks ago) must NOT fail every future update.
@@ -563,10 +532,8 @@ def collect_fleet_versions(
     verification gap, #88848/#74973 class).
     """
     _pre_restart = {int(p) for p in (pre_restart_pids or []) if isinstance(p, int)}
-    _pending = {int(p) for p in (self_restart_pending or ()) if isinstance(p, int)}
     results: list[dict[str, Any]] = []
     expected_sha = _code_identity(refresh=True).get("sha")
-    expected_root = _updater_code_root()
     try:
         from gateway.status import (
             live_gateway_pid_for_home,
@@ -581,8 +548,6 @@ def collect_fleet_versions(
                 row = _fleet_row(
                     profile, pid, identity.get("code_sha"), identity.get("code_version"), expected_sha,
                     served_profiles=identity.get("served_profiles"),
-                    code_root=_gateway_code_root(pid, home), expected_root=expected_root,
-                    self_restart_pending=_pending,
                 )
                 results.append({**row, "source": "socket"})
                 continue
@@ -601,8 +566,6 @@ def collect_fleet_versions(
                     _fleet_row(
                         profile, pid, record.get("code_sha"), record.get("code_version"), expected_sha,
                         served_profiles=record.get("served_profiles"),
-                        code_root=_gateway_code_root(pid, home), expected_root=expected_root,
-                        self_restart_pending=_pending,
                     )
                 )
                 continue
@@ -622,8 +585,22 @@ def collect_fleet_versions(
             # could still mislabel B as down — inherent to the snapshot's data model.
             # See #93258.
             gw_state = record.get("gateway_state")
-            if pid in _pre_restart and isinstance(gw_state, str) and gw_state and gw_state not in _NOT_EXPECTED_STATES:
-                results.append(_fleet_row(profile, pid, None, record.get("code_version"), None, state="down"))
+            if (
+                pid in _pre_restart
+                and isinstance(gw_state, str)
+                and gw_state
+                and gw_state not in _NOT_EXPECTED_STATES
+            ):
+                results.append(
+                    _fleet_row(
+                        profile,
+                        pid,
+                        None,
+                        record.get("code_version"),
+                        None,
+                        state="down",
+                    )
+                )
     except Exception as exc:
         logger.debug("Fleet version probe failed: %s", exc)
     return results
@@ -633,11 +610,6 @@ _FLEET_ROW_LINES = {
     "current": "  ✓ {profile} (pid {pid}) @ {short} — up to date",
     "stale": "  ✗ {profile} (pid {pid}) @ {short} — STALE (pre-update code)",
     "down": "  ✗ {profile} — DOWN (gateway was running before the update; pid {pid} is gone and nothing replaced it)",
-    "external": "  ◆ {profile} (pid {pid}) @ {short} — separate checkout, not updated by this run",
-    RESTART_PENDING_STATE: (
-        "  ↻ {profile} (pid {pid}) @ {short} — restart pending (deferred until this process exits;"
-        " the update runs inside this gateway)"
-    ),
 }
 _FLEET_ROW_UNKNOWN = "  ? {profile} (pid {pid}) — version unknown (gateway predates version stamping; restart to enable)"
 # A gateway pid the pre-update snapshot did not know that had not published its code identity when
@@ -657,33 +629,20 @@ def print_fleet_version_matrix(fleet: list[dict[str, Any]]) -> bool:
     provably down (killed by the restart phase, nothing came back), so the caller can escalate.
     ``unknown`` entries are reported but do NOT fail the update: gateways started before the
     code-identity stamp existed have no sha to compare, and failing them would be a false-positive
-    storm. ``restart_pending`` entries (the gateway this updater runs inside, self-restart
-    accepted) are on the old code by construction and do not fail it either (#119597).
+    storm.
     """
     if not fleet:
         return False
     print()
     print("Fleet version check:")
     states = set()
-    external_roots: list[str] = []
     for entry in fleet:
         sha = entry.get("code_sha")
         states.add(entry.get("state"))
-        if row_is_external(entry) and entry.get("code_root"):
-            external_roots.append(f"{entry.get('profile')}: {entry.get('code_root')}")
         fallback = _FLEET_ROW_IDENTITY_PENDING if entry.get("identity_pending") else _FLEET_ROW_UNKNOWN
         print(_FLEET_ROW_LINES.get(entry.get("state"), fallback).format(
             profile=entry.get("profile"), pid=entry.get("pid"), short=sha[:8] if isinstance(sha, str) and sha else "?",
         ))
-    if external_roots:
-        print()
-        print("  ℹ These profiles run their own checkout and are updated separately:")
-        for line in external_roots:
-            print(f"      {line}")
-    if RESTART_PENDING_STATE in states:
-        print()
-        print("  ℹ A restart-pending gateway picks up the new code as soon as this update exits;")
-        print("    verify afterwards with `hermes gateway status`.")
     stale_or_down = sum(1 for entry in fleet if entry.get("state") in ("stale", "down"))
     if stale_or_down:
         print()

@@ -17,8 +17,54 @@ from hermes_cli import main as hermes_main
 import hermes_cli.main_web_build as main_web_build
 import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
+from hermes_cli import update_cmd_fleet
 
-def _make_head_pinned_side_effect(sha="abc123"):
+
+_PRE_UPDATE_SHA = "a" * 40
+_POST_UPDATE_SHA = "b" * 40
+
+
+def _make_head_moved_side_effect(
+    pre_sha: str = _PRE_UPDATE_SHA,
+    post_sha: str = _POST_UPDATE_SHA,
+):
+    """Simulate git commands where HEAD advances from pre_sha to post_sha."""
+    state = {"head": pre_sha}
+
+    def side_effect(cmd, **kwargs):
+        joined = " ".join(str(c) for c in cmd)
+
+        # git rev-parse --abbrev-ref HEAD  (get current branch)
+        if "rev-parse" in joined and "--abbrev-ref" in joined:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
+
+        # git rev-list HEAD..origin/main --count  (behind count)
+        if "rev-list" in joined:
+            return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+
+        if "merge --ff-only origin/main" in joined:
+            state["head"] = post_sha
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        if joined.endswith("rev-parse HEAD"):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{state['head']}\n",
+                stderr="",
+            )
+
+        # Everything else (merge, checkout, etc.) succeeds quietly.
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return side_effect
+
+
+def _make_head_pinned_side_effect(sha: str = _PRE_UPDATE_SHA):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
 
     def side_effect(cmd, **kwargs):
@@ -26,6 +72,11 @@ def _make_head_pinned_side_effect(sha="abc123"):
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")
+
+        if "rev-parse" in joined and "--absolute-git-dir" in joined:
+            return SimpleNamespace(
+                returncode=0, stdout="/tmp/hermes-update-test.git\n", stderr=""
+            )
 
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
@@ -36,6 +87,7 @@ def _make_head_pinned_side_effect(sha="abc123"):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect
+
 
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch the hermes_cli.main helpers ``_cmd_update_impl`` touches.
@@ -94,8 +146,26 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_gateway, "supports_systemd_services", lambda: False
     )
     monkeypatch.setattr(
+        update_cmd_fleet,
+        "_restart_macos_launchd_gateways",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+
+
+def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
+    """When the pull advances HEAD, the update proceeds normally."""
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+
+    hermes_main.cmd_update(args)  # completes normally (no SystemExit)
+
+    out = capsys.readouterr().out
+    assert "✓ Code updated!" in out
+    assert "Code did not move" not in out
+
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     """A detached/pinned HEAD that never moves must fail loudly, not print
@@ -108,4 +178,6 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
 
     assert exc_info.value.code == 1
     out = capsys.readouterr().out
+    assert "Code did not move" in out
     assert "✓ Code updated!" not in out
+    assert "checkout main" in out
