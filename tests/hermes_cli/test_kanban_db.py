@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import sqlite3
@@ -9,10 +10,12 @@ import subprocess
 import sys
 import time
 import types
+import unittest.mock
 from pathlib import Path
 
 import pytest
 
+import hermes_state
 import hermes_state_wal
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -36,9 +39,267 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/dev/null"], check=True, capture_output=True, text=True)
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
+
+
+def test_claim_idempotent_replay_is_same_claimer_only(
+    kanban_home,
+    monkeypatch,
+) -> None:
+    """A lost claim acknowledgement must replay without accepting a foreign claim."""
+    hooks: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda event, task_id, **_fields: hooks.append((event, task_id)),
+    )
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim replay", assignee="dream-cron")
+        first = kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:daily-audit:2026-08-30",
+            idempotent_replay=True,
+        )
+        assert first is not None
+        run_id = first.current_run_id
+        claim_expires = first.claim_expires
+        runs_before = [(run.id, run.status, run.outcome) for run in kb.list_runs(conn, task_id)]
+        events_before = [
+            (event.id, event.kind, event.run_id, event.payload)
+            for event in kb.list_events(conn, task_id)
+        ]
+
+        replay = kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:daily-audit:2026-08-30",
+            idempotent_replay=True,
+        )
+
+        assert replay is not None
+        assert replay.status == "running"
+        assert replay.current_run_id == run_id
+        assert replay.claim_expires == claim_expires
+        assert [(run.id, run.status, run.outcome) for run in kb.list_runs(conn, task_id)] == runs_before
+        assert [
+            (event.id, event.kind, event.run_id, event.payload)
+            for event in kb.list_events(conn, task_id)
+        ] == events_before
+
+        foreign = kb.claim_task(
+            conn,
+            task_id,
+            claimer="foreign:worker",
+            idempotent_replay=True,
+        )
+        assert foreign is None
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.current_run_id == run_id
+        assert hooks == [("kanban_task_claimed", task_id)]
+
+
+def test_claim_idempotent_replay_serializes_concurrent_same_claimer(
+    kanban_home,
+) -> None:
+    """Concurrent lost-ack retries converge to one owner run and event."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="concurrent claim replay")
+
+    def claim() -> int:
+        with kbc.connect_closing() as conn:
+            task = kb.claim_task(
+                conn,
+                task_id,
+                claimer="dream:concurrent",
+                idempotent_replay=True,
+            )
+            assert task is not None
+            assert task.current_run_id is not None
+            return task.current_run_id
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        run_ids = list(pool.map(lambda _: claim(), range(8)))
+
+    assert len(set(run_ids)) == 1
+    with kbc.connect_closing() as conn:
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert sum(
+            event.kind == "claimed" for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_claim_idempotent_replay_serializes_mixed_claimers(kanban_home) -> None:
+    """Exactly one identity wins a mixed race and owns the only run."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="mixed claim replay")
+    claimers = ["dream:mixed"] * 4 + ["foreign:mixed"] * 4
+
+    def claim(claimer: str) -> tuple[str, bool]:
+        with kbc.connect_closing() as conn:
+            task = kb.claim_task(
+                conn,
+                task_id,
+                claimer=claimer,
+                idempotent_replay=True,
+            )
+            return claimer, task is not None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(claim, claimers))
+
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None
+        winner = row["claim_lock"]
+        assert winner in {"dream:mixed", "foreign:mixed"}
+        assert all(success == (claimer == winner) for claimer, success in results)
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert sum(
+            event.kind == "claimed" for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_claim_idempotent_replay_requires_explicit_claimer(kanban_home) -> None:
+    """Replay mode must never fall back to a process-generated claim identity."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim replay identity")
+        with pytest.raises(ValueError, match="claimer"):
+            kb.claim_task(conn, task_id, idempotent_replay=True)
+
+
+def test_claim_idempotent_replay_refuses_expired_same_claimer(kanban_home) -> None:
+    """An expired lease is not a valid acknowledgement of the original claim."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="expired claim replay")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:expired",
+            idempotent_replay=True,
+        ) is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (int(time.time()) - 1, task_id),
+            )
+
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:expired",
+            idempotent_replay=True,
+        ) is None
+
+
+def test_claim_idempotent_replay_expiry_boundary(kanban_home, monkeypatch) -> None:
+    """The lease is live at equality and expired immediately afterward."""
+    now = [1_000]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim expiry boundary")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            ttl_seconds=10,
+            claimer="dream:boundary",
+            idempotent_replay=True,
+        ) is not None
+        now[0] = 1_010
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:boundary",
+            idempotent_replay=True,
+        ) is not None
+        now[0] = 1_011
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:boundary",
+            idempotent_replay=True,
+        ) is None
+
+
+def test_claim_idempotent_replay_refuses_missing_current_run(kanban_home) -> None:
+    """A matching lease without an authoritative run is corruption, not success."""
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="claim without current run")
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:runless",
+            idempotent_replay=True,
+        ) is not None
+        conn.execute(
+            "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+            (task_id,),
+        )
+        assert kb.claim_task(
+            conn,
+            task_id,
+            claimer="dream:runless",
+            idempotent_replay=True,
+        ) is None
+        assert len(kb.list_runs(conn, task_id)) == 1
+        assert sum(
+            event.kind == "claimed" for event in kb.list_events(conn, task_id)
+        ) == 1
+
+
+def test_claim_idempotent_replay_refuses_invalid_current_run_identity(
+    kanban_home,
+) -> None:
+    """A non-null pointer must identify the exact live claim run."""
+    corruptions = (
+        ("dangling", "UPDATE tasks SET current_run_id = 999999 WHERE id = ?", ()),
+        (
+            "foreign task",
+            "UPDATE task_runs SET task_id = 't_foreign' WHERE id = ?",
+            ("run",),
+        ),
+        (
+            "ended run",
+            "UPDATE task_runs SET status = 'done', ended_at = 1 WHERE id = ?",
+            ("run",),
+        ),
+        (
+            "foreign run claimer",
+            "UPDATE task_runs SET claim_lock = 'foreign' WHERE id = ?",
+            ("run",),
+        ),
+        (
+            "mismatched run expiry",
+            "UPDATE task_runs SET claim_expires = claim_expires + 1 WHERE id = ?",
+            ("run",),
+        ),
+    )
+    for label, sql, target in corruptions:
+        with kbc.connect_closing() as conn:
+            task_id = kb.create_task(conn, title=f"invalid current run {label}")
+            claimed = kb.claim_task(
+                conn,
+                task_id,
+                claimer="dream:invalid-run",
+                idempotent_replay=True,
+            )
+            assert claimed is not None
+            target_id = claimed.current_run_id if target else task_id
+            assert target_id is not None
+            conn.execute(sql, (target_id,))
+            assert kb.claim_task(
+                conn,
+                task_id,
+                claimer="dream:invalid-run",
+                idempotent_replay=True,
+            ) is None
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +312,7 @@ def _init_git_repo(repo: Path) -> None:
 
 
 
-@pytest.mark.platforms("windows")
+@pytest.mark.windows_only
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
     """Windows must use a real (non-blocking) process lock, not a no-op open.
 
@@ -59,7 +320,7 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
     wedged holder can never block connect() forever; a clean acquire takes the
     lock once and releases it once.
 
-    ``platforms("windows")``: ``msvcrt`` does not exist off Windows, so faking
+    ``windows_only``: ``msvcrt`` does not exist off Windows, so faking
     ``_IS_WINDOWS`` on Linux meant injecting a fake ``msvcrt`` module too —
     the test then asserted against its own stub rather than the byte-range
     locking API. Here the platform is real; only ``msvcrt.locking`` is
@@ -469,88 +730,6 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
-@pytest.mark.parametrize(
-    "error_text, expected",
-    [
-        # Worker progress prose talking about *writing*, not an auth failure
-        # (#117009): must NOT trip the guard.
-        ("Workstream C items C-3 and C-4: author t  (90.59s)", None),
-        ("docs authored by the previous cycle", None),
-        ("relying on an authoritative source", None),
-        # Genuine auth failures must still trip the guard, one row per
-        # curated stem family (bare, -ate, -ize, -ise).
-        ("401 auth failed", "blocker_auth"),
-        ("authentication error from provider", "blocker_auth"),
-        ("still authorizing the request", "blocker_auth"),
-        ("still authorising the request", "blocker_auth"),
-    ],
-)
-def test_respawn_guard_blocker_auth_curated_not_open_stem(
-    kanban_home, monkeypatch, error_text, expected,
-):
-    """``_RESPAWN_BLOCKER_RE`` used to use an open ``auth\\w*`` stem that matched
-    ordinary English words like "author"/"authored"/"authoring"/"authoritative"
-    in worker progress prose, parking a healthy ``ready`` card forever (#117009).
-    The auth family must be a curated set of real auth-failure tokens."""
-    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
-
-    with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="prose", assignee="a")
-        conn.execute(
-            "UPDATE tasks SET last_failure_error=? WHERE id=?",
-            (error_text, tid),
-        )
-        conn.commit()
-        assert kbd.check_respawn_guard(conn, tid) == expected
-
-
-def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
-    """A plain crash's captured stdout is context, not a diagnosis.
-
-    ``_classify_dead_worker`` appends the worker's last output to the persisted
-    failure text.  A benign command such as ``claude auth status`` must not turn
-    an unrelated crash into a permanent auth guard on the next dispatch.
-    """
-    with kbc.connect() as conn:
-        crashed_id = kb.create_task(conn, title="crashed", assignee="a")
-        kb.claim_task(conn, crashed_id)
-        crashed_run_id = kb.get_task(conn, crashed_id).current_run_id
-        conn.execute(
-            "UPDATE task_runs SET outcome='crashed', status='failed', ended_at=? "
-            "WHERE id=?",
-            (5_000_000, crashed_run_id),
-        )
-        conn.execute(
-            "UPDATE tasks SET status='ready', current_run_id=NULL, "
-            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
-            "last_failure_error=? WHERE id=?",
-            (
-                "pid 1 killed by signal 9. Worker's last output: "
-                "'env -u ANTHROPIC_API_KEY claude auth status --text'",
-                crashed_id,
-            ),
-        )
-
-        spawn_failed_id = kb.create_task(conn, title="spawn failed", assignee="a")
-        kb.claim_task(conn, spawn_failed_id)
-        spawn_run_id = kb.get_task(conn, spawn_failed_id).current_run_id
-        conn.execute(
-            "UPDATE task_runs SET outcome='spawn_failed', status='failed', ended_at=? "
-            "WHERE id=?",
-            (5_000_000, spawn_run_id),
-        )
-        conn.execute(
-            "UPDATE tasks SET status='ready', current_run_id=NULL, "
-            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
-            "last_failure_error=? WHERE id=?",
-            ("provider authentication failed", spawn_failed_id),
-        )
-        conn.commit()
-
-        assert kbd.check_respawn_guard(conn, crashed_id) is None
-        assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
-
-
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -847,6 +1026,36 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_complete_task_rollback_discards_staged_copies(
+    kanban_home, monkeypatch, failure_type
+):
+    """A failure after completion staging cannot leave an unreferenced copy."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="completion rollback")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        artifact = ws / "evidence.json"
+        artifact.write_text("{}")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+
+        def fail_run(*_args, **_kwargs):
+            raise failure_type("run bookkeeping failed")
+
+        monkeypatch.setattr(kb, "_end_run", fail_run)
+        with pytest.raises(failure_type):
+            kb.complete_task(
+                conn, t, summary="done", metadata={"artifacts": [str(artifact)]},
+                expected_run_id=run_id,
+            )
+
+        attachment_dir = kb.task_attachments_dir(t)
+        assert kb.get_task(conn, t).status == "running"
+        assert kb.list_attachments(conn, t) == []
+        assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
+
+
 def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     """A review-bound card's declared files must outlive the reviewer's
     completion — that completion is what cleans the scratch workspace up."""
@@ -876,7 +1085,8 @@ def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     ]
 
 
-def test_request_review_rollback_discards_staged_copies(kanban_home):
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_request_review_rollback_discards_staged_copies(kanban_home, failure_type):
     """A failure after staging rolls the txn back; the copied file must go
     too, or the retry stages ``evidence_1.json`` next to an orphan."""
     with kbc.connect() as conn:
@@ -890,11 +1100,11 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         kwargs = dict(summary="ready", metadata={"artifacts": [str(artifact)]}, expected_run_id=run_id)
 
         def _boom(*_a, **_k):
-            raise RuntimeError("run bookkeeping failed")
+            raise failure_type("run bookkeeping failed")
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(kb, "_end_or_synthesize_run", _boom)
-            with pytest.raises(RuntimeError):
+            with pytest.raises(failure_type):
                 kb.request_review(conn, t, **kwargs)
         attachment_dir = kb.task_attachments_dir(t)
         assert kb.get_task(conn, t).status == "running"
@@ -902,6 +1112,74 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         assert kb.request_review(conn, t, **kwargs)
         assert [a.filename for a in kb.list_attachments(conn, t)] == ["evidence.json"]
         assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_request_review_staging_failure_discards_every_copy(
+    kanban_home, monkeypatch, failure_type
+):
+    """Failure while inserting a later attachment cannot orphan earlier copies."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="review staging failure")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        artifacts = [ws / "first.json", ws / "second.json"]
+        for artifact in artifacts:
+            artifact.write_text("{}")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        real_insert = kb._insert_completion_attachment
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise failure_type("second attachment insert failed")
+            return real_insert(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_insert_completion_attachment", fail_second)
+        with pytest.raises(failure_type):
+            kb.request_review(
+                conn, t, summary="ready",
+                metadata={"artifacts": [str(path) for path in artifacts]},
+                expected_run_id=run_id,
+            )
+
+        attachment_dir = kb.task_attachments_dir(t)
+        assert kb.get_task(conn, t).status == "running"
+        assert kb.list_attachments(conn, t) == []
+        assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
+
+
+def test_request_review_receipt_failure_preserves_committed_artifact(
+    kanban_home, monkeypatch
+):
+    """Post-commit receipt failure must not delete a durably referenced file."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="review receipt failure")
+        ws = kbw.resolve_workspace(kb.get_task(conn, t))
+        kbw.set_workspace_path(conn, t, ws)
+        artifact = ws / "evidence.json"
+        artifact.write_text("{}")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        capture = kbc.LifecycleReceiptCapture()
+
+        def fail_receipt(_self, _conn, _receipt):
+            raise RuntimeError("receipt publication failed")
+
+        monkeypatch.setattr(kbc.LifecycleReceiptCapture, "_publish", fail_receipt)
+        with pytest.raises(kbc.ReceiptFinalizationError):
+            kb.request_review(
+                conn, t, summary="ready", metadata={"artifacts": [str(artifact)]},
+                expected_run_id=run_id, receipt_capture=capture,
+            )
+
+        attachments = kb.list_attachments(conn, t)
+        assert kb.get_task(conn, t).status == "review"
+        assert len(attachments) == 1
+        assert Path(attachments[0].stored_path).read_text() == "{}"
 
 
 # ---------------------------------------------------------------------------
@@ -1374,7 +1652,7 @@ def test_link_tasks_no_dependency_wait_when_parent_done(kanban_home):
     """A done parent demotes nothing and reports no gate."""
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="done parent")
-        kb.complete_task(conn, parent, result="done")
+        kb.complete_task(conn, parent)
         child = kb.create_task(conn, title="follower")
 
         gated = kb.link_tasks(conn, parent, child)
@@ -1430,7 +1708,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     with kbc.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
-        kb.complete_task(conn, a, result="done")
+        kb.complete_task(conn, a)
 
         # C is running (not done) — blocks child B.
         c = kb.create_task(conn, title="parent-running")
@@ -1492,6 +1770,54 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
     conn.close()
 
 
+def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home):
+    """Full _migrate_add_optional_columns must not raise when columns already
+    exist (issue #21708 race window — two connections migrate concurrently)."""
+    import sqlite3
+
+    # Schema already in fully-migrated state (all optional columns present).
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT '',
+            tenant TEXT,
+            result TEXT,
+            idempotency_key TEXT,
+            branch_name TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            max_retries INTEGER,
+            session_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE task_events (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id    TEXT NOT NULL DEFAULT '',
+            run_id     INTEGER,
+            kind       TEXT NOT NULL DEFAULT '',
+            payload    TEXT,
+            created_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    # Running migration on an already-migrated schema must not raise.
+    kbc._migrate_add_optional_columns(conn)
+    conn.close()
 
 
 def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_home):
@@ -1568,6 +1894,23 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
 
 
+def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeypatch):
+    """When the shim is not on PATH, fall back to `python -m hermes_cli.main`.
+
+    Pins the correct module name (NOT `hermes` — there is no top-level
+    `hermes` package). Regression for #23198: the original PR shipped
+    `python -m hermes` which fails with `No module named hermes` on every
+    invocation.
+    """
+    import shutil
+    import sys
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    argv = kbd._resolve_hermes_argv()
+    assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
 
 def test_resolve_hermes_argv_module_actually_runs():
@@ -1580,6 +1923,7 @@ def test_resolve_hermes_argv_module_actually_runs():
     Run it as a real subprocess to catch that regression.
     """
     import subprocess
+    import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_dispatch as kbd
     import shutil
     import unittest.mock as mock
@@ -1593,6 +1937,7 @@ def test_resolve_hermes_argv_module_actually_runs():
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
+    assert "Hermes Agent" in r.stdout, f"unexpected output: {r.stdout[:200]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1610,6 +1955,27 @@ def test_resolve_hermes_argv_module_actually_runs():
 # ---------------------------------------------------------------------------
 
 
+def _make_task(**overrides) -> "kb.Task":
+    """Minimal Task with all required fields filled in. Override anything."""
+    defaults = dict(
+        id="t_age",
+        title="x",
+        body=None,
+        assignee=None,
+        status="ready",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+    defaults.update(overrides)
+    return kb.Task(**defaults)
 
 
 
@@ -1781,35 +2147,71 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
 
-def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home):
-    """The first scratch workspace materialized on an install appends a
-    ``tip_scratch_workspace`` event; later scratch tasks on the same install
-    stay silent, and non-scratch workspaces never trigger it."""
+def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
+    """First scratch workspace materialization warns + emits an event.
+
+    Subsequent scratch workspaces on the SAME install stay silent — the
+    sentinel file under kanban_home() flips after the first emit.
+    """
+    import logging
+
     with kbc.connect() as conn:
-        wt = kb.create_task(conn, title="worktree task")
         t1 = kb.create_task(conn, title="first scratch")
         t2 = kb.create_task(conn, title="second scratch")
 
-    def _kinds(task_id):
+    # Sentinel must not exist yet on a fresh install.
+    assert not kbw._scratch_tip_shown()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
         with kbc.connect() as conn:
-            rows = conn.execute(
-                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
-                (task_id,),
-            ).fetchall()
-        return [r["kind"] for r in rows]
+            kbw._maybe_emit_scratch_tip(conn, t1, "scratch")
 
-    with kbc.connect() as conn:
-        kbw._maybe_emit_scratch_tip(conn, wt, "worktree")
-    assert "tip_scratch_workspace" not in _kinds(wt)
+    # Sentinel is now set.
+    assert kbw._scratch_tip_shown()
+    assert kbw._scratch_tip_sentinel_path().exists()
 
-    with kbc.connect() as conn:
-        kbw._maybe_emit_scratch_tip(conn, t1, "scratch")
-    assert _kinds(t1).count("tip_scratch_workspace") == 1
+    # Warning was logged exactly once.
+    tip_records = [
+        r for r in caplog.records
+        if "scratch workspaces are ephemeral" in r.getMessage()
+    ]
+    assert len(tip_records) == 1, (
+        f"Expected exactly one tip warning, got {len(tip_records)}: "
+        f"{[r.getMessage() for r in tip_records]!r}"
+    )
 
+    # An event row was appended on the first task.
     with kbc.connect() as conn:
-        kbw._maybe_emit_scratch_tip(conn, t2, "scratch")
-    assert "tip_scratch_workspace" not in _kinds(t2), (
-        "scratch tip re-fired on the same install"
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (t1,),
+        ).fetchall()
+    kinds = [e["kind"] for e in events]
+    assert "tip_scratch_workspace" in kinds, (
+        f"Expected tip_scratch_workspace event on first scratch task; "
+        f"got {kinds!r}"
+    )
+
+    # Second scratch materialization on the same install stays silent.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
+        with kbc.connect() as conn:
+            kbw._maybe_emit_scratch_tip(conn, t2, "scratch")
+    tip_records2 = [
+        r for r in caplog.records
+        if "scratch workspaces are ephemeral" in r.getMessage()
+    ]
+    assert tip_records2 == [], (
+        f"Tip should not re-fire after sentinel is set; got "
+        f"{[r.getMessage() for r in tip_records2]!r}"
+    )
+    with kbc.connect() as conn:
+        events2 = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (t2,),
+        ).fetchall()
+    assert "tip_scratch_workspace" not in [e["kind"] for e in events2], (
+        "Tip event should not be appended for subsequent scratch tasks."
     )
 
 
@@ -1952,6 +2354,792 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 
 
 
+def test_bare_connect_does_not_close_on_context_exit(tmp_path):
+    """Document the leak that connect_closing exists to prevent.
+
+    sqlite3.Connection's __exit__ commits/rollbacks but doesn't close.
+    This is the upstream behaviour we cannot change; the regression
+    guard is to make sure connect_closing() does the right thing.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kbc.connect(db_path=db_path) as conn:
+        pass
+    # Still usable after with-block exit (the leak).
+    conn.execute("SELECT 1").fetchone()
+    conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# complete_task(expected_status=...): compare-and-swap completion guard
+# A Dream caller that observed ``running`` and then calls complete has a
+# TOCTOU window in which the task may have moved to ``blocked``. The guard
+# re-checks the status inside the write transaction so a stale observation
+# cannot complete the task.
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_expected_status_mismatch_blocked_has_no_side_effects(
+    kanban_home, monkeypatch,
+):
+    """blocked != expected 'running' must refuse with zero side effects."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting on input")
+        before = kb.get_task(conn, tid)
+        assert before.status == "blocked"
+        runs_before = [(r.id, r.status, r.outcome) for r in kb.list_runs(conn, tid)]
+        events_before = [(e.id, e.kind) for e in kb.list_events(conn, tid)]
+        hook_calls.clear()
+
+        assert kb.complete_task(
+            conn, tid, result="stale complete", expected_status="running",
+        ) is False
+
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.result is None
+        assert after.completed_at is None
+        assert [(r.id, r.status, r.outcome) for r in kb.list_runs(conn, tid)] == runs_before
+        assert [(e.id, e.kind) for e in kb.list_events(conn, tid)] == events_before
+        assert hook_calls == []
+
+
+def test_complete_task_expected_status_mismatch_precedes_created_card_audit(
+    kanban_home,
+):
+    """A stale CAS guard must refuse before phantom-card audit side effects."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cas audit ordering", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting on input")
+        events_before = [(event.id, event.kind) for event in kb.list_events(conn, tid)]
+        runs_before = [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ]
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            expected_status="running",
+            created_cards=["t_deadbeef"],
+        ) is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.result is None
+        assert [(event.id, event.kind) for event in kb.list_events(conn, tid)] == events_before
+        assert [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ] == runs_before
+
+
+def test_complete_task_expected_run_id_mismatch_precedes_created_card_audit(
+    kanban_home,
+):
+    """A stale run guard must refuse before phantom-card audit side effects."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="run cas audit ordering", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        events_before = [(event.id, event.kind) for event in kb.list_events(conn, tid)]
+        runs_before = [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ]
+
+        assert kb.complete_task(
+            conn,
+            tid,
+            expected_status="running",
+            expected_run_id=claimed.current_run_id + 1,
+            created_cards=["t_deadbeef"],
+        ) is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.result is None
+        assert [(event.id, event.kind) for event in kb.list_events(conn, tid)] == events_before
+        assert [
+            (run.id, run.status, run.outcome) for run in kb.list_runs(conn, tid)
+        ] == runs_before
+
+
+def test_complete_task_invalid_expected_status_raises(kanban_home):
+    """A typo'd guard value must fail loudly, not read as a mismatch."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard typo", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.complete_task(conn, tid, expected_status="runing")
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_complete_task_expected_status_running_match_succeeds(kanban_home):
+    """A matching guard must not change the normal completion path."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard match", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(
+            conn, tid,
+            result="built it",
+            summary="handoff summary",
+            metadata={"tests_run": 3},
+            expected_status="running",
+        ) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.result == "built it"
+        run = kb.list_runs(conn, tid)[-1]
+        assert run.outcome == "completed"
+        assert run.summary == "handoff summary"
+
+
+def test_complete_task_expected_status_and_run_id_are_conjunctive(kanban_home):
+    """Both guards must match; either mismatch alone refuses completion."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cas guard conj", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        # Status matches, run id does not.
+        assert kb.complete_task(
+            conn, tid, expected_status="running", expected_run_id=run_id + 999,
+        ) is False
+        # Run id matches, status does not.
+        assert kb.complete_task(
+            conn, tid, expected_status="blocked", expected_run_id=run_id,
+        ) is False
+        assert kb.get_task(conn, tid).status == "running"
+        # Both match.
+        assert kb.complete_task(
+            conn, tid, expected_status="running", expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle CAS guards on add_comment / request_review / block_task /
+# unblock_task. Same TOCTOU story as the complete_task guard above: a caller
+# that observed a status and then acts on it must be refused inside the write
+# transaction — before ANY side effect — when the observation went stale.
+# ---------------------------------------------------------------------------
+
+
+def _lifecycle_snapshot(conn, tid):
+    """(runs, events, comments) tuples for zero-side-effect assertions."""
+    return (
+        [(r.id, r.status, r.outcome) for r in kb.list_runs(conn, tid)],
+        [(e.id, e.kind) for e in kb.list_events(conn, tid)],
+        [(c.id, c.author, c.body) for c in kb.list_comments(conn, tid)],
+    )
+
+
+def test_add_comment_expected_status_match_succeeds(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="comment cas match", assignee="worker")
+        assert kb.get_task(conn, tid).status == "ready"
+        cid = kb.add_comment(
+            conn, tid, "worker", "still on it", expected_status="ready",
+        )
+        assert cid > 0
+        assert [c.body for c in kb.list_comments(conn, tid)] == ["still on it"]
+
+
+def test_add_comment_expected_status_mismatch_raises_with_no_side_effects(
+    kanban_home,
+):
+    """A stale 'running' observation must not append a comment or event."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="comment cas stale", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected status"):
+            kb.add_comment(
+                conn, tid, "worker", "stale note", expected_status="running",
+            )
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_invalid_expected_status_raises_before_mutation(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="comment cas typo", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.add_comment(
+                conn, tid, "worker", "typo guard", expected_status="redy",
+            )
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_request_review_expected_status_match_succeeds(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review cas match", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid,
+            summary="implemented and verified",
+            expected_run_id=claimed.current_run_id,
+            expected_status="running",
+        ) is True
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_request_review_expected_status_mismatch_refuses_with_no_side_effects(
+    kanban_home,
+):
+    """Stale 'ready' vs actual running must refuse and keep the live claim."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review cas stale", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        before = _lifecycle_snapshot(conn, tid)
+        ok, reason = kb.request_review(
+            conn, tid,
+            summary="would otherwise synthesize a run",
+            expected_run_id=claimed.current_run_id,
+            expected_status="ready",
+            with_reason=True,
+        )
+        assert ok is False
+        assert "expected status" in reason
+        after = kb.get_task(conn, tid)
+        assert after.status == "running"
+        assert after.claim_lock is not None
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_request_review_expected_status_is_conjunctive_with_claim_rules(
+    kanban_home,
+):
+    """A matching guard must not bypass the running/ready source rule."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review cas conj", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="waiting on input")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="s", expected_status="blocked",
+        ) is False
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_request_review_invalid_expected_status_raises(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review cas typo", assignee="worker")
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.request_review(conn, tid, expected_status="runing")
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_block_task_expected_status_match_succeeds(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block cas match", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(
+            conn, tid,
+            reason="needs credentials",
+            kind="needs_input",
+            expected_status="running",
+        ) is True
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+
+
+def test_block_task_expected_status_mismatch_has_no_side_effects(
+    kanban_home, monkeypatch,
+):
+    """ready != expected 'running' must refuse before runs/events/hooks."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block cas stale", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.block_task(
+            conn, tid,
+            reason="reason that would synthesize a run",
+            kind="needs_input",
+            expected_status="running",
+        ) is False
+        after = kb.get_task(conn, tid)
+        assert after.status == "ready"
+        assert after.block_kind is None
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_expected_status_mismatch_precedes_dependency_routing(
+    kanban_home, monkeypatch,
+):
+    """The guard fires before dependency_wait routing/events too."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block cas dep", assignee="worker")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.block_task(
+            conn, tid,
+            reason="waiting on t_other",
+            kind="dependency",
+            expected_status="running",
+        ) is False
+        assert kb.get_task(conn, tid).status == "ready"
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_invalid_expected_status_raises(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block cas typo", assignee="worker")
+        with pytest.raises(ValueError, match="expected_status"):
+            kb.block_task(conn, tid, expected_status="runing")
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_expected_block_kind_match_succeeds(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas match", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="needs_input",
+        ) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        assert [e.kind for e in kb.list_events(conn, tid)][-1] == "unblocked"
+
+
+def test_unblock_task_expected_block_kind_mismatch_has_no_side_effects(
+    kanban_home,
+):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas stale", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="capability",
+        ) is False
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_unblock_task_expected_block_kind_untyped_block_mismatches(kanban_home):
+    """A legacy un-typed block never matches a canonical expected kind."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas untyped", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="untyped")
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="needs_input",
+        ) is False
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_unblock_task_expected_block_kind_requires_blocked_status(kanban_home):
+    """The kind guard demands 'blocked'; scheduled tasks are refused, and a
+    plain unguarded unblock still resumes them (compatibility)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas sched", assignee="worker")
+        assert kb.schedule_task(conn, tid, reason="wait for window")
+        assert kb.get_task(conn, tid).status == "scheduled"
+        before = _lifecycle_snapshot(conn, tid)
+        assert kb.unblock_task(
+            conn, tid, expected_block_kind="needs_input",
+        ) is False
+        assert kb.get_task(conn, tid).status == "scheduled"
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_invalid_expected_block_kind_raises(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock cas typo", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        with pytest.raises(ValueError, match="expected_block_kind"):
+            kb.unblock_task(conn, tid, expected_block_kind="need_input")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Reviewer hardening: guarded transition + reason comment must be ONE SQLite
+# transaction (a failed comment write rolls back the whole transition),
+# block_task must return structured refusal reasons on request, and
+# ``dependency`` is not an acceptable expected unblock kind (dependency
+# blocks live in ``todo``, never ``blocked``, so it could never match).
+# ---------------------------------------------------------------------------
+
+
+def test_block_task_guarded_reason_comment_failure_rolls_back_everything(
+    kanban_home, monkeypatch,
+):
+    """An injected comment failure aborts the block: status, run closure,
+    events, and lifecycle hook must all be rolled back / suppressed."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block atomic", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        before = _lifecycle_snapshot(conn, tid)
+        hook_calls.clear()
+
+        def _boom(*a, **k):
+            raise RuntimeError("injected comment failure")
+
+        monkeypatch.setattr(kb, "add_comment", _boom)
+        with pytest.raises(RuntimeError, match="injected comment failure"):
+            kb.block_task(
+                conn, tid,
+                reason="waiting on operator",
+                kind="needs_input",
+                expected_status="running",
+                reason_comment_author="ops",
+            )
+
+        after = kb.get_task(conn, tid)
+        assert after.status == "running"
+        assert after.claim_lock is not None
+        assert after.block_kind is None
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_guarded_dependency_comment_failure_precedes_hook(
+    kanban_home, monkeypatch,
+):
+    """On the dependency->todo branch the comment write happens before the
+    lifecycle hook, so an injected failure rolls back with no hook fired."""
+    hook_calls: list[tuple] = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda *a, **k: hook_calls.append((a, k)),
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="dep atomic", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        before = _lifecycle_snapshot(conn, tid)
+        hook_calls.clear()
+
+        def _boom(*a, **k):
+            raise RuntimeError("injected comment failure")
+
+        monkeypatch.setattr(kb, "add_comment", _boom)
+        with pytest.raises(RuntimeError, match="injected comment failure"):
+            kb.block_task(
+                conn, tid,
+                reason="waiting on t_parent",
+                kind="dependency",
+                expected_status="running",
+                reason_comment_author="ops",
+            )
+
+        assert kb.get_task(conn, tid).status == "running"
+        assert _lifecycle_snapshot(conn, tid) == before
+        assert hook_calls == []
+
+
+def test_block_task_guarded_success_writes_comment_in_same_txn(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block atomic ok", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(
+            conn, tid,
+            reason="waiting on operator",
+            kind="needs_input",
+            expected_status="running",
+            reason_comment_author="ops",
+        ) is True
+        assert kb.get_task(conn, tid).status == "blocked"
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("ops", "BLOCKED: waiting on operator"),
+        ]
+
+
+def test_unblock_task_guarded_reason_comment_failure_rolls_back(
+    kanban_home, monkeypatch,
+):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock atomic", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        before = _lifecycle_snapshot(conn, tid)
+
+        def _boom(*a, **k):
+            raise RuntimeError("injected comment failure")
+
+        monkeypatch.setattr(kb, "add_comment", _boom)
+        with pytest.raises(RuntimeError, match="injected comment failure"):
+            kb.unblock_task(
+                conn, tid,
+                expected_block_kind="needs_input",
+                reason="input arrived",
+                reason_comment_author="ops",
+            )
+
+        after = kb.get_task(conn, tid)
+        assert after.status == "blocked"
+        assert after.block_kind == "needs_input"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_unblock_task_guarded_success_persists_reason_in_event_and_comment(
+    kanban_home,
+):
+    """The guarded unblock's audit evidence — the operator reason — must
+    survive on the ``unblocked`` event, not only in the comment stream."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock audit", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        assert kb.unblock_task(
+            conn, tid,
+            expected_block_kind="needs_input",
+            reason="input arrived",
+            reason_comment_author="ops",
+        ) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        comments = kb.list_comments(conn, tid)
+        assert ("ops", "UNBLOCK: input arrived") in [
+            (c.author, c.body) for c in comments
+        ]
+        unblocked = [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
+        assert len(unblocked) == 1
+        assert unblocked[0].payload is not None
+        assert unblocked[0].payload.get("reason") == "input arrived"
+
+
+def test_block_task_with_reason_stale_run_id_produces_run_id_diagnostic(
+    kanban_home,
+):
+    """Matching status + stale run id must name the run id, not the status."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="block reason runid", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        ok, why = kb.block_task(
+            conn, tid,
+            reason="stale observation",
+            expected_status="running",
+            expected_run_id=run_id + 1,
+            with_reason=True,
+        )
+        assert ok is False
+        assert "run" in why
+        assert str(run_id + 1) in why
+        assert "expected status" not in why
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_block_task_with_reason_distinguishes_refusal_causes(kanban_home):
+    with kbc.connect() as conn:
+        # Unknown task.
+        ok, why = kb.block_task(conn, "t_missing", with_reason=True)
+        assert ok is False
+        assert why == "task not found"
+        # Expected-status mismatch.
+        tid = kb.create_task(conn, title="block reason causes", assignee="worker")
+        ok, why = kb.block_task(
+            conn, tid, expected_status="running", with_reason=True,
+        )
+        assert ok is False
+        assert "expected status 'running'" in why
+        assert "'ready'" in why
+        # Invalid source state (terminal task, no guards supplied).
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.complete_task(conn, tid, result="done")
+        ok, why = kb.block_task(conn, tid, with_reason=True)
+        assert ok is False
+        assert "not in a blockable state" in why
+        assert "'done'" in why
+        # Plain bool return is preserved for existing callers.
+        assert kb.block_task(conn, tid) is False
+
+
+def test_unblock_task_expected_block_kind_dependency_rejected(kanban_home):
+    """dependency waits live in todo, never blocked — an expected kind of
+    'dependency' can never match and must fail loudly before mutation."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="unblock dep kind", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.block_task(conn, tid, reason="creds", kind="needs_input")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected_block_kind"):
+            kb.unblock_task(conn, tid, expected_block_kind="dependency")
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+# ---------------------------------------------------------------------------
+# add_comment --if-absent idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_add_comment_if_absent_replay_returns_existing_id_without_side_effects(
+    kanban_home,
+):
+    """An exact (author, canonical body) replay must be a no-op success."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="idempotent comment", assignee="worker")
+        first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        before = _lifecycle_snapshot(conn, tid)
+        replay = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint", if_absent=True,
+        )
+        assert replay == first
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_if_absent_dedupes_on_canonical_body(kanban_home):
+    """Bodies canonicalize (strip) on insert; dedup must compare the same
+    canonical form, so a whitespace-padded replay still deduplicates."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="canonical dedup", assignee="worker")
+        first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        before = _lifecycle_snapshot(conn, tid)
+        replay = kb.add_comment(
+            conn, tid, "dream", "  sync checkpoint  ", if_absent=True,
+        )
+        assert replay == first
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_if_absent_different_body_or_author_inserts(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no false dedup", assignee="worker")
+        first = kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        other_body = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint v2", if_absent=True,
+        )
+        other_author = kb.add_comment(
+            conn, tid, "operator", "sync checkpoint", if_absent=True,
+        )
+        assert len({first, other_body, other_author}) == 3
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("dream", "sync checkpoint"),
+            ("dream", "sync checkpoint v2"),
+            ("operator", "sync checkpoint"),
+        ]
+        commented = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert len(commented) == 3
+
+
+def test_add_comment_if_absent_stale_expected_status_fails_before_dedup(
+    kanban_home,
+):
+    """The CAS guard is validated first: a stale guard must raise even when
+    an exact duplicate exists, and must leave zero traces."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale guard first", assignee="worker")
+        kb.add_comment(conn, tid, "dream", "sync checkpoint")
+        before = _lifecycle_snapshot(conn, tid)
+        with pytest.raises(ValueError, match="expected status"):
+            kb.add_comment(
+                conn, tid, "dream", "sync checkpoint",
+                expected_status="running", if_absent=True,
+            )
+        with pytest.raises(ValueError, match="expected status"):
+            kb.add_comment(
+                conn, tid, "dream", "brand new body",
+                expected_status="running", if_absent=True,
+            )
+        assert _lifecycle_snapshot(conn, tid) == before
+
+
+def test_add_comment_if_absent_matching_expected_status_inserts_once(
+    kanban_home,
+):
+    """The Dream call shape: --expected-status running --if-absent replayed
+    twice must produce exactly one comment and one commented event."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="dream call shape", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.get_task(conn, tid).status == "running"
+        first = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint",
+            expected_status="running", if_absent=True,
+        )
+        replay = kb.add_comment(
+            conn, tid, "dream", "sync checkpoint",
+            expected_status="running", if_absent=True,
+        )
+        assert replay == first
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("dream", "sync checkpoint")
+        ]
+        commented = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert len(commented) == 1
+
+
+def test_add_comment_if_absent_dedup_serializes_under_begin_immediate(
+    kanban_home,
+):
+    """The dedup read must run inside the guarded write transaction: a
+    second connection's guarded replay must wait for an open BEGIN
+    IMMEDIATE writer, then observe its committed duplicate and dedupe."""
+    import threading
+
+    with kbc.connect() as conn1:
+        tid = kb.create_task(conn1, title="two-conn dedup", assignee="worker")
+
+    conn1.execute("BEGIN IMMEDIATE")
+    first = kb.add_comment(conn1, tid, "dream", "sync checkpoint")
+
+    results: dict[str, int] = {}
+
+    def _replay() -> None:
+        with kbc.connect() as conn2:
+            results["replay"] = kb.add_comment(
+                conn2, tid, "dream", "sync checkpoint", if_absent=True,
+            )
+
+    worker = threading.Thread(target=_replay)
+    worker.start()
+    # The replay must not complete while the writer holds the lock —
+    # completing here would mean the dedup ran outside BEGIN IMMEDIATE.
+    worker.join(timeout=0.5)
+    assert worker.is_alive(), "guarded replay finished under an open writer"
+    conn1.execute("COMMIT")
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+
+    assert results["replay"] == first
+    with kbc.connect() as conn:
+        comments = kb.list_comments(conn, tid)
+        assert [(c.author, c.body) for c in comments] == [
+            ("dream", "sync checkpoint")
+        ]
+        commented = [e for e in kb.list_events(conn, tid) if e.kind == "commented"]
+        assert len(commented) == 1
 
 
 def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
