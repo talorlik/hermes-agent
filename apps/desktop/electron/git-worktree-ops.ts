@@ -2,22 +2,29 @@
 // fresh worktree the lightest way (`git worktree add -b`), list real worktrees,
 // and remove them. Git is the source of truth; the renderer just drives these.
 
+import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
 import { resolveRequestedPathForIpc } from './hardening'
-import { execGit } from './no-console-git'
 
 function runGit(gitBin, args, cwd): Promise<string> {
-  return execGit(gitBin, args, { cwd, timeoutMs: 30_000 }).then(result => {
-    if (result.code !== 0) {
-      const error = new Error(result.stderr || `git exited ${result.code}`) as Error & { stderr?: string }
+  return new Promise((resolve, reject) => {
+    execFile(
+      gitBin,
+      args,
+      { cwd, windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          err.stderr = String(stderr || '')
+          reject(err)
 
-      error.stderr = result.stderr
-      throw error
-    }
+          return
+        }
 
-    return result.stdout
+        resolve(String(stdout || ''))
+      }
+    )
   })
 }
 
@@ -200,6 +207,11 @@ async function ensureGitRepo(gitBin, dir) {
     await runGit(
       gitBin,
       [
+        // This is a synthetic bootstrap commit created by Hermes, not a user
+        // commit. Global hooks can reject its fixed message and make worktree
+        // initialization unusable, so isolate only this command.
+        '-c',
+        'core.hooksPath=',
         '-c',
         'user.email=hermes@localhost',
         '-c',
@@ -374,20 +386,10 @@ async function listBranches(repoPath, gitBin) {
   }
 
   try {
-    // Both children own cwd handles: a failed probe must still wait for its
-    // sibling before the caller may remove or switch the repository directory.
-    const probes = await Promise.allSettled([
+    const [localOut, remoteOut] = await Promise.all([
       runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/heads'], resolved),
       runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/remotes'], resolved)
     ])
-
-    const [local, remote] = probes
-
-    if (local.status === 'rejected' || remote.status === 'rejected') {
-      return []
-    }
-
-    const [localOut, remoteOut] = [local.value, remote.value]
 
     const trees = await listWorktrees(resolved, gitBin)
     const pathByBranch = new Map(trees.filter(tree => tree.branch).map(tree => [tree.branch, tree.path]))
