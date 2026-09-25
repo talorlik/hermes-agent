@@ -19,8 +19,7 @@ import { AlertCircle, ChevronDown, ChevronRight, Globe, iconSize, Loader2, Monit
 import { capitalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 
-import { localCardPresentation } from './desktop-install-local-card'
-import { FirstRunRemoteSetup } from './remote-setup/first-run'
+import { FirstRunRemoteForm } from './first-run-remote-form'
 
 /**
  * DesktopInstallOverlay
@@ -190,8 +189,7 @@ const EMPTY_STATE: DesktopBootstrapState = {
   startedAt: null,
   completedAt: null,
   setupChoice: null,
-  unsupportedPlatform: null,
-  bundled: false
+  unsupportedPlatform: null
 }
 
 function applyEvent(state: DesktopBootstrapState, ev: DesktopBootstrapEvent): DesktopBootstrapState {
@@ -209,13 +207,10 @@ function applyEvent(state: DesktopBootstrapState, ev: DesktopBootstrapEvent): De
       setupChoice: ev.active
         ? {
             platform: ev.platform || state.setupChoice?.platform || 'unknown',
-            activeRoot: ev.activeRoot || state.setupChoice?.activeRoot || '',
-            local: ev.local || state.setupChoice?.local || 'none',
-            bundled: Boolean(ev.bundled)
+            activeRoot: ev.activeRoot || state.setupChoice?.activeRoot || ''
           }
         : null,
-      unsupportedPlatform: null,
-      bundled: Boolean(ev.bundled)
+      unsupportedPlatform: null
     }
   }
 
@@ -417,13 +412,10 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
   }
 
   if (remoteOpen) {
-    return <FirstRunRemoteSetup onBack={() => setRemoteOpen(false)} />
+    return <FirstRunRemoteForm onBack={() => setRemoteOpen(false)} />
   }
 
   if (state.setupChoice) {
-    const localState = state.setupChoice.local
-    const localPres = localCardPresentation(localState)
-
     return (
       <div className="fixed inset-0 z-(--z-setup) flex items-center justify-center bg-background/90 p-4 backdrop-blur-md">
         <div className="w-full max-w-2xl rounded-xl border border-(--stroke-nous) bg-card p-8 shadow-nous">
@@ -431,9 +423,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
             <BrandMark className="size-11 shrink-0" />
             <div className="min-w-0">
               <h2 className="text-xl font-semibold tracking-tight">{copy.setupChoiceTitle}</h2>
-              <p className="mt-1.5 text-sm text-muted-foreground">
-                {localState === 'none' ? copy.setupChoiceDesc : copy.setupChoiceDescLocal}
-              </p>
+              <p className="mt-1.5 text-sm text-muted-foreground">{copy.setupChoiceDesc}</p>
             </div>
           </div>
 
@@ -451,7 +441,7 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
             </button>
 
             <button
-              className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) p-4 text-left transition hover:bg-(--chrome-action-hover) disabled:cursor-not-allowed disabled:opacity-60"
+              className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) p-4 text-left transition hover:bg-(--chrome-action-hover) disabled:cursor-wait disabled:opacity-60"
               disabled={localStarting}
               onClick={async () => {
                 setLocalStart({ root: activeRoot, starting: true, error: null })
@@ -476,9 +466,9 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
                 ) : (
                   <Monitor className="size-4 text-muted-foreground" />
                 )}
-                <span>{copy[localPres.title]}</span>
+                <span>{copy.installLocalTitle}</span>
               </div>
-              <p className="mt-2 text-sm leading-5 text-muted-foreground">{copy[localPres.desc]}</p>
+              <p className="mt-2 text-sm leading-5 text-muted-foreground">{copy.installLocalDesc}</p>
             </button>
           </div>
 
@@ -489,12 +479,10 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
             </div>
           ) : null}
 
-          {localPres.showInstallTo ? (
-            <div className="mt-6 text-xs text-muted-foreground">
-              {copy.installTo}{' '}
-              <code className="font-mono text-(--ui-text-secondary)">{state.setupChoice.activeRoot}</code>
-            </div>
-          ) : null}
+          <div className="mt-6 text-xs text-muted-foreground">
+            {copy.installTo}{' '}
+            <code className="font-mono text-(--ui-text-secondary)">{state.setupChoice.activeRoot}</code>
+          </div>
         </div>
       </div>
     )

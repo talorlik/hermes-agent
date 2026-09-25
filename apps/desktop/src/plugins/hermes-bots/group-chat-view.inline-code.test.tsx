@@ -8,12 +8,14 @@ import { afterEach, beforeAll, expect, it, vi } from 'vitest'
 
 import { translateBots } from './i18n-test-helper'
 
-// Without a room-owned hook the room's `<code>` falls through to Tailwind
-// Typography's fixed near-black ink, which is invisible on every dark theme
-// (#114086). The renderer stub emits a bare `<code>` with NO `.aui-md`
-// wrapper, so only the room's own `[data-slot='group-chat-message-content']`
-// rule in the real stylesheet can theme it: the cascade decides, not a regex
-// over the source text.
+// Room bodies render through the shell's message renderer, whose markdown
+// root is `aui-md prose` — the same container the 1:1 chat uses, minus the
+// `[data-slot='aui_assistant-message-content']` ancestor that scopes the
+// themed inline-code rule in styles.css. Without a room-owned hook the room's
+// `<code>` falls through to Tailwind Typography's fixed near-black ink, which
+// is invisible on every dark theme (#114086). The stubs below emit the two
+// shapes the room can produce (renderer path, raw Streamdown fallback) so the
+// real stylesheet's cascade decides, not a regex over the source text.
 vi.mock('@hermes/plugin-sdk', async () => {
   const { pluginSdkMock, createGroupGateway } = await import('./group-test-utils')
   const base = await pluginSdkMock(createGroupGateway().host)
@@ -31,7 +33,6 @@ vi.mock('@hermes/plugin-sdk', async () => {
     cn: (...values: unknown[]) => values.filter(Boolean).join(' '),
     Codicon: () => null,
     CopyButton: () => null,
-    ToggleRow: () => null,
     ConfirmDialog: () => null,
     Dialog: () => null,
     DialogContent: () => null,
@@ -41,9 +42,11 @@ vi.mock('@hermes/plugin-sdk', async () => {
     DialogTitle: () => null,
     Input: () => null,
     MessageTextContent: ({ text }: { text: string }) => (
-      <p>
-        set <code data-testid="renderer-code">{text}</code> first
-      </p>
+      <div className="aui-md prose">
+        <p>
+          set <code data-testid="renderer-code">{text}</code> first
+        </p>
+      </div>
     ),
     Tip: ({ children }: { children: ReactNode }) => children,
     relativeTime: () => 'now',
