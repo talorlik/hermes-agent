@@ -1,21 +1,11 @@
-"""Tests for file permissions hardening on sensitive files.
-
-POSIX permission bits (0700/0600) are only meaningful on POSIX filesystems;
-native Windows does not implement them, so these tests are host-gated (the
-repo's host-native rule: never fake the platform).
-"""
+"""Tests for file permissions hardening on sensitive files."""
 
 import os
 import stat
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
-
-pytestmark = pytest.mark.platforms("posix")
 
 
 class TestCronFilePermissions(unittest.TestCase):
@@ -115,7 +105,10 @@ class TestConfigFilePermissions(unittest.TestCase):
             self.assertEqual(file_mode, 0o600)
 
     def test_ensure_hermes_home_sets_0700(self):
-        home = Path(self.tmpdir) / ".hermes"
+        # macOS exposes tempfile paths through /var -> /private/var. Resolve
+        # that host-level link so this test exercises the owned directory, not
+        # the intentional symlink-boundary permission exemption.
+        home = Path(self.tmpdir).resolve() / ".hermes"
         with patch("hermes_cli.config.get_hermes_home", return_value=home):
             from hermes_cli.config import ensure_hermes_home
             ensure_hermes_home()
