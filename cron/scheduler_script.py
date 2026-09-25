@@ -20,6 +20,7 @@ import threading
 import time
 from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
+from cron.outcomes import ScriptResult
 from pathlib import Path
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -105,7 +106,7 @@ def _get_session_db_timeout() -> float:
 
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     try:
-        lines = (venv_dir / "pyvenv.cfg").read_text(encoding="utf-8-sig").splitlines()
+        lines = (venv_dir / "pyvenv.cfg").read_text(encoding="utf-8").splitlines()
     except OSError:
         return {}
     return {
@@ -129,18 +130,6 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
         sibling = interpreter.with_name("python.exe")
         if sibling.exists():
             interpreter = sibling
-
-    from hermes_cli._launchers import resolve_store_python
-    from pm.environments import selected_venv, site_packages as dependency_site
-
-    repo = Path(__file__).resolve().parents[1]
-    managed_python = resolve_store_python(repo)
-    if managed_python is not None:
-        # A packaged caller may hand us the old venv launcher; select bytes
-        # from the install record rather than interpreting relocated pyvenv.cfg.
-        dependencies = dependency_site(selected_venv(repo))
-
-        return str(managed_python), {"PYTHONPATH": os.pathsep.join([str(repo), str(dependencies)])}
 
     cfg = _read_windows_pyvenv_cfg(venv_dir)
     home = cfg.get("home", "")
@@ -247,9 +236,7 @@ def _windows_cron_bootstrap_argv(
     the venv on ``PYTHONPATH``, but ``.pth`` files are only processed by ``site.addsitedir()``, so
     editable installs would be invisible; bootstrap via addsitedir + ``runpy.run_path`` (keeps
     ``__file__``/``sys.path[0]`` semantics). Plain invocation if the venv is unresolvable."""
-    site_packages = next((Path(item) for item in env_overlay.get("PYTHONPATH", "").split(os.pathsep)
-                          if Path(item).name == "site-packages"),
-                         _sched.Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages")
+    site_packages = _sched.Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages"
     if not site_packages.is_dir():
         # Warn: silent fallback would make "editable installs invisible" undiagnosable.
         logger.warning(
@@ -288,10 +275,14 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
         return None, f"Blocked: script path contains a NUL byte: {script_path!r}"
     try:
         raw = _sched.Path(script_path).expanduser()
+        path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
     except (ValueError, RuntimeError, OSError):
-        # RuntimeError: unexpandable ``~`` (no resolvable HOME).
-        return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+        # RuntimeError: unexpandable ``~`` (no resolvable HOME). OSError:
+        # filesystem rejection such as an overlong path. Preserve the supplied
+        # value for the caller's mandatory redaction boundary.
+        return None, (
+            f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+        )
 
     # Traversal / absolute-path / symlink escape guard — MUST stay inside HERMES_HOME/scripts/.
     try:
@@ -301,16 +292,22 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
         )
-    if not path.exists():
-        # Scripts resolve against THIS profile's scripts/ dir by design (profiles never share files),
-        # which is the usual reason a copied job cannot find a script that exists elsewhere (#94821).
+    try:
+        if not path.exists():
+            # Scripts resolve against THIS profile's scripts/ dir by design (profiles never share
+            # files), which is the usual reason a copied job cannot find a script that exists
+            # elsewhere (#94821).
+            return None, (
+                f"Script not found: {path}. Cron scripts are looked up only in this profile's folder "
+                f"({scripts_dir_resolved}); if the job was copied from another profile, copy the script "
+                f"there too, or edit the job with `hermes cron edit`."
+            )
+        if not path.is_file():
+            return None, f"Script path is not a file: {path}"
+    except OSError:
         return None, (
-            f"Script not found: {path}. Cron scripts are looked up only in this profile's folder "
-            f"({scripts_dir_resolved}); if the job was copied from another profile, copy the script "
-            f"there too, or edit the job with `hermes cron edit`."
+            f"Blocked: script path is not a valid filesystem path: {script_path!r}"
         )
-    if not path.is_file():
-        return None, f"Script path is not a file: {path}"
     return path, None
 
 
@@ -334,6 +331,22 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
     return [python_exe, str(path)], env_overlay, None
 
 
+_CRON_SCRIPT_REDACTION_FAILURE = "[REDACTED - cron script result unavailable]"
+
+
+def _redact_job_script_result(success: bool, output: object) -> tuple[bool, str]:
+    """Force-redact one script runner result, failing safe if scrubbing breaks."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            str(output), force=True, redact_url_credentials=True
+        )
+    except Exception:
+        redacted = _CRON_SCRIPT_REDACTION_FAILURE
+    return success, redacted
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
@@ -348,25 +361,22 @@ def _run_job_script(
     Optional absolute path to use as the script's cwd. When set, the subprocess runs in this directory
     instead of the scripts-dir parent. See #69396.
     """
-    path, err = _resolve_script_path(script_path)
+    try:
+        path, err = _resolve_script_path(script_path)
+    except (ValueError, RuntimeError, OSError):
+        return _redact_job_script_result(
+            False, "Blocked: Hermes scripts directory is unavailable"
+        )
     if path is None:
-        return False, err
+        return _redact_job_script_result(False, err)
     script_timeout = _get_script_timeout()
     argv, env_overlay, err = _script_argv(path)
     if argv is None:
-        return False, err
+        return _redact_job_script_result(False, err)
 
     try:
         from tools.environments.local import build_subprocess_env
-        # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
-        # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
-        # ``errors=`` must not stay 'strict': one stray non-UTF-8 byte in the script's stdout
-        # or stderr raises UnicodeDecodeError in communicate() and fails the whole run,
-        # discarding the output (#105582; the Windows branch decodes lossily per #45099).
-        popen_kwargs: dict[str, Any] = {
-            "start_new_session": True,
-            "errors": "replace",
-        }
+        popen_kwargs: dict[str, Any] = {"start_new_session": True}
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
@@ -398,7 +408,9 @@ def _run_job_script(
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
+                return _redact_job_script_result(
+                    False, "Script cancelled because cron fire ownership was lost"
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_tree(proc)
@@ -409,7 +421,9 @@ def _run_job_script(
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
                 # signalling, so own-session grandchildren are reached too — the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return _redact_job_script_result(
+                    False, f"Script timed out after {script_timeout}s: {path}"
+                )
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
@@ -419,25 +433,18 @@ def _run_job_script(
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
 
-        # Redact secrets before ANY return path.
-        try:
-            from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
-        except Exception as e:
-            logger.warning("Failed to redact sensitive text from output: %s", e)
-            stdout = stderr = "[REDACTED - redaction failed]"
-
         if proc.returncode != 0:
             parts = [f"Script exited with code {proc.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
                 parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
-        return True, stdout
+            ok, text = _redact_job_script_result(False, "\n".join(parts))
+            return ScriptResult(ok, text, returncode=proc.returncode)
+        ok, text = _redact_job_script_result(True, stdout)
+        return ScriptResult(ok, text, returncode=proc.returncode)
     except Exception as exc:
-        return False, f"Script execution failed: {exc}"
+        return _redact_job_script_result(False, f"Script execution failed: {exc}")
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

@@ -41,6 +41,8 @@ from cron.jobs import (
     pause_job,
     remove_job,
     resolve_job_ref,
+    resnapshot_all_unpinned,
+    resnapshot_job,
     resume_job,
     update_job)
 from tools.cronjob_prompt_scan import _scan_cron_prompt
@@ -376,12 +378,8 @@ def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[s
     block (parent sees what the job produced). Never raises."""
     try:
         from cron.jobs import get_cron_output_dir
-
-        out_dir = get_cron_output_dir() / job_id
-        files = sorted(out_dir.glob("*.md"))
-        if not files:
-            return None
-        text = files[-1].read_text(encoding="utf-8-sig", errors="replace").strip()
+        files = sorted((get_cron_output_dir() / job_id).glob("*.md"))
+        text = files[-1].read_text(encoding="utf-8", errors="replace").strip() if files else ""
         if not text:
             return None
         if len(text) > max_chars:
@@ -399,9 +397,9 @@ def _reap_stale_executions(job_name: str) -> None:
     try:
         # Reap any execution row this job (or any job) left stranded 'claimed'/ 'running' by a dead owner
         # process -- e.g. a PRIOR one-shot `hermes cron run` invocation whose dispatched runner died with
-        # the exiting process before writing a terminal status (issue #86721). Safe and cheap: provably-dead
-        # owners (PID gone, or PID reused by a different process per its start time) are reaped, as is a
-        # live owner whose claim is older than the derived stale bound (the process itself is not killed).
+        # the exiting process before writing a terminal status (issue #86721). Safe and cheap: only
+        # provably-dead owners (PID gone, or PID reused by a different process per its start time) are
+        # reaped; a genuinely live owner's row is left untouched.
         from cron.executions import recover_interrupted_executions
         _reclaimed = recover_interrupted_executions()
         if _reclaimed:
@@ -482,11 +480,10 @@ def _try_dispatch_background_run(
         return None
 
     # Early dedupe so a mid-run job reports in THIS response, not as a delayed error completion
-    # (authoritative check: try_register_running_job). Home-scoped: one process ticks every
-    # profile, so the bare-id union would report another profile's same-named job as running.
+    # (authoritative check: try_register_running_job).
     try:
-        from cron.scheduler import is_job_running
-        if is_job_running(job_id):
+        from cron.scheduler import get_running_job_ids
+        if job_id in get_running_job_ids():
             return {"claimed": False, "success": False, "error": _ALREADY_RUNNING_ERROR}
     except Exception:
         pass
@@ -605,19 +602,17 @@ def _action_create(a: Dict[str, Any]) -> str:
     try:
         job = create_job_with_scheduler_registration(
             prompt=prompt or "", schedule=a["schedule"], name=a["name"], repeat=a["repeat"],
-            deliver=_resolve_cron_context_deliver(deliver),
-            origin=_origin_from_env(a["schedule"]),
-            skills=canonical_skills,
+            deliver=_resolve_cron_context_deliver(deliver), origin=_origin_from_env(), skills=canonical_skills,
             model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
             base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
-            script=_normalize_optional_job_value(script), context_from=context_from,
+            script=_normalize_optional_job_value(script),
+            script_failure_policy=a["script_failure_policy"], context_from=context_from,
             enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
             no_agent=_no_agent, attach_to_session=a["attach_to_session"],
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
-            pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
@@ -765,8 +760,6 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
         updates["model"] = _normalize_optional_job_value(a["model"])
     if a["provider"] is not None:
         updates["provider"] = _normalize_optional_job_value(a["provider"])
-    if a["pinned"] is not None:
-        updates["pinned"] = bool(a["pinned"])
     if a["base_url"] is not None:
         updates["base_url"] = _normalize_optional_job_value(a["base_url"], strip_trailing_slash=True)
     if a["reasoning_effort"] is not None:
@@ -788,6 +781,8 @@ def _update_script_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[
                 if path_error:
                     return path_error
             updates[field] = _normalize_optional_job_value(value) if value else None
+    if a["script_failure_policy"] is not None:
+        updates["script_failure_policy"] = a["script_failure_policy"]
     if monitor_url is not None:
         updates["monitor_url"] = _normalize_optional_job_value(monitor_url) if monitor_url else None
     if (monitor_script is not None or monitor_url is not None) and (
@@ -867,7 +862,51 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
         {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
 
 
-_JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
+def _action_resnap(a: Dict[str, Any]) -> str:
+    """Refresh stored effective pins to the current global inference resolution (#44585).
+
+    Bulk (``all=true``) refreshes every unpinned job; single-job resolves
+    ``job_id`` and refreshes just that job. Refuses to guess scope.
+    """
+    if bool(a["all"]):
+        updated = resnapshot_all_unpinned()
+        _notify_provider_jobs_changed_safe()
+        return _dumps({
+            "success": True,
+            "message": (
+                f"Refreshed inference snapshots on {len(updated)} unpinned "
+                "job(s). Successfully resolved axes are re-pinned to current "
+                "defaults until another resnap; unresolved axes retain their "
+                "prior snapshots."),
+            "updated_jobs": [_format_job(j) for j in updated],
+        })
+    job_id = a["job_id"]
+    if not job_id:
+        return tool_error(
+            "resnap requires either `job_id=<id>` (single job) or `all=true` "
+            "(refresh every unpinned job). Refusing to guess scope.",
+            success=False,
+        )
+    job, error = _resolve_job_or_error(job_id)
+    if error is not None:
+        return error
+    assert job is not None  # error is None ⇔ job resolved
+    updated = resnapshot_job(job["id"])
+    if not updated:
+        return tool_error(f"Failed to resnap job '{job_id}'", success=False)
+    _notify_provider_jobs_changed_safe()
+    return _dumps({
+        "success": True,
+        "message": (
+            f"Cron job '{updated['name']}' resnapshot completed. Successfully "
+            "resolved axes are re-pinned to current defaults until another "
+            "resnap; unresolved axes retain their prior snapshots."),
+        "job": _format_job(updated),
+    })
+
+
+# Actions that need no job_id, and job-bound actions (job resolved first).
+_JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list, "resnap": _action_resnap}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
@@ -912,6 +951,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    script_failure_policy: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     continuity: Optional[bool] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -922,11 +962,11 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    all: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
-    paused_reason: Optional[str] = None,
-    pinned: Optional[bool] = None) -> str:
+    paused_reason: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -969,9 +1009,9 @@ CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
 
-Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
+'resnap' refreshes stored effective pins for an unpinned job (job_id) or all unpinned jobs (all=true). Successfully resolved axes use the CURRENT global inference defaults until another resnap; unresolved axes retain their prior snapshots.
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -979,15 +1019,15 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run, resnap. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. When action=resnap, pass either job_id (single job) or all=true (every unpinned job)."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run."
+                "description": "Required for update/pause/resume/remove/run. For resnap: the job to adopt the current global inference resolution (omit if all=true)."
             },
-            "pinned": {
+            "all": {
                 "type": "boolean",
-                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later `hermes model` / `/model` changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
+                "description": "Only for action='resnap'. all=true re-pins every successfully resolved unpinned inference axis to its current global default until another resnap. Must be explicitly set to true — never implied. Omit (or false) to resnap a single job via job_id."
             },
             "prompt": {
                 "type": "string",
@@ -1022,6 +1062,12 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "script": {
                 "type": "string",
                 "description": _script_description("the profile HERMES_HOME")
+            },
+            "script_failure_policy": {
+                "type": "string",
+                "enum": ["continue", "fail_closed"],
+                "default": "continue",
+                "description": "Agent-backed pre-run script failure behavior. continue preserves legacy behavior by injecting the error into the prompt; fail_closed fails the run before the agent starts and requires a nonblank script."
             },
             "monitor": {
                 "type": "string",
@@ -1082,7 +1128,8 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "script_failure_policy",
+    "paused_reason", "all")
 
 
 def _cronjob_handler(args, **kw):

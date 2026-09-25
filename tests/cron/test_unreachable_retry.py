@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cron import unreachable_retry as ur
-from cron.jobs import create_job, get_due_jobs, get_job, load_jobs, mark_job_run, save_jobs
+from cron.jobs import create_job, get_job, mark_job_run
 
 
 @pytest.fixture
@@ -26,13 +26,9 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(
-    tmp_cron_home, monkeypatch,
-):
+def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(tmp_cron_home):
     """Failed-unreachable runs re-fire on the 5/15/30-minute ladder instead of waiting a
-    full period, and the ladder stops after its last rung (falls back to the schedule). A
-    cron job's ladder instant is off its lattice yet must be due, not re-anchored as a stale
-    expression edit."""
+    full period, and the ladder stops after its last rung (falls back to the schedule)."""
     # Interval, not a cron expression: the natural next fire is always a full day out. A
     # fixed clock time ("0 3 * * *") makes the 30-minute rung land past the natural fire
     # in the half hour before it, and plan_retry rightly yields to the schedule (CI red).
@@ -55,25 +51,6 @@ def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(
     assert j.get(ur.STATE_KEY) is None
     assert datetime.fromisoformat(j["next_run_at"]) - now > timedelta(hours=1)
 
-    pinned = datetime(2026, 9, 18, 12, 1, tzinfo=timezone.utc)
-    monkeypatch.setattr("cron.jobs._hermes_now", lambda: pinned)
-    monkeypatch.setattr(ur, "_hermes_now", lambda: pinned)
-    weekly = create_job("weekly digest", "0 12 * * 5")
-    assert mark_job_run(weekly["id"], False, "ConnectError: dns", model_unreachable=True)
-    retry_at = datetime.fromisoformat(get_job(weekly["id"])["next_run_at"])
-    assert retry_at == pinned + timedelta(seconds=ur.RETRY_DELAYS_SECONDS[0])
-    monkeypatch.setattr("cron.jobs._hermes_now", lambda: retry_at + timedelta(seconds=1))
-    assert weekly["id"] in {due["id"] for due in get_due_jobs()}
-
-    # A direct jobs.json expression edit while a retry is parked re-anchors without firing.
-    assert mark_job_run(weekly["id"], False, "ConnectError: dns", model_unreachable=True)
-    retry_at = datetime.fromisoformat(get_job(weekly["id"])["next_run_at"])
-    jobs = load_jobs()
-    next(j for j in jobs if j["id"] == weekly["id"])["schedule"]["expr"] = "0 9 * * 1"
-    save_jobs(jobs)
-    monkeypatch.setattr("cron.jobs._hermes_now", lambda: retry_at + timedelta(seconds=1))
-    assert weekly["id"] not in {due["id"] for due in get_due_jobs()}
-
 
 def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home):
     """Any run that reached the model clears retry state; one-shots (pre-claimed
@@ -95,3 +72,21 @@ def test_reaching_the_model_resets_ladder_and_oneshots_never_retry(tmp_cron_home
     assert mark_job_run(once["id"], False, "ConnectError: dns", model_unreachable=True)
     remaining = get_job(once["id"])
     assert remaining is None or remaining.get(ur.STATE_KEY) is None
+
+
+def test_retry_yields_to_nearer_natural_run(tmp_cron_home, monkeypatch):
+    """The durable store mutation leaves a nearer natural occurrence intact."""
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(ur, "_hermes_now", lambda: now)
+    natural_next = (now + timedelta(minutes=1)).isoformat()
+    job = {
+        "id": "near-natural",
+        "name": "near natural",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "state": "scheduled",
+        "next_run_at": natural_next,
+    }
+
+    assert ur.plan_retry(job) is False
+    assert job.get(ur.STATE_KEY) is None
+    assert job["next_run_at"] == natural_next

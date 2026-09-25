@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cron.jobs import create_job, get_job, list_jobs, load_jobs, pause_job, save_jobs
+from cron.jobs import create_job, get_job, list_jobs, load_jobs, save_jobs
 from hermes_cli import cron as cron_cli
 from hermes_cli.cron import cron_command
 from hermes_cli.subcommands.cron import build_cron_parser
@@ -130,6 +130,80 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
 
+    def test_create_parses_and_persists_fail_closed_script_policy(
+        self, tmp_cron_dir, capsys
+    ):
+        # Create-time validation requires the script to exist in this
+        # profile's scripts/ dir (#94821).
+        from hermes_constants import get_hermes_home
+
+        scripts_dir = get_hermes_home() / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        (scripts_dir / "gate.py").write_text("print('gate')\n")
+
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Analyze only if the gate succeeds",
+                "--script",
+                "gate.py",
+                "--script-failure-policy",
+                "fail_closed",
+            ]
+        )
+
+        assert cron_command(args) == 0
+        job = list_jobs()[0]
+        assert job["script_failure_policy"] == "fail_closed"
+        assert "Script failure policy: fail_closed" in capsys.readouterr().out
+
+    def test_edit_resets_policy_when_removing_script_atomically(
+        self, tmp_cron_dir, capsys
+    ):
+        job = create_job(
+            prompt="Analyze only if gate succeeds",
+            schedule="every 1h",
+            script="gate.py",
+            script_failure_policy="fail_closed",
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        args = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--script",
+                "",
+                "--script-failure-policy",
+                "continue",
+            ]
+        )
+
+        assert cron_command(args) == 0
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["script"] is None
+        assert updated["script_failure_policy"] == "continue"
+        assert "Updated job" in capsys.readouterr().out
+
+    def test_list_displays_script_failure_policy(self, tmp_cron_dir, capsys):
+        create_job(
+            prompt="Analyze only if gate succeeds",
+            schedule="every 1h",
+            script="gate.py",
+            script_failure_policy="fail_closed",
+        )
+
+        cron_cli.cron_list()
+
+        assert "Script failure policy: fail_closed" in capsys.readouterr().out
 
 class TestUnverifiedDeliveryVisibility:
     """An evidence-free live-adapter ack (Slack/Matrix/Mattermost bare
@@ -260,18 +334,6 @@ class TestCronDoctor:
 class TestCronListStatusRendering:
     """`cron list` must never paint an undelivered run as a success (#83993)."""
 
-    def test_default_list_includes_paused_jobs(self, tmp_cron_dir, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
-        job = create_job(prompt="Paused digest", schedule="every 1h")
-        pause_job(job["id"])
-
-        cron_command(Namespace(cron_command="list", all=False))
-
-        out = capsys.readouterr().out
-        assert job["id"] in out
-        assert "[paused]" in out
-        assert "No scheduled jobs" not in out
-
     def test_delivery_failed_is_not_green_ok(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1])
         # capsys is not a tty, so force colors on to check the paint itself.
@@ -352,7 +414,7 @@ class TestExternalCronProviderStatus:
         assert "managed scheduler" in out
         assert "not firing" not in out.lower()
         assert "STALLED" not in out
-        assert "No gateway is running on this host" not in out
+        assert "Gateway is not running" not in out
         # Still surfaces the active-job summary.
         assert "active job(s)" in out
 
@@ -386,8 +448,38 @@ class TestExternalCronProviderStatus:
         assert "Scheduler is not ready" not in out
 
 
+def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "cron.jobs.list_jobs",
+        lambda include_disabled=False: [
+            {
+                "id": "job-1",
+                "name": "Nightly docs",
+                "schedule_display": "every day",
+                "state": "scheduled",
+                "enabled": True,
+                "next_run_at": "2026-06-01T00:00:00Z",
+                "deliver": ["local"],
+            }
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+    monkeypatch.setattr(cron_cli, "_active_cron_provider_name", lambda: "builtin")
+
+    cron_cli.cron_list()
+
+    out = capsys.readouterr().out
+    assert "Scheduler is not ready" in out
+    assert "Nightly docs" in out
 
 
+def test_cron_tick_invokes_scheduler_tick_with_verbose(monkeypatch):
+    calls = []
+    monkeypatch.setattr("cron.scheduler.tick", lambda verbose=False: calls.append(verbose))
+
+    cron_cli.cron_tick()
+
+    assert calls == [True]
 
 
 def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
@@ -563,6 +655,15 @@ class TestSlashCronListLastStatus:
         out = self._run_list(tmp_cron_dir, capsys)
         assert "Last run: 2026-09-01T07:00:00+00:00 (delivery_failed: telegram: 502 Bad Gateway)" in out
 
+    def test_ok_stays_plain(self, tmp_cron_dir, capsys):
+        create_job(prompt="Nightly brief", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["last_run_at"] = "2026-09-01T07:00:00+00:00"
+        jobs[0]["last_status"] = "ok"
+        save_jobs(jobs)
+
+        out = self._run_list(tmp_cron_dir, capsys)
+        assert "(ok)" in out
 
 
 class TestStatusSurfacesDeadScheduler:
@@ -570,12 +671,7 @@ class TestStatusSurfacesDeadScheduler:
     status` / `cron list` must not present the stale timestamp as an upcoming "Next run":
     flag it as overdue and say when the scheduler last ticked."""
 
-    def _dead_gateway(self, monkeypatch, lock_dir):
-        # No gateway owns the HOST role either: point the rendezvous dir at an empty scratch dir
-        # so an unrelated host record can never make this profile look served. (Superseded by the
-        # tests/conftest.py hook in #118097 once that lands.)
-        lock_dir.mkdir(exist_ok=True)
-        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(lock_dir))
+    def _dead_gateway(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
         monkeypatch.setattr(
             "hermes_cli.gateway.named_profile_served_by_running_multiplexer", lambda: None
@@ -591,7 +687,7 @@ class TestStatusSurfacesDeadScheduler:
         self, tmp_cron_dir, capsys, monkeypatch
     ):
         job = create_job(prompt="Hourly", schedule="every 60m")
-        self._dead_gateway(monkeypatch, tmp_cron_dir / "locks")
+        self._dead_gateway(monkeypatch)
         self._park_next_run(job["id"], datetime.now(timezone.utc) - timedelta(hours=7))
         (tmp_cron_dir / "cron" / "ticker_heartbeat").write_text(str(time.time() - 25 * 3600))
 
@@ -600,7 +696,7 @@ class TestStatusSurfacesDeadScheduler:
         cron_command(Namespace(cron_command="list", all=False, json=False))
         list_out = capsys.readouterr().out
 
-        assert "No gateway is running on this host" in status_out
+        assert "Gateway is not running" in status_out
         assert "Scheduler last ticked" in status_out
         assert "OVERDUE" in status_out and "7h ago" in status_out
         # The stale timestamp must no longer read as an upcoming run on either surface.
@@ -612,7 +708,7 @@ class TestStatusSurfacesDeadScheduler:
         # a few minutes behind the ticker's own cadence is not an outage yet, and status must
         # not flash OVERDUE while doctor calls the same job healthy.
         job = create_job(prompt="Hourly", schedule="every 60m")
-        self._dead_gateway(monkeypatch, tmp_cron_dir / "locks")
+        self._dead_gateway(monkeypatch)
         self._park_next_run(job["id"], datetime.now(timezone.utc) - timedelta(minutes=5))
 
         cron_command(Namespace(cron_command="status"))
