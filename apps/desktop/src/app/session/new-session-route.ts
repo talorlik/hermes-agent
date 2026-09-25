@@ -10,7 +10,7 @@ import {
   ensureGatewayProfile,
   pinLegacyNewChatProfile
 } from '@/store/profile'
-import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
+import { $projectScope, ALL_PROJECTS } from '@/store/projects'
 import {
   isPeerInstanceWindow,
   isProfilePinnedWindow,
