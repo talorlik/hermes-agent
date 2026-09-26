@@ -168,12 +168,7 @@ _STATE_BADGES = {"paused": ("[paused]", Colors.YELLOW), "completed": ("[complete
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import effective_job_state, list_jobs
-    jobs = list_jobs(include_disabled=True)
-    if not show_all:
-        jobs = [
-            job for job in jobs
-            if job.get("enabled", True) or effective_job_state(job) == "paused"
-        ]
+    jobs = list_jobs(include_disabled=show_all)
 
     if not jobs:
         print(color("No scheduled jobs.\nCreate one with 'hermes cron create ...' "
@@ -188,7 +183,8 @@ def cron_list(show_all: bool = False):
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {color(*badge)}")
         for label, value in _job_rows(job):
-            print(f"    {label + ':':<11}{value}")
+            padding = " " * max(1, 11 - len(label) - 1)
+            print(f"    {label}:{padding}{value}")
         for line in _job_warnings(job):
             print(f"    {line}")
         print()
@@ -200,6 +196,10 @@ def _last_run_display(job: Dict[str, Any]) -> str:
     last_status = job["last_status"]
     if last_status == "ok":
         return color("ok", Colors.GREEN)
+    if last_status == "deferred":
+        defer = job.get("last_defer") or {}
+        retry_at = defer.get("retry_at") or job.get("next_run_at") or "?"
+        return color(f"deferred (retry at {retry_at})", Colors.YELLOW)
     if last_status == "delivery_queued":
         return color("finished; delivery is still in progress", Colors.YELLOW)
     if last_status == "delivery_failed":
@@ -229,6 +229,8 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
+        ("Script failure policy", job.get("script_failure_policy", "continue")
+         if job.get("script") else ""),
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
@@ -320,10 +322,31 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
               f"{record.get('claimed_at', '?')}")
         if record.get("error"):
             print(f"    {record['error']}")
+        outcome = record.get("outcome")
+        if outcome and outcome != record.get("status"):
+            print(f"    outcome={outcome}")
+        if record.get("occurrence_key"):
+            retry_at = record.get("retry_at")
+            suffix = f"  retry_at={retry_at}" if retry_at else ""
+            print(f"    occurrence={record['occurrence_key']}{suffix}")
+        if record.get("delivery_target"):
+            print(
+                f"    delivery={record.get('delivery_status', '?')} "
+                f"target={record['delivery_target']} "
+                f"attempts={record.get('delivery_attempts', 0)}"
+            )
+            if record.get("delivery_error"):
+                print(f"      {record['delivery_error']}")
+        if record.get("detached_run_id"):
+            print(
+                f"    detached run={record['detached_run_id']} "
+                f"status={record.get('detached_status', '?')} "
+                f"lease_expires={record.get('lease_expires_at', '?')}"
+            )
 
 
 _INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "resolved": Colors.GREEN,
-                          "closed": Colors.DIM}
+                          "recovered": Colors.GREEN, "closed": Colors.DIM}
 
 
 def cron_incidents(args) -> int:
@@ -395,10 +418,8 @@ def _print_ticker_health(pids: list, restart_command: str = "hermes gateway rest
     from cron.jobs import (
         get_ticker_heartbeat_age, get_ticker_last_error, get_ticker_success_age)
     from cron.scheduler import _is_fd_exhaustion_text as _cron_is_fd_exhaustion_text
-    from cron.scheduler import stale_code_yield_labels
     hb_age = get_ticker_heartbeat_age()
     ok_age = get_ticker_success_age()
-    last_error = get_ticker_last_error()
     pid_line = f"  PID: {', '.join(map(str, pids))}" if pids else None
 
     def _warn(headline: str) -> None:
@@ -416,19 +437,10 @@ def _print_ticker_health(pids: list, restart_command: str = "hermes gateway rest
         _warn("⚠ Gateway is running but the cron ticker looks STALLED — "
               f"no heartbeat for {int(hb_age)}s (expected every ~60s).")
         print(f"  Cron jobs may NOT be firing. Restart: {restart_command}")
-    elif (skew := stale_code_yield_labels(last_error)) is not None:
-        # `hermes update` moved the checkout under a running gateway: its ticker yields every
-        # tick (heartbeat stays fresh, nothing dispatches) until the process is restarted (#117275).
-        _warn("⚠ Gateway is running STALE code — its cron ticker yields every tick and "
-              "fires NOTHING.")
-        print(color(f"  Booted on {skew[0]}, checkout is now at {skew[1]} "
-                    "(the code was updated under the running gateway).", Colors.RED))
-        print(f"  Restart it onto the new code: {restart_command}")
-    elif (ok_age is not None and not _ticker_age_is_fresh(ok_age)) or (ok_age is None and last_error):
-        # Loop alive but every tick fails (or has never succeeded since boot).
+    elif ok_age is not None and not _ticker_age_is_fresh(ok_age):  # loop alive but every tick fails
         _warn("⚠ Gateway and cron ticker are running, but no tick has "
-              f"succeeded {'in ' + str(int(ok_age)) + 's' if ok_age is not None else 'yet'} "
-              "— ticks may be failing.")
+              f"succeeded in {int(ok_age)}s — ticks may be failing.")
+        last_error = get_ticker_last_error()
         if last_error:
             # WHY ticks fail: root-rewritten jobs.json (PermissionError) or fd exhaustion.
             # Show WHY ticks fail — e.g. a root-rewritten jobs.json (PermissionError) that silently locked
@@ -464,18 +476,10 @@ def cron_status():
         print(color("  (No ticker heartbeat is expected for an external provider; "
                     "due jobs are delivered by an authenticated webhook.)", Colors.DIM))
     else:
-        from gateway.host_topology import host_gateway_serving
-        active = get_active_profile_name()
-        # FIRST question under multiplex-only: is the HOST gateway alive and does it tick THIS
-        # profile? Starting from find_gateway_pids() (argv `-p <name>`) made every served profile
-        # report "not running" and told the user to start a SECOND host process.
-        host = None
-        with contextlib.suppress(Exception):
-            host = host_gateway_serving(active)
-        pids = [] if host is not None else find_gateway_pids()
+        pids = find_gateway_pids()
         gateway_alive_via_lock = False
         served_by_multiplexer = False
-        if host is None and not pids:
+        if not pids:
             # The pid scan transiently misses a live gateway right after a restart; the runtime
             # lock proves the process is alive. Declare "not running" only when both agree.
             with contextlib.suppress(Exception):
@@ -489,19 +493,15 @@ def cron_status():
             # Multiplexer identity does not establish the active profile's ticker health.
             if not gateway_alive_via_lock:
                 served_by_multiplexer = named_profile_served_by_running_multiplexer()
-        if host is not None:
-            print(f"  Scheduler host: {host.describe()}")
-            # `hermes gateway restart` exits 78 for a served NAMED profile
-            # (_guard_named_profile_under_multiplexer): the one host process is the default's.
-            _print_ticker_health([host.pid], restart_command="hermes --profile default gateway restart")
-        elif pids or gateway_alive_via_lock or served_by_multiplexer:
+        if pids or gateway_alive_via_lock or served_by_multiplexer:
             if served_by_multiplexer:
-                print("  Scheduler host: the host gateway (multiplexing this profile)")
+                print("  Scheduler host: default-profile multiplexer")
                 _print_ticker_health([], restart_command="hermes --profile default gateway restart")
             else:
                 _print_ticker_health(pids)
         else:
-            print(color("✗ No gateway is running on this host — cron jobs will NOT fire", Colors.RED))
+            print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
+            active = get_active_profile_name()
             # When scheduling last worked before the host went away: without this, a
             # 7h-overdue job still reads as a normal upcoming "Next run" (#114309).
             with contextlib.suppress(Exception):
@@ -511,14 +511,17 @@ def cron_status():
                     print(color("  Scheduler last ticked "
                                 f"{_format_lateness(hb_age)} ago — jobs that came due "
                                 "since then have not fired.", Colors.YELLOW))
-            print("\n  Start the ONE host gateway (it multiplexes every profile, this one included):\n"
-                  "    hermes --profile default gateway install   # user service\n"
-                  "    sudo hermes --profile default gateway install --system  # Linux servers: boot-time service\n"
-                  "    hermes --profile default gateway run       # Or run in foreground")
+            print("\n  To enable automatic execution for this profile:\n"
+                  "    hermes gateway install    # Install as a user service\n"
+                  "    sudo hermes gateway install --system  # Linux servers: boot-time system service\n"
+                  "    hermes gateway run        # Or run in foreground")
             if active not in ("default", "custom"):
-                print("\n  It serves this profile automatically. If a per-profile service or gateway\n"
-                      "  from an older release is still installed, fold it in (preflight + dry run):\n"
-                      "      hermes --profile default gateway migrate --multiplex --dry-run\n"
+                print("\n  Alternatives for this named profile:\n"
+                      "    Keep the Desktop app open with this profile included in its scheduler and the machine awake, or\n"
+                      "    configure a running default gateway to tick this profile:\n"
+                      "      hermes --profile default config set gateway.multiplex_profiles true\n"
+                      "      hermes --profile default gateway restart\n"
+                      "    To migrate existing per-profile services with preflight checks:\n"
                       "      hermes --profile default gateway migrate --multiplex\n"
                       "  Check: hermes cron status from this profile should show its ticker heartbeat.\n")
 
@@ -668,8 +671,9 @@ def cron_doctor() -> int:
 
 
 _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver", "failure_deliver"),
-                   ("repeat", "repeat"), ("script", "script"), ("workdir", "workdir"),
-                   ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
+                   ("repeat", "repeat"), ("script", "script"),
+                   ("script_failure_policy", "script_failure_policy"), ("workdir", "workdir"),
+                   ("model", "model"), ("provider", "model_provider"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"))
 
@@ -693,6 +697,11 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
     for key, template in _JOB_DETAIL_LINES:
         if job_data.get(key):
             print(template.format(job_data[key]))
+    if job_data.get("script"):
+        print(
+            "  Script failure policy: "
+            f"{job_data.get('script_failure_policy', 'continue')}"
+        )
 
 
 def cron_create(args):
@@ -878,6 +887,40 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_finalize_detached(args) -> int:
+    """Finalize a detached cron run by correlation id."""
+    from cron.executions import finalize_detached_run, find_detached_run
+
+    run_id = str(getattr(args, "run_id", "") or "")
+    success = bool(getattr(args, "success", False))
+    error = getattr(args, "error", None)
+    record = finalize_detached_run(run_id, success=success, error=error)
+    if record is not None:
+        print(
+            f"Finalized detached run {run_id}: "
+            f"{record.get('detached_status')} "
+            f"(job {record.get('job_id')}, execution {record.get('id')})"
+        )
+        return 0
+    existing = find_detached_run(run_id)
+    if existing is None:
+        print(f"No detached run found for correlation id {run_id!r}")
+        return 2
+    current = str(existing.get("detached_status") or "")
+    desired = "succeeded" if success else "failed"
+    if current == desired:
+        print(
+            f"Detached run {run_id} already finalized as {current} "
+            "(idempotent no-op)"
+        )
+        return 0
+    print(
+        f"Detached run {run_id} is already {current!r}; refusing to "
+        f"rewrite it as {desired!r}"
+    )
+    return 1
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
@@ -886,6 +929,7 @@ _CRON_SUBCOMMANDS = {
     "tick": lambda a: cron_tick(),
     "runs": lambda a: cron_runs(getattr(a, "job_id", None), getattr(a, "limit", 20)) or 0,
     "incidents": lambda a: cron_incidents(a),
+    "finalize-detached": lambda a: cron_finalize_detached(a),
     "notepad": lambda a: cron_notepad(a),
     "create": lambda a: cron_create(a),
     "edit": lambda a: cron_edit(a),
@@ -893,7 +937,7 @@ _CRON_SUBCOMMANDS = {
     "resume": lambda a: cron_resume(a),
     "run": lambda a: _job_action("run", a.job_id, "Triggered"),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),
-}
+    "resnap": lambda a: _cron_resnap(a)}
 _CRON_SUBCOMMANDS["history"] = _CRON_SUBCOMMANDS["runs"]
 _CRON_SUBCOMMANDS["add"] = _CRON_SUBCOMMANDS["create"]
 _CRON_SUBCOMMANDS["rm"] = _CRON_SUBCOMMANDS["delete"] = _CRON_SUBCOMMANDS["remove"]
@@ -906,5 +950,35 @@ def cron_command(args):
     if handler is not None:
         return handler(args)
     print(f"Unknown cron command: {subcmd}\n"
-          "Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+          "Usage: hermes cron [list|create|edit|pause|resume|run|remove|resnap|status|runs|doctor|tick]")
     sys.exit(1)
+
+
+def _cron_resnap(args) -> int:
+    """Handle `hermes cron resnap [job_id] [--all]`."""
+    if bool(getattr(args, "all", False)):
+        result = _cron_api(action="resnap", all=True)
+        if not result.get("success"):
+            print(color(f"Failed to resnap: {result.get('error', 'unknown error')}", Colors.RED))
+            return 1
+        updated = result.get("updated_jobs", [])
+        print(color(f"Resnapped {len(updated)} unpinned job(s) to the current global resolution.", Colors.GREEN))
+        for job in updated:
+            print(f"  • {job.get('name', job.get('job_id'))} ({job.get('job_id')})")
+        if not updated:
+            print("  (no unpinned agent jobs found — nothing to refresh)")
+        return 0
+
+    job_id = getattr(args, "job_id", None)
+    if not job_id:
+        print(color("resnap requires either a <job_id> or --all.", Colors.RED))
+        print("Usage: hermes cron resnap <job_id> | hermes cron resnap --all")
+        return 1
+    result = _cron_api(action="resnap", job_id=job_id)
+    if not result.get("success"):
+        print(color(f"Failed to resnap job: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    job = result.get("job", {})
+    print(color(f"Resnapped job: {job.get('name', job_id)} ({job.get('job_id', job_id)})", Colors.GREEN))
+    print("  Adopted the current global inference resolution; the job remains unpinned and will track future global changes.")
+    return 0
