@@ -1,3 +1,34 @@
+---
+title: "Github Pr Workflow — GitHub PR lifecycle: branch, commit, open, CI, merge"
+sidebar_label: "Github Pr Workflow"
+description: "GitHub PR lifecycle: branch, commit, open, CI, merge"
+---
+
+{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
+
+# Github Pr Workflow
+
+GitHub PR lifecycle: branch, commit, open, CI, merge.
+
+## Skill metadata
+
+| | |
+|---|---|
+| Source | Bundled (installed by default) |
+| Path | `skills/github/github-pr-workflow` |
+| Version | `1.1.0` |
+| Author | Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos, windows |
+| Tags | `GitHub`, `Pull-Requests`, `CI/CD`, `Git`, `Automation`, `Merge` |
+| Related skills | [`github-auth`](./github-github-auth.md), [`github-code-review`](./github-github-code-review.md) |
+
+## Reference: full SKILL.md
+
+:::info
+The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+:::
+
 # GitHub Pull Request Workflow
 
 Complete guide for managing the PR lifecycle. Each section shows the `gh` way first, then the `git` + `curl` fallback for machines without `gh`.
@@ -20,7 +51,7 @@ else
     if _hermes_env="${HERMES_HOME:-$HOME/.hermes}/.env"; [ -f "$_hermes_env" ] && grep -q "^GITHUB_TOKEN=" "$_hermes_env"; then
       GITHUB_TOKEN=$(grep "^GITHUB_TOKEN=" "$_hermes_env" | head -1 | cut -d= -f2 | tr -d '\n\r')
     elif grep -q "github.com" ~/.git-credentials 2>/dev/null; then
-      GITHUB_TOKEN=$(uv run python "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/git-credential-token.py")
+      GITHUB_TOKEN=$(uv run python3 "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/git-credential-token.py")
     fi
   fi
 fi
@@ -160,7 +191,7 @@ SHA=$(git rev-parse HEAD)
 curl -s \
   -H "Authorization: token $GITHUB_TOKEN" \
   https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
-  | python -c "
+  | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 print(f\"Overall: {data['state']}\")
@@ -171,7 +202,7 @@ for s in data.get('statuses', []):
 curl -s \
   -H "Authorization: token $GITHUB_TOKEN" \
   https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/check-runs \
-  | python -c "
+  | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for cr in data.get('check_runs', []):
@@ -187,7 +218,7 @@ for i in $(seq 1 20); do
   STATUS=$(curl -s \
     -H "Authorization: token $GITHUB_TOKEN" \
     https://api.github.com/repos/$OWNER/$REPO/commits/$SHA/status \
-    | python -c "import sys,json; print(json.load(sys.stdin)['state'])")
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
   echo "Check $i: $STATUS"
   if [ "$STATUS" = "success" ] || [ "$STATUS" = "failure" ] || [ "$STATUS" = "error" ]; then
     break
@@ -221,7 +252,7 @@ BRANCH=$(git branch --show-current)
 curl -s \
   -H "Authorization: token $GITHUB_TOKEN" \
   "https://api.github.com/repos/$OWNER/$REPO/actions/runs?branch=$BRANCH&per_page=5" \
-  | python -c "
+  | python3 -c "
 import sys, json
 runs = json.load(sys.stdin)['workflow_runs']
 for r in runs:
@@ -326,7 +357,7 @@ Merge methods: `"merge"` (merge commit), `"squash"`, `"rebase"`
 PR_NODE_ID=$(curl -s \
   -H "Authorization: token $GITHUB_TOKEN" \
   https://api.github.com/repos/$OWNER/$REPO/pulls/$PR_NUMBER \
-  | python -c "import sys,json; print(json.load(sys.stdin)['node_id'])")
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['node_id'])")
 
 curl -s -X POST \
   -H "Authorization: token $GITHUB_TOKEN" \
