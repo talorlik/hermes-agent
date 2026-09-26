@@ -21,6 +21,9 @@ function makeRepo() {
 
   tempDirs.push(dir)
   execFileSync('git', ['init', '-q'], { cwd: dir })
+  // An empty local core.hooksPath overrides any global hooks dir whose
+  // commit-msg hook would reject the short fixture messages below.
+  execFileSync('git', ['config', 'core.hooksPath', ''], { cwd: dir })
   execFileSync('git', ['config', 'user.email', 'hermes-test@example.com'], { cwd: dir })
   execFileSync('git', ['config', 'user.name', 'Hermes Test'], { cwd: dir })
   fs.writeFileSync(path.join(dir, 'tracked.txt'), 'tracked\n')
@@ -36,6 +39,26 @@ test('resolveRenamePath: plain path is unchanged', () => {
 
 test('gitFor accepts an internally resolved git binary path containing spaces', () => {
   assert.doesNotThrow(() => gitFor(process.cwd(), 'C:\\Program Files\\Git\\cmd\\git.exe'))
+})
+
+test('gitFor runs git through a spaced binary path', async () => {
+  if (process.platform !== 'win32') {
+    return
+  }
+
+  const gitBin = path.join(process.env.ProgramFiles || String.raw`C:\Program Files`, 'Git', 'cmd', 'git.exe')
+
+  if (!fs.existsSync(gitBin)) {
+    return
+  }
+
+  const repo = makeRepo()
+
+  fs.writeFileSync(path.join(repo, 'changed.txt'), 'review me\n')
+
+  const status = await gitFor(repo, gitBin).status()
+
+  assert.equal(status.not_added.includes('changed.txt'), true)
 })
 
 test('resolveRenamePath: simple rename resolves to the new path', () => {
