@@ -29,7 +29,6 @@ import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
 import { $pinnedSessionIds } from '@/store/layout'
-import { $guideOpening, $onboardingGate } from '@/store/onboarding-gate'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $hydrationSyncProfile, $profiles } from '@/store/profile'
@@ -61,12 +60,7 @@ import { ChatBar, ChatBarFallback } from './composer'
 import { FloatingComposerSurface } from './composer/floating-surface'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
-import {
-  ComposerScopeProvider,
-  ComposerSurfaceProvider,
-  useComposerScope,
-  useComposerSurfaceId
-} from './composer/scope'
+import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from './composer/scope'
 import type { ChatBarState } from './composer/types'
 import { useHistoryWindow } from './history-window'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
@@ -79,14 +73,13 @@ import { useRuntimeMessageRepository } from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
-import { composerStaysMounted, routedSessionIsLoading, threadLoadingState } from './thread-loading'
+import { routedSessionIsLoading, threadLoadingState } from './thread-loading'
 import {
   backfillOlderTranscriptPage,
   mergeOlderTranscriptPage,
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceSessionTranscriptWindow, type SessionWindowMemo } from './transcript-window'
-import { useTranscriptRetention } from './use-transcript-retention'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -269,20 +262,6 @@ export function ChatRuntimeBoundary({
     [ownerConnection, ownerProfile]
   )
 
-  // A Bot chat opened IN PLACE in the main pane (openStoredBotChat) keeps the
-  // active profile, so the ambient scope carries no owner. Publish the session
-  // owner hint's (connection, profile) here so voice playback speaks with the
-  // Bot's own voice; a tile's scope already names its owner and is kept as is.
-  const parentScope = useComposerScope()
-
-  const composerScope = useMemo(
-    () =>
-      parentScope.profile || !ownerProfile
-        ? parentScope
-        : { ...parentScope, connectionId: ownerConnection || undefined, profile: ownerProfile },
-    [ownerConnection, ownerProfile, parentScope]
-  )
-
   const history = useHistoryWindow({
     scopeKey: JSON.stringify([runtimeId, storedId, tailProfile, connectionId, activeProfile, suppressMessages]),
     storedId,
@@ -333,17 +312,6 @@ export function ChatRuntimeBoundary({
   }, [messages, windowPages])
 
   const currentMessages = history.page?.messages ?? windowedMessages
-  // Release the store's paged-through history (persisted rows older than the
-  // window) instead of retaining it for the window's lifetime (#77311). A
-  // static history page is not the live store, and neither is a suppressed
-  // transcript, so both opt out.
-  useTranscriptRetention({
-    anchorId: windowed ? (windowedMessages[0]?.id ?? null) : null,
-    enabled: !suppressMessages && !history.page,
-    profile: tailProfile,
-    runtimeId,
-    storedSessionId: storedId
-  })
   const runtimeMessageRepository = useRuntimeMessageRepository(currentMessages)
   // Subscribed (not read imperatively) so the "Show earlier" affordance
   // appears/retires as tail hydrations and backfill pages record their state.
@@ -437,26 +405,15 @@ export function ChatRuntimeBoundary({
       // Submission is handled explicitly by ChatBar.
       // Keeping this no-op avoids duplicate prompt.submit calls.
     },
-    // Editing stays AVAILABLE on a history page. `isDisabled` above blocks
-    // submit/reload/branch and keeps the page static, but the rail jump is
-    // the only way into that page and it has no in-thread exit — so dropping
-    // `onEdit` left the inline composer unopenable after ANY far rail jump
-    // (the throw "Runtime does not support editing", infectious downward,
-    // healed only by the floating jump button's returnToLatest). `editMessage`
-    // already resolves its target against the live session store
-    // (use-prompt-actions), never the display page, so the edit is correct;
-    // sending one rewinds the live transcript and drops the page.
-    onEdit,
+    onEdit: isHistorical ? undefined : onEdit,
     onCancel: isHistorical ? undefined : async () => onCancel(),
     onReload: isHistorical ? undefined : onReload
   })
 
   return (
-    <ComposerScopeProvider value={composerScope}>
-      <TranscriptWindowProvider value={transcriptWindow}>
-        <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
-      </TranscriptWindowProvider>
-    </ComposerScopeProvider>
+    <TranscriptWindowProvider value={transcriptWindow}>
+      <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+    </TranscriptWindowProvider>
   )
 }
 
@@ -515,8 +472,6 @@ const ChatViewContent = memo(function ChatViewContent({
   const composerScope = useComposerScope()
   const composerSurfaceId = useComposerSurfaceId()
   const isPrimary = view.kind === 'primary'
-  const guideOpening = useStore($guideOpening) && isPrimary
-  const guideStarted = useStoreSelector($onboardingGate, gate => gate.guideKickoff === 'started')
   const activeSessionId = useStore(view.$runtimeId)
 
   const transcriptStoredSessionId = useStoreSelector($sessionStates, states =>
@@ -673,25 +628,7 @@ const ChatViewContent = memo(function ChatViewContent({
   // Hide the composer in the exhausted error state too: there's no live runtime
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
-  //
-  // Once this route has rendered with its composer, a later transient loader
-  // (periodic list/status refresh, hydrate through an empty frame) must not
-  // unmount it again — see composerStaysMounted (#117375).
-  const settledRoutedSessionRef = useRef<null | string>(null)
-
-  if (!guideOpening && !loadingSession && isRoutedSessionView) {
-    settledRoutedSessionRef.current = routedSessionId
-  } else if (!isRoutedSessionView) {
-    settledRoutedSessionRef.current = null
-  }
-
-  const showChatBar = composerStaysMounted({
-    hideComposer: resumeExhausted || isWatchWindow(),
-    loadingSession,
-    routedSessionId,
-    settledRoutedSessionId: settledRoutedSessionRef.current
-  })
-
+  const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResult>({
@@ -801,7 +738,6 @@ const ChatViewContent = memo(function ChatViewContent({
       data-chat-unfocused={surfaceFocused || surfaceHovered ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}
       data-composer-target={composerScope.target}
-      data-guide-arrived={isPrimary && guideStarted ? '' : undefined}
       data-session-anchor={sessionAnchor}
     >
       <Backdrop />
@@ -835,22 +771,20 @@ const ChatViewContent = memo(function ChatViewContent({
           data-slot="composer-bounds"
           {...dropHandlers}
         >
-          {!guideOpening && (
-            <Thread
-              clampToComposer={showChatBar}
-              cwd={currentCwd}
-              gateway={gateway}
-              intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
-              loading={threadLoading}
-              onBranchInNewChat={onBranchInNewChat}
-              onCancel={haltRun}
-              onDismissError={onDismissError}
-              onRestoreToMessage={onRestoreToMessage}
-              scrollProfile={modelOptionsProfile || activeGatewayProfile}
-              sessionId={activeSessionId}
-              sessionKey={threadKey}
-            />
-          )}
+          <Thread
+            clampToComposer={showChatBar}
+            cwd={currentCwd}
+            gateway={gateway}
+            intro={showIntro ? { personality: introPersonality, seed: introSeed } : undefined}
+            loading={threadLoading}
+            onBranchInNewChat={onBranchInNewChat}
+            onCancel={haltRun}
+            onDismissError={onDismissError}
+            onRestoreToMessage={onRestoreToMessage}
+            scrollProfile={modelOptionsProfile || activeGatewayProfile}
+            sessionId={activeSessionId}
+            sessionKey={threadKey}
+          />
           {resumeExhausted && routedSessionId && (
             <ResumeExhaustedOverlay onRetryResume={onRetryResume} sessionId={routedSessionId} />
           )}
