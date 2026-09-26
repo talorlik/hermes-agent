@@ -171,6 +171,21 @@ def coalesce_session_name_args(argv: list[str]) -> list[str]:
     return result
 
 
+def command_argv(argv: list[str]) -> list[str]:
+    """Subcommand and its arguments, excluding top-level flags and their values."""
+    required, optional = top_level_value_flag_sets()
+    value_flags = required | optional | {flag for flag, takes_value in PRE_ARGPARSE_INHERITED_FLAGS if takes_value}
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            return argv[i + 1:]
+        if not token.startswith("-"):
+            return argv[i:]
+        i += 2 if "=" not in token and token in value_flags and i + 1 < len(argv) else 1
+    return []
+
+
 def first_positional_index(
     argv: list[str], parser: argparse.ArgumentParser | None = None
 ) -> int | None:
