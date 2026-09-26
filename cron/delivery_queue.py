@@ -41,6 +41,14 @@ def _path() -> Path:
     return DELIVERY_DB or (get_hermes_home().resolve() / "cron" / "deliveries.db")
 
 
+def queue_path(home: Optional[Path] = None) -> Path:
+    """Return the path to the delivery queue database for the given home."""
+    if DELIVERY_DB is not None:
+        return DELIVERY_DB
+    target_home = home.resolve() if home is not None else get_hermes_home().resolve()
+    return target_home / "cron" / "deliveries.db"
+
+
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
     """Bound only truly terminal legacy rows and obsolete exact rows."""
     terminal = """((delivery_contract=0 AND status IN ('delivered','failed','unknown','suppressed'))
