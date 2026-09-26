@@ -2248,6 +2248,7 @@ _GATEWAY_IDENTITY_PARAMS = (
 )
 _CALLBACK_PARAMS = (
     "tool_progress_callback", "tool_start_callback", "tool_complete_callback",
+    "tool_result_metadata_callback",
     "thinking_callback", "reasoning_callback", "clarify_callback",
     "read_terminal_callback", "read_preview_callback", "drive_preview_callback",
     "read_window_below_callback", "connection_callback", "tour_callback",
@@ -2293,6 +2294,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
+    tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
