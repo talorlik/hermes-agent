@@ -519,3 +519,20 @@ def build_top_level_parser():
     # every subcommand name; ``hermes --help`` still lists each command with its help row.
     subparsers = parser.add_subparsers(dest="command", help="Command to run", metavar="<command>")
     return parser, subparsers, _build_chat_parser(subparsers)
+
+
+def command_argv(argv: list[str]) -> list[str]:
+    """Subcommand and its arguments, excluding top-level flags and their values."""
+    required, optional = top_level_value_flag_sets()
+    value_flags = required | optional | {
+        flag for flag, takes_value in PRE_ARGPARSE_INHERITED_FLAGS if takes_value
+    }
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[index + 1:]
+        if not token.startswith("-"):
+            return argv[index:]
+        index += 2 if "=" not in token and token in value_flags and index + 1 < len(argv) else 1
+    return []
