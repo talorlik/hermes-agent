@@ -14,7 +14,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -200,8 +200,15 @@ def kanban_command(args: argparse.Namespace) -> int:
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
-    from hermes_cli.profiles import current_profile_name
-    return current_profile_name("user") or "user"
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        v = os.environ.get(env)
+        if v:
+            return v
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "user"
+    except Exception:
+        return "user"
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
@@ -334,16 +341,6 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
-    body = args.body
-    body_file = getattr(args, "body_file", None)
-    if body is not None and body_file is not None:
-        return _err("kanban: --body and --body-file are mutually exclusive", 2)
-    if body_file is not None:
-        try:
-            body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")
-        except OSError as exc:
-            return _err(f"kanban: --body-file: {exc}", 2)
-
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -361,7 +358,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     "use 1 to trip on the first failure.", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
+            conn, title=args.title, body=args.body, assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -474,29 +471,30 @@ def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
         return rc
+    rsk = rsk or {}
     graph = None
     want_json = getattr(args, "json", False)
     with kbc.connect_closing() as conn:
-        task = kb.get_task(conn, args.task_id)
-        if not task:
+        snapshot = kb.build_task_snapshot(
+            conn,
+            args.task_id,
+            run_state_type=rsk.get("state_type"),
+            run_state_name=rsk.get("state_name"),
+        )
+        if snapshot is None:
             return _err(f"no such task: {args.task_id}")
-        comments = kb.list_comments(conn, args.task_id)
-        events = kb.list_events(conn, args.task_id)
-        parents = kb.parent_ids(conn, args.task_id)
-        children = kb.child_ids(conn, args.task_id)
-        runs = kb.list_runs(conn, args.task_id, **rsk)
-        # Workers hand off via task_runs.summary; tasks.result stays NULL unless set.
-        latest_summary = kb.latest_summary(conn, args.task_id)
+        task = snapshot.task
+        comments = snapshot.comments
+        events = snapshot.events
+        parents = snapshot.parents
+        children = snapshot.children
+        runs = snapshot.runs
+        latest_summary = snapshot.latest_summary
         if not want_json:
             graph = kb.task_graph_context(conn, task.id)
 
     if want_json:
-        _print_json({
-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
-            "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
-            "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
-            "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
-        })
+        _print_json(snapshot.to_dict())
         return 0
 
     def field(label: str, value) -> None:
@@ -731,9 +729,36 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
                       f"Unlinked {args.parent_id} -> {args.child_id}")
 
 
+def _emit_receipt(
+    capture: kbc.LifecycleReceiptCapture,
+    operation: str,
+) -> int:
+    """Print committed evidence or fail instead of fabricating a receipt."""
+    if capture.receipt is None:
+        return _err(
+            f"kanban: {operation} succeeded but no receipt evidence was captured"
+        )
+    _print_json(capture.receipt.to_json_dict())
+    return 0
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
+    receipt_capture = (
+        kbc.LifecycleReceiptCapture() if getattr(args, "json", False) else None
+    )
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        claimer = getattr(args, "claimer", None)
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            claimer=claimer,
+            idempotent_replay=claimer is not None,
+            **receipt_kwargs,
+        )
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
@@ -742,6 +767,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
+    if receipt_capture is not None:
+        return _emit_receipt(receipt_capture, "claim")
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 
@@ -755,9 +782,27 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
+    if_absent = bool(getattr(args, "if_absent", False))
+    receipt_capture = (
+        kbc.LifecycleReceiptCapture() if getattr(args, "json", False) else None
+    )
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
-    print(f"Comment added to {args.task_id}")
+        kb.add_comment(
+            conn,
+            args.task_id,
+            author,
+            body,
+            expected_status=getattr(args, "expected_status", None),
+            if_absent=if_absent,
+            **receipt_kwargs,
+        )
+    if receipt_capture is not None:
+        return _emit_receipt(receipt_capture, "comment")
+    verb = "ensured on" if if_absent else "added to"
+    print(f"Comment {verb} {args.task_id}")
     return 0
 
 
@@ -822,6 +867,41 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _expected_run_id_for(args: argparse.Namespace, task_id: str) -> Optional[int]:
+    """Resolve explicit ownership and require matching worker attestation."""
+    explicit = getattr(args, "expected_run_id", None)
+    if explicit is None:
+        return _worker_run_id_for(task_id)
+
+    env_task = os.environ.get("HERMES_KANBAN_TASK")
+    env_run_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if env_task is not None and env_task != task_id:
+        raise ValueError(
+            f"--expected-run-id task {task_id!r} does not match "
+            f"HERMES_KANBAN_TASK {env_task!r}"
+        )
+    if env_run_raw is not None:
+        if env_task != task_id:
+            raise ValueError(
+                "HERMES_KANBAN_RUN_ID is present without a matching "
+                "HERMES_KANBAN_TASK"
+            )
+        try:
+            env_run_id = int(env_run_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "HERMES_KANBAN_RUN_ID is not a positive integer"
+            ) from exc
+        if env_run_id <= 0:
+            raise ValueError("HERMES_KANBAN_RUN_ID is not a positive integer")
+        if explicit != env_run_id:
+            raise ValueError(
+                f"--expected-run-id {explicit} does not match "
+                f"HERMES_KANBAN_RUN_ID {env_run_id}"
+            )
+    return explicit
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
@@ -898,6 +978,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return rc
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    expected_status = getattr(args, "expected_status", None)
+    explicit_run_id = getattr(args, "expected_run_id", None)
+    as_json = bool(getattr(args, "json", False))
+    if as_json and len(ids) != 1:
+        return _err("kanban: --json cannot be used with multiple task ids", 2)
+    if explicit_run_id is not None and len(ids) != 1:
+        return _err(
+            "kanban: --expected-run-id cannot be used with multiple task ids",
+            2,
+        )
+    try:
+        expected_run_id = (
+            _expected_run_id_for(args, ids[0]) if len(ids) == 1 else None
+        )
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     # Handoff fields are per-run; refuse to copy them across N runs.
     if len(ids) > 1 and (summary or raw_meta):
         return _err("kanban: --summary / --metadata are per-task and can't be used "
@@ -907,6 +1003,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if rc:
         return rc
     fail_msg: dict[str, str] = {}
+    receipt_capture = kbc.LifecycleReceiptCapture() if as_json else None
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
         def op(tid):
             gate_err = _goal_gate_error(
@@ -916,19 +1016,40 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             if gate_err:
                 fail_msg[tid] = gate_err
                 return False
-            fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+            if expected_status is not None:
+                current = kb.get_task(conn, tid)
+                actual = current.status if current else "unknown id"
+                fail_msg[tid] = (
+                    f"refusing to complete {tid}: expected status "
+                    f"{expected_status!r}, task is {actual!r}"
+                )
+            elif explicit_run_id is not None:
+                current = kb.get_task(conn, tid)
+                actual_run_id = current.current_run_id if current else None
+                fail_msg[tid] = (
+                    f"refusing to complete {tid}: expected run id "
+                    f"{expected_run_id!r}, task current run is {actual_run_id!r}"
+                )
+            else:
+                fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
-                done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                        expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
+                done = kb.complete_task(
+                    conn,
+                    tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=(
+                        expected_run_id if len(ids) == 1 else _worker_run_id_for(tid)
+                    ),
+                    expected_status=expected_status,
+                    force=bool(getattr(args, "force", False)),
+                    **receipt_kwargs,
+                )
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
-                return False
-            except kb.EmptyCompletionError as empty_err:
-                fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
-                                 f"describing what was done (an empty completion is not evidence).")
                 return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
@@ -940,33 +1061,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
             return done
 
-        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+        if as_json:
+            if not op(ids[0]):
+                return _err(fail_msg[ids[0]])
+        else:
+            return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+    assert receipt_capture is not None
+    return _emit_receipt(receipt_capture, "complete")
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
-    result = getattr(args, "result", None)
-    raw_metadata = getattr(args, "metadata", None)
-    summary = getattr(args, "summary", None)
-    title = getattr(args, "title", None)
-    body = getattr(args, "body", None)
-    priority = getattr(args, "priority", None)
-    if result is None and (summary is not None or raw_metadata is not None):
-        return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
-    metadata, rc = _parse_metadata_flag(raw_metadata)
+    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        ok = kb.edit_task(
-            conn, args.task_id, title=title, body=body, priority=priority,
-            result=result, summary=summary, metadata=metadata,
-        )
-    return _ok_or_err(
-        ok,
-        f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
-        f"Edited {args.task_id}",
-    )
+        ok = kb.edit_completed_task_result(conn, args.task_id, result=args.result,
+                                           summary=getattr(args, "summary", None), metadata=metadata)
+    return _ok_or_err(ok, f"cannot edit {args.task_id} (unknown id or task is not done)", f"Edited {args.task_id}")
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):
@@ -981,9 +1092,39 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
-    author = _profile_author()
+    expected_status = getattr(args, "expected_status", None)
+    explicit_author = getattr(args, "author", None)
+    if explicit_author is not None:
+        author = explicit_author.strip()
+        if not author or not reason:
+            return _err(
+                "kanban block: --author requires a non-empty reason and author",
+                2,
+            )
+    else:
+        author = _profile_author()
     ids = _bulk_ids(args)
+    as_json = bool(getattr(args, "json", False))
+    if as_json and len(ids) != 1:
+        return _err("kanban: --json cannot be used with multiple task ids", 2)
+    explicit_run_id = getattr(args, "expected_run_id", None)
+    if explicit_run_id is not None and len(ids) != 1:
+        return _err(
+            "kanban: --expected-run-id cannot be used with multiple task ids",
+            2,
+        )
+    try:
+        expected_run_id = (
+            _expected_run_id_for(args, ids[0]) if len(ids) == 1 else None
+        )
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
+    receipt_capture = kbc.LifecycleReceiptCapture() if as_json else None
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -1000,9 +1141,51 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        if (
+            expected_status is None
+            and explicit_author is None
+            and explicit_run_id is None
+            and not as_json
+        ):
+            op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
+            return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+
+        def transactional_op(tid):
+            block_result = kb.block_task(
+                conn,
+                tid,
+                reason=reason,
+                kind=kind,
+                expected_run_id=(
+                    expected_run_id if len(ids) == 1 else _worker_run_id_for(tid)
+                ),
+                expected_status=expected_status,
+                reason_comment_author=author if reason else None,
+                with_reason=(
+                    expected_status is not None
+                    or explicit_run_id is not None
+                    or as_json
+                ),
+                **receipt_kwargs,
+            )
+            if expected_status is not None or explicit_run_id is not None or as_json:
+                ok, refusal = cast(tuple[bool, Optional[str]], block_result)
+                fail_msg[tid] = (
+                    f"refusing to block {tid}: "
+                    f"{refusal or 'transactional guard refused'}"
+                )
+            else:
+                ok = bool(block_result)
+                fail_msg[tid] = f"cannot block {tid}"
+            return ok
+
+        if as_json:
+            if not transactional_op(ids[0]):
+                return _err(fail_msg[ids[0]])
+            assert receipt_capture is not None
+            return _emit_receipt(receipt_capture, "block")
+        return _bulk_apply(ids, transactional_op, ok_msg, fail_msg.__getitem__)
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1022,17 +1205,79 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     ids, rc = _require_ids(args)
     if rc:
         return rc
+    as_json = bool(getattr(args, "json", False))
+    if as_json and len(ids) != 1:
+        return _err("kanban: --json cannot be used with multiple task ids", 2)
     reason = _stripped_or_none(getattr(args, "reason", None))
-    author = _profile_author() if reason else None
+    explicit_author = getattr(args, "author", None)
+    if explicit_author is not None:
+        author = explicit_author.strip()
+        if not author or reason is None:
+            return _err(
+                "kanban unblock: --author requires a non-empty reason and author",
+                2,
+            )
+    else:
+        author = _profile_author() if reason else None
+    expected_kind = getattr(args, "expected_block_kind", None)
     suffix = f": {reason}" if reason else ""
+    receipt_capture = kbc.LifecycleReceiptCapture() if as_json else None
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
-        return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+        if expected_kind is None and explicit_author is None and not as_json:
+            op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+            return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
+                               lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+        def guarded_op(tid):
+            return kb.unblock_task(
+                conn,
+                tid,
+                expected_block_kind=expected_kind,
+                reason=reason,
+                reason_comment_author=author,
+                **receipt_kwargs,
+            )
+
+        def fail_msg(tid):
+            current = kb.get_task(conn, tid)
+            actual = (
+                f"status={current.status!r} kind={current.block_kind!r}"
+                if current else "unknown id"
+            )
+            return (
+                f"refusing to unblock {tid}: expected a blocked task with "
+                f"kind {expected_kind!r}, task is {actual}"
+            )
+
+        if as_json:
+            if not guarded_op(ids[0]):
+                if expected_kind is None:
+                    return _err(
+                        f"cannot unblock {ids[0]} (not blocked/scheduled?)"
+                    )
+                return _err(fail_msg(ids[0]))
+            assert receipt_capture is not None
+            return _emit_receipt(receipt_capture, "unblock")
+        return _bulk_apply(
+            ids, guarded_op, lambda tid: f"Unblocked {tid}{suffix}", fail_msg,
+        )
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
+    receipt_capture = (
+        kbc.LifecycleReceiptCapture() if getattr(args, "json", False) else None
+    )
+    receipt_kwargs: dict[str, Any] = (
+        {"receipt_capture": receipt_capture} if receipt_capture is not None else {}
+    )
+    try:
+        expected_run_id = _expected_run_id_for(args, tid)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
     summary = _stripped_or_none(getattr(args, "summary", None))
     metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
     if rc:
@@ -1044,13 +1289,19 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             "Provide acceptance evidence matching the task.")
         if gate_err:
             return _err(gate_err)
-        ok, reason = kb.request_review(
+        review_result = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=expected_run_id,
+            expected_status=getattr(args, "expected_status", None),
+            force=bool(getattr(args, "force", False)), with_reason=True,
+            **receipt_kwargs)
+        ok, reason = cast(tuple[bool, Optional[str]], review_result)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
         display_summary = persisted_run.summary if persisted_run else None
+        if receipt_capture is not None:
+            return _emit_receipt(receipt_capture, "request-review")
         print(f"Requested review for {tid}" + (f": {display_summary}" if display_summary else ""))
     return 0
 
@@ -1371,20 +1622,9 @@ def run_slash(rest: str) -> str:
     stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
     import io
 
-    # Non-posix split (Windows) keeps backslashes as path separators but
-    # leaves quote characters in the tokens — strip a fully wrapping pair
-    # so `"my task"` reaches argparse as `my task`, not `"my task"`.
-    tokens = []
-    if rest and rest.strip():
-        for tok in shlex.split(rest, posix=os.name == "posix"):
-            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
-                tok = tok[1:-1]
-            tokens.append(tok)
-
-    # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
-    # show the curated short-help block instead of dumping argparse's full
-    # usage tree (which is enormous and reads as garbage in a chat
-    # bubble).  Per-subcommand help still works via ``/kanban foo -h``.
+    tokens = shlex.split(rest) if rest and rest.strip() else []
+    # Bare ``/kanban`` / ``help`` / ``-h``: curated short block, not argparse's full tree (garbage
+    # in a chat bubble). ``/kanban foo -h`` still works.
     if not tokens or tokens[0] in {"help", "--help", "-h", "?"}:
         return _SLASH_KANBAN_HELP
     # build_parser() needs a subparsers action to attach to: build a throwaway one and drive
