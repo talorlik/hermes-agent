@@ -4605,7 +4605,7 @@ def _try_main_provider_route(
     return client, resolved or main_model, resolved_provider
 
 
-def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> bool:
+def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None, has_fallback: bool = False) -> bool:
     """The built-in discovery chain is a convenience for installs with NO selected main provider.
     Once the user picked one, every auxiliary route must be a provider they configured (main,
     ``auxiliary.<task>``, ``fallback_providers``); guessing "whatever else is logged in" bills an
@@ -4613,10 +4613,18 @@ def _discovery_chain_allowed(main_provider: str, task: Optional[str] = None) -> 
     compression silently charged to a Nous Portal balance)."""
     if (main_provider or "").strip().lower() in {"", "auto"}:
         return True
-    logger.warning(
-        "Auxiliary %s: main provider %s is unavailable and no fallback_chain / fallback_providers is "
-        "configured — refusing to guess another logged-in provider. Re-authenticate (`hermes model`) "
-        "or declare a fallback.", task or "call", main_provider)
+    if has_fallback:
+        # User has configured fallbacks but they all failed. This is likely a transient
+        # timeout/capacity issue, not an auth problem. Don't suggest re-auth.
+        logger.warning(
+            "Auxiliary %s: main provider %s is unavailable and all configured fallbacks "
+            "failed — refusing to guess another logged-in provider. "
+            "Check network connectivity and provider status.", task or "call", main_provider)
+    else:
+        logger.warning(
+            "Auxiliary %s: main provider %s is unavailable and no fallback_chain / fallback_providers is "
+            "configured — refusing to guess another logged-in provider. Re-authenticate (`hermes model`) "
+            "or declare a fallback.", task or "call", main_provider)
     return False
 
 
@@ -4660,16 +4668,33 @@ def _resolve_auto_route(
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
+    # Main provider unavailable - check for fallbacks before warning
+    has_task_fallback = False
+    has_main_fallback = False
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+        # Task fallback exists but failed/empty
+        try:
+            from hermes_cli.config import load_config_readonly
+            task_cfg = load_config_readonly().get("auxiliary", {}).get(task, {})
+            has_task_fallback = bool(task_cfg.get("fallback_chain"))
+        except Exception:
+            pass
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
     if fb_client is not None:
         return fb_client, fb_model, fb_label
-    if not _discovery_chain_allowed(main_provider, task):
+    # Main fallback exists but failed/empty
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.fallback_config import get_fallback_chain
+        has_main_fallback = bool(get_fallback_chain(load_config_readonly()))
+    except Exception:
+        pass
+    if not _discovery_chain_allowed(main_provider, task, has_fallback=has_task_fallback or has_main_fallback):
         return None, None, ""
     return _try_discovery_chain()
 
