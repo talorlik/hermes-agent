@@ -425,12 +425,31 @@ def _is_openai_codex_backend(agent) -> bool:
     return classify_responses_route(agent).is_codex_backend
 
 
+def _is_xai_responses_backend(agent) -> bool:
+    """True when the agent is using xAI's Responses API (Grok models)."""
+    from agent.codex_responses_adapter import classify_responses_route
+    return classify_responses_route(agent).is_xai_responses
+
+
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     """Minimum wall-clock stale timeout for openai-codex by estimated context:
     subscription-backed Codex can spend minutes in admission/prefill on
     gateway-scale payloads, so the generic default would abort healthy calls.
     The floor engages above 10k estimated tokens."""
     for threshold, floor in ((100_000, 1200.0), (50_000, 900.0), (10_000, 600.0)):
+        if est_tokens > threshold:
+            return floor
+    return 0.0
+
+
+def xai_stale_timeout_floor(est_tokens: int) -> float:
+    """Minimum wall-clock stale timeout for xAI Responses by estimated context.
+    
+    xAI Grok models use the Responses API and can take significant time for
+    large-context requests, similar to OpenAI Codex. Apply graduated timeouts
+    to prevent false timeout kills on healthy large-context streams.
+    The floor engages above 10k estimated tokens."""
+    for threshold, floor in ((100_000, 900.0), (50_000, 720.0), (10_000, 480.0)):
         if est_tokens > threshold:
             return floor
     return 0.0
@@ -1210,6 +1229,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
     codex = agent.api_mode == "codex_responses"
     openai_codex_backend = _is_openai_codex_backend(agent)
+    xai_backend = _is_xai_responses_backend(agent)
     est_tokens = estimate_request_context_tokens(api_kwargs)
     effort_floor = _high_effort_silence_floor(agent) if codex else 0.0
     codex_floor = 0.0
@@ -1218,8 +1238,18 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     base_url = getattr(agent, "base_url", None)
     local = bool(base_url) and is_local_endpoint(base_url)
     if codex and not local:
-        codex_floor = openai_codex_stale_timeout_floor(est_tokens)
-        stale_timeout = _bound_openai_codex_stale_timeout(stale_timeout, est_tokens)
+        if openai_codex_backend:
+            codex_floor = openai_codex_stale_timeout_floor(est_tokens)
+            stale_timeout = _bound_openai_codex_stale_timeout(stale_timeout, est_tokens)
+        elif xai_backend:
+            # xAI Grok also needs large-context timeout bumps for Responses API
+            codex_floor = xai_stale_timeout_floor(est_tokens)
+            if codex_floor:
+                stale_timeout = max(stale_timeout, codex_floor)
+            # Apply same hard timeout ceiling as OpenAI Codex
+            hard_timeout = env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
+            if hard_timeout > 0:
+                stale_timeout = min(stale_timeout, hard_timeout)
 
     idle_default = max(effort_floor, next(
         (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
@@ -1269,7 +1299,8 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     # default for unset AND unparseable values, so both count as implicit.
     idle_explicit = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", -1.0) != -1.0
     idle_timeout = env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
-    progress_gated = codex and openai_codex_backend and codex_floor > 0 and not idle_explicit
+    # Progress gating applies to OpenAI Codex and xAI when they have large-context floors
+    progress_gated = codex and (openai_codex_backend or xai_backend) and codex_floor > 0 and not idle_explicit
     return _NonStreamWatchdogs(stale_timeout=stale_timeout, codex=codex, est_tokens=est_tokens,
         ttfb_enabled=ttfb_enabled, ttfb_timeout=ttfb_timeout, idle_enabled=codex and idle_timeout > 0,
         idle_timeout=idle_timeout, idle_requires_progress=progress_gated,
