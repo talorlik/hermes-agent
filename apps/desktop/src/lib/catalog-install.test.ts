@@ -36,7 +36,7 @@ describe('public catalog install links', () => {
     expect(skillCatalogInstallUrl({ name: 'pdf', source: 'built-in' })).toBeNull()
   })
 
-  it('routes only the canonical catalog name through the reviewed lookup', () => {
+  it('forwards catalog identity, display pin and encoded subdirectory to the plugin confirmation', () => {
     const plugin = {
       name: 'weather',
       repo: 'https://github.com/owner/plugins',
@@ -45,9 +45,13 @@ describe('public catalog install links', () => {
     }
 
     expect(route(pluginCatalogInstallUrl(plugin))).toEqual({
-      type: 'plugin-catalog-install',
-      name: plugin.name
+      type: 'plugin-install',
+      repo: `${plugin.repo}#${plugin.subdir}`,
+      catalogName: plugin.name,
+      sha: plugin.sha,
+      enable: true,
+      force: false,
+      legacyHint: null
     })
-    expect([...new URL(pluginCatalogInstallUrl(plugin)).searchParams]).toEqual([['catalog', plugin.name]])
   })
 })
