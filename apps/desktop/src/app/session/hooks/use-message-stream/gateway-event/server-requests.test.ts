@@ -74,7 +74,7 @@ describe('approval request routing', () => {
     )
 
     expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'approval', title: expect.stringContaining('Fix the flaky test') })
+      expect.objectContaining({ kind: 'approval', title: 'Approval needed — Fix the flaky test' })
     )
   })
 })
@@ -136,7 +136,12 @@ describe('preview action request routing', () => {
   it('fails fast for an unscoped request with no session in view', () => {
     const { respond } = deliver('preview.act', { action: 'elements' }, null)
 
-    expect(JSON.parse(respond.mock.calls[0][0].value)).toMatchObject({ success: false })
+    expect(respond).toHaveBeenCalledWith({
+      value: JSON.stringify({
+        error: 'The in-app browser only takes actions in the session the user is looking at.',
+        success: false
+      })
+    })
   })
 })
 
@@ -156,6 +161,8 @@ describe('tour request routing', () => {
   it('fails fast for an unscoped request with no session in view', () => {
     const { respond } = deliver('tour', { action: 'discover' }, null)
 
-    expect(JSON.parse(respond.mock.calls[0][0].value)).toMatchObject({ success: false })
+    expect(respond).toHaveBeenCalledWith({
+      value: JSON.stringify({ error: 'Tours only run in the session the user is looking at.', success: false })
+    })
   })
 })
