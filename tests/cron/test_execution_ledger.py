@@ -165,7 +165,12 @@ def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     assert executions.latest_execution("immutable")["status"] == "completed"
 
 
-def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
+def test_retention_is_per_job_and_preserves_inflight(monkeypatch, tmp_path):
+    """One job's volume cannot evict another job's evidence.
+
+    Rows inside the 30-day floor are retained. Aged per-job overflow pruning
+    is covered by ``test_execution_schema_migration.py``.
+    """
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
     inflight = executions.create_execution("live", source="builtin")
@@ -175,7 +180,7 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
         executions.finish_execution(row["id"], success=True)
 
     records = executions.list_executions(limit=100)
-    assert len([row for row in records if row["status"] == "completed"]) == 3
+    assert len([row for row in records if row["status"] == "completed"]) == 8
     assert executions.latest_execution("live")["status"] == "running"
 
 
@@ -194,7 +199,9 @@ def test_recently_finished_long_running_execution_survives_retention(
     assert finished is not None
     assert finished["status"] == "completed"
     assert executions.get_execution(long_running["id"])["status"] == "completed"
-    assert executions.get_execution(newer["id"]) is None
+    newer_record = executions.get_execution(newer["id"])
+    assert newer_record is not None
+    assert newer_record["status"] == "completed"
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
@@ -455,8 +462,9 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert opened
-    assert sorted(opened) == sorted(closed)
+    assert len(opened) == 6
+    assert len(closed) == 6
+    assert set(opened) == set(closed)
 
 
 def test_early_return_still_closes_connection(monkeypatch, tmp_path):
@@ -471,8 +479,49 @@ def test_early_return_still_closes_connection(monkeypatch, tmp_path):
     assert len(closed) == 1
 
 
+def test_exception_during_operation_still_closes_connection(monkeypatch, tmp_path):
+    """A failing statement inside the transaction must roll back and close,
+    not leak the connection."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    opened, closed = _count_open_connections(executions, monkeypatch)
+
+    with __import__("pytest").raises(sqlite3.IntegrityError):
+        with executions._transaction() as conn:
+            conn.execute(
+                "INSERT INTO executions (id, job_id, source, process_id, pid, "
+                "status, claimed_at) VALUES ('x', 'x', 'x', 'x', 1, 'bogus-status', 'now')"
+            )
+
+    assert len(opened) == 1
+    assert len(closed) == 1
 
 
+def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
+    """If PRAGMA/DDL setup in _connect() fails after sqlite3.connect()
+    succeeds, the partially-initialized connection must still be closed."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    opened_ids = []
+    closed_ids = []
+    real_connect = sqlite3.connect
+
+    class _FailingSchemaConnection(_TrackingConnection):
+        def execute(self, sql, *args, **kwargs):
+            if "CREATE TABLE" in sql:
+                raise sqlite3.OperationalError("simulated schema init failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened_ids.append(id(conn))
+        return _FailingSchemaConnection(conn, closed_ids)
+
+    monkeypatch.setattr(executions.sqlite3, "connect", tracking_connect)
+
+    with __import__("pytest").raises(sqlite3.OperationalError):
+        executions.create_execution("init-fail", source="builtin")
+
+    assert len(opened_ids) == 1
+    assert len(closed_ids) == 1
 
 
 def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
