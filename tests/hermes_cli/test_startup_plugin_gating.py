@@ -6,9 +6,13 @@ This saves 500-650ms on ``hermes --help``, ``hermes --version``,
 ``hermes logs``, etc., by not importing ``google.cloud.pubsub_v1``,
 ``aiohttp``, ``grpc``, and friends.
 
-Invariants: ``_plugin_cli_discovery_needed()`` classifies flag/positional argv
-correctly, and deferred platforms register their CLI command before argparse
-builds the plugin subparsers (issue #54678).
+Two invariants:
+
+1. The capability-free built-in command catalog must exactly equal the
+   root choices registered by the full parser, including aliases.
+
+2. ``_plugin_cli_discovery_needed()`` returns the right answer for the
+   flag/positional parsing cases it's meant to handle.
 """
 
 from __future__ import annotations
@@ -16,14 +20,105 @@ from __future__ import annotations
 import sys
 from unittest.mock import patch
 
+import pytest
+
+from hermes_cli._parser import (
+    BUILTIN_COMMAND_TOKENS,
+    build_top_level_parser,
+    top_level_value_flag_sets,
+)
 from hermes_cli.main import (
+    _first_positional_argv,
+    _plugin_cli_discovery_needed,
     _resolve_deferred_platform_cli_command,
 )
+
+
+# ── _first_positional_argv ─────────────────────────────────────────────────
+
+
+def test_value_flag_sets_match_top_level_parser():
+    required, optional = top_level_value_flag_sets()
+
+    for action in build_top_level_parser()[0]._actions:
+        if not action.option_strings or action.nargs == 0:
+            continue
+        expected = optional if action.nargs == "?" else required
+        assert set(action.option_strings) <= expected
+
+
+def test_reasoning_value_is_not_misclassified_as_subcommand(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "--reasoning", "high", "chat", "hello"],
+    )
+
+    assert _first_positional_argv() == "chat"
+    assert _plugin_cli_discovery_needed() is False
+
+
+
+
+# ── _plugin_cli_discovery_needed ───────────────────────────────────────────
+
+
+# ── capability-free catalog ↔ argparse registration parity ────────────────
+
+
+def test_builtin_command_catalog_matches_full_parser_root_choices(monkeypatch):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "_register_plugin_cli_commands", lambda _subparsers: None
+    )
+    _parser, subparsers = main_mod._build_cli_parser()
+
+    assert set(BUILTIN_COMMAND_TOKENS) == set(subparsers.choices)
+
+
+def test_every_builtin_root_choice_skips_plugin_discovery(monkeypatch):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "_register_plugin_cli_commands", lambda _subparsers: None
+    )
+    _parser, subparsers = main_mod._build_cli_parser()
+    for command in subparsers.choices:
+        monkeypatch.setattr(sys, "argv", ["hermes", command])
+        assert _first_positional_argv() == command
+        assert _plugin_cli_discovery_needed() is False
 
 
 # ── _resolve_deferred_platform_cli_command (issue #54678) ──────────────────
 
 
+def test_deferred_platform_cli_resolution_targets_matching_platform():
+    """The slow path must import the deferred platform whose name matches the
+    invoked command, so its register_cli_command side effect fires.
+
+    Photon registers ``hermes photon`` only when its adapter module is
+    imported; on the unknown-command slow path the platform is still a
+    deferred entry, so without this resolution step the CLI command stays
+    absent and argparse rejects ``photon`` (issue #54678).
+    """
+    from hermes_cli import main as _main
+
+    class _FakeRegistry:
+        def __init__(self):
+            self.resolved: list[str] = []
+
+        def get(self, name):
+            self.resolved.append(name)
+            return None
+
+    fake = _FakeRegistry()
+    fake_module = type(sys)("gateway.platform_registry")
+    fake_module.platform_registry = fake
+    with patch.dict(sys.modules, {"gateway.platform_registry": fake_module}):
+        _resolve_deferred_platform_cli_command("photon")
+
+    assert fake.resolved == ["photon"]
 
 
 def test_deferred_platform_loader_registers_cli_command_before_parser_table():
