@@ -56,6 +56,9 @@ def test_xai_gets_large_context_timeout_bumps(monkeypatch):
     
     Regression for reported timeouts on ~22k token contexts where
     xAI was not getting the same large-context grace as OpenAI Codex.
+    Regression for issue where idle_timeout and ttfb_timeout were not
+    respecting the large-context floors (they stayed at 300s from high-effort
+    floor instead of using the 480s/720s/900s codex floors).
     """
     from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
     
@@ -79,6 +82,14 @@ def test_xai_gets_large_context_timeout_bumps(monkeypatch):
     # xAI should get the 480s floor for contexts >10k
     assert watchdogs.stale_timeout >= 480.0, \
         "xAI with 22k tokens should get at least 480s stale timeout"
+    
+    # idle_timeout should also respect the 480s floor (was broken, stayed at 300s)
+    assert watchdogs.idle_timeout >= 480.0, \
+        "xAI with 22k tokens should get at least 480s idle timeout"
+    
+    # ttfb_timeout should also respect the 480s floor (was broken, stayed at 300s)
+    assert watchdogs.ttfb_timeout >= 480.0, \
+        "xAI with 22k tokens should get at least 480s TTFB timeout"
     
     # Progress gating should be enabled for xAI with large contexts
     assert watchdogs.idle_requires_progress is True, \
@@ -147,3 +158,50 @@ def test_xai_timeout_with_high_reasoning_effort(monkeypatch):
     # TTFB should be at least 300s due to high effort floor
     assert watchdogs.ttfb_timeout >= 300.0, \
         "xAI with high reasoning effort should get 300s TTFB floor"
+
+
+def test_xai_large_context_floors_with_high_effort(monkeypatch):
+    """xAI with large contexts AND high effort: codex floor wins over effort floor.
+    
+    Regression test for the core bug: when both effort_floor (300s) and 
+    codex_floor (480s/720s/900s) apply, idle_timeout and ttfb_timeout must 
+    use the LARGER codex_floor, not the smaller effort_floor.
+    """
+    from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
+    
+    agent = SimpleNamespace(
+        provider="xai-oauth",
+        base_url="https://api.x.ai/v1",
+        api_mode="codex_responses",
+        model="grok-4.7",
+        reasoning_config={"enabled": True, "effort": "high"},
+    )
+    
+    agent._compute_non_stream_stale_timeout = lambda kwargs: 180.0
+    
+    # Test at each threshold tier
+    test_cases = [
+        (22_000, 480.0, "22k tokens (>10k threshold)"),
+        (75_000, 720.0, "75k tokens (>50k threshold)"),
+        (150_000, 900.0, "150k tokens (>100k threshold)"),
+    ]
+    
+    for est_tokens, expected_floor, description in test_cases:
+        # Simulate large request
+        api_kwargs = {"input": [{"content": "x" * (est_tokens * 4)}]}
+        
+        watchdogs = _resolve_nonstream_watchdogs(agent, api_kwargs)
+        
+        # All timeouts should respect the large-context floor
+        assert watchdogs.stale_timeout >= expected_floor, \
+            f"xAI {description} with high effort should get {expected_floor}s stale timeout"
+        
+        assert watchdogs.idle_timeout >= expected_floor, \
+            f"xAI {description} with high effort should get {expected_floor}s idle timeout (was broken)"
+        
+        assert watchdogs.ttfb_timeout >= expected_floor, \
+            f"xAI {description} with high effort should get {expected_floor}s TTFB timeout (was broken)"
+        
+        # Progress gating should be enabled
+        assert watchdogs.idle_requires_progress is True, \
+            f"xAI {description} should gate idle watchdog on progress"

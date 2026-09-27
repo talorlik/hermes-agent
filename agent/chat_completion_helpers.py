@@ -1251,7 +1251,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
             if hard_timeout > 0:
                 stale_timeout = min(stale_timeout, hard_timeout)
 
-    idle_default = max(effort_floor, next(
+    idle_default = max(effort_floor, codex_floor, next(
         (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
         12.0))
 
