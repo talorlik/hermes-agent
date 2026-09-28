@@ -138,7 +138,6 @@ def _run_full_parser_main(monkeypatch, parser, subparsers, argv, calls) -> None:
         "_advertise_agent_env",
         "_cleanup_quarantined_exes",
         "_sweep_stale_bytecode_if_checkout_changed",
-        "_recover_from_interrupted_install",
     ):
         monkeypatch.setattr(main_mod, name, lambda: None)
     for name in (

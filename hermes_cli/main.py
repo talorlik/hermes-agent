@@ -260,13 +260,10 @@ _startup_fast.normalize_hermes_home_env()
 # Early venv self-heal — MUST run before any third-party import below. A prior
 # ``hermes update`` may have left a recovery marker with a core package wiped;
 # the hermes_cli.config/env_loader imports further down would then crash before
-# main() reaches _recover_from_interrupted_install(). ``_early_recovery`` is
+# this import finishes. ``_early_recovery`` is
 # stdlib-only (safe on a corrupted venv) and repairs just enough to finish this
-# import; the marker lifecycle stays with the full recovery path. Its own
-# import is unguarded on purpose: same package dir, so if IT can't import
-# nothing in hermes_cli can.
-# It is also the canonical home of the probe/repair tables reused by the full recovery path below. See
-# #57828.
+# import. Its own import is unguarded on purpose: same package dir, so if IT
+# can't import nothing in hermes_cli can. See #57828.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
 try:
@@ -997,33 +994,49 @@ from hermes_cli.main_provider_setup import (
     _prompt_provider_choice,
     _remove_custom_provider,
 )
-from hermes_cli.main_install_repair import (
-    _cleanup_quarantined_exes,
-    _recover_from_interrupted_install,
-)
-from hermes_cli.main_install_repair import (  # frozen updater surface: update_cmd*.py resolve these via _m()
+from hermes_cli.old_updater_main import (
     ShimQuarantineError,
+    _BYTECODE_FINGERPRINT_FILE,
+    _desktop_stamp_path,
+    _detect_broken_lazy_refresh_imports,
+    _expected_windows_pe_machines,
+    _hermes_exe_shims,
+    _insert_python_pin,
+    _interpreter_scripts_dir,
+    _load_installable_optional_extras,
+    _parse_pe_machine,
+    _quarantine_running_hermes_exe,
+    _repair_broken_lazy_refresh_imports,
+    _resolve_install_target_python,
+    _restore_quarantined_exes,
+    _run_install_with_heartbeat,
+    _run_package_only_install,
+    _run_quarantined_install,
+    _run_with_idle_timeout,
+    _self,
+    _verify_console_scripts_installed,
+    _verify_core_dependencies_installed,
+    _web_ui_build_needed,
+    _windows_native_machine,
+    _windows_shim_in_process_chain,
+    _write_web_ui_build_stamp,
+)
+from hermes_cli.main_install_repair import _cleanup_quarantined_exes
+from hermes_cli.main_install_repair import (  # frozen updater surface: update_cmd*.py resolve these via _m()
     _UPDATE_REEXEC_ENV,
     _clear_lazy_refresh_incomplete_marker,
     _clear_marker_file,
     _clear_update_incomplete_marker,
-    _install_python_dependencies_with_optional_fallback,
     _is_termux_env,
     _is_windows,
     _is_windows_npm_path,
     _lazy_refresh_marker_path,
     _pytest_owns_live_checkout,
     _reexec_dependency_sync_off_windows_shim,
-    _repair_venv_via_import_probes,
-    _resolve_install_target_python,
     _resolve_node_runtime_npm,
     _resolve_update_branch,
-    _run_install_with_heartbeat,
-    _run_package_only_install,
     _update_marker_path,
     _venv_scripts_dir,
-    _verify_console_scripts_installed,
-    _verify_core_dependencies_installed,
 )
 from hermes_cli.main_desktop import (
     cmd_gui,
@@ -3636,19 +3649,15 @@ def _main_impl():
     # process resolves fresh source against old bytecode. Never raises.
     _sweep_stale_bytecode_if_checkout_changed()
 
-    # Self-heal a venv left half-built by an interrupted ``hermes update``, and
-    # hint (never restart) about a fleet the interrupted update never
-    # restarted. Both skipped while the user is *running* update — that flow
-    # owns its marker and a recovery install must not race the real one. The
-    # substring match is deliberately loose: over-matching (``hermes skills
-    # install update``) only defers recovery one launch; under-matching
+    # Hint (never restart) about a fleet the interrupted update never
+    # restarted. Skipped while the user is *running* update — that flow
+    # owns its marker. Interrupted-install recovery already ran at import
+    # via ``_early_recovery.recover_if_needed()``. The substring match is
+    # deliberately loose: over-matching (``hermes skills install update``)
+    # only defers the warning one launch; under-matching
     # (``hermes -p work update``) would race. Never raises.
     # See #95294.
     if "update" not in sys.argv[1:]:
-        try:
-            _recover_from_interrupted_install()
-        except Exception:
-            pass
         try:
             from hermes_cli.update_cmd_fleet import _warn_pending_fleet_restart_on_startup
 
