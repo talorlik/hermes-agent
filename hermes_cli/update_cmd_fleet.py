@@ -82,8 +82,12 @@ def _write_legacy_fleet_restart_pending_marker(
         return False
 
 
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> None:
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> bool:
     """Arm the HOST pull→restart obligation. Never raises.
+
+    Returns True when an obligation record (host or legacy per-home) was written, False when
+    nothing was armed (explicit empty inventory, pytest-owned live checkout, or both stores
+    unwritable), so a caller can tell whether the restart breadcrumb actually landed.
 
     An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a container
     UID that does not own ``$HOME``) must never disarm the obligation: an update interrupted
@@ -95,20 +99,20 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         # An explicit empty inventory owes no restart (e.g. Desktop-hosted `serve` with no
         # gateway services). Arming the marker here leaves a breadcrumb nothing can discharge:
         # a no-gateway host would then fail every later ``hermes update`` (#115311).
-        return
+        return False
     from hermes_cli.update_cmd import _m
     from hermes_cli.update_host_obligation import host_obligation_path, write_host_obligation
     if _m()._pytest_owns_live_checkout(_fleet_restart_pending_marker_path().parent):
         logger.debug("Skipping fleet-restart-pending obligation under pytest (live checkout)")
-        return
+        return False
     if write_host_obligation(
             expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name()):
-        return
+        return True
     if _write_legacy_fleet_restart_pending_marker(expected_sha=expected_sha, runtimes=runtimes):
         logger.warning(
             "Host update-restart obligation (%s) is unwritable; armed the per-home marker %s instead.",
             host_obligation_path(), _fleet_restart_pending_marker_path())
-        return
+        return True
     logger.error(
         "Could not arm the update-restart obligation in %s or %s; an interrupted update will not warn.",
         host_obligation_path(), _fleet_restart_pending_marker_path())
@@ -117,6 +121,7 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         "restart gateways with `hermes gateway restart` if this update is interrupted.",
         file=sys.stderr,
     )
+    return False
 
 
 def _current_profile_name() -> str:
@@ -387,9 +392,7 @@ def _marker_only_restart_obsolete() -> bool:
     that died before its inventory was recorded, #115638) clears once every live gateway is
     current on the checkout — there is no recorded owed set, so the fleet running the code on disk
     is the whole of the evidence the marker's warning can be about, even after HEAD moved past
-    ``expected_sha`` by an out-of-band pull — and so does an inventory-less record armed with no
-    SHA at all (a no-op update whose head capture failed, #125952): with no owed set and no SHA,
-    the checkout is the only code it can be held to. With no live gateway at all, the inventory-less marker
+    ``expected_sha`` by an out-of-band pull. With no live gateway at all, the inventory-less marker
     asks the host instead (``update_cmd_fleet_gatewayless``): it clears when no profile left a
     gateway that should be running and every live runtime is supervisor-owned or handed off, so a
     Desktop-only install stops failing every later update (#118742).
@@ -420,8 +423,8 @@ def _marker_only_restart_obsolete() -> bool:
         _clear_fleet_restart_pending_marker()
         logger.debug("Fleet-restart-pending marker discharged: no gateway obligation recorded")
         return True
-    if owed is not None and not expected_sha:
-        return False  # an inventoried obligation without its SHA can never be proven
+    if not expected_sha:
+        return False
     checkout_sha = _current_checkout_sha()
     if owed is not None and checkout_sha != expected_sha and not checkout_contains(expected_sha):
         return False  # a newer pull moved HEAD; it owns a fresh obligation
@@ -437,11 +440,9 @@ def _marker_only_restart_obsolete() -> bool:
     except Exception as exc:
         logger.debug("Fleet probe failed; keeping fleet-restart-pending marker: %s", exc)
         return False
-    if not fleet or (not expected_sha and all(row_is_external(row) for row in fleet)):
-        if owed is not None or not expected_sha:
-            # Absence cannot prove recovery of the recorded inventory / unnamed code; a fleet
-            # whose every row serves ANOTHER checkout root is absence too, not evidence.
-            return False
+    if not fleet:
+        if owed is not None:
+            return False  # Absence cannot prove recovery of the recorded inventory.
         return _discharge_gatewayless_marker(checkout_sha, expected_sha)
     covered = _fleet_covered_gateways(fleet)
     if covered is None:
@@ -1917,10 +1918,7 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     # Restart a managed dashboard via systemd or stop stale manual ones (raw-killing
     # a systemd-owned PID reads as clean stop and leaves the Cloudflare origin dead).
     # Already-restarted units aren't redone.
-    # A dashboard it stopped and could not bring back is a promised restart that did not happen.
-    _dashboards_down = _refresh_dashboard_after_update(already_restarted_units=set(restart.restarted_services))
-    if _dashboards_down:
-        restart.incomplete = True
+    _refresh_dashboard_after_update(already_restarted_units=set(restart.restarted_services))
 
     # Success-path twin of the abort-recovery probe: the restart phase only touches
     # units, so a unit-less `hermes serve` keeps stale sys.modules. Runs AFTER
@@ -2003,7 +2001,6 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
                     if _stale_serve_rows is not None
                     else None
                 ),
-                failed_respawn_pids=_dashboards_down,
             )
             from dataclasses import asdict
             from hermes_cli.update_serve_obligations import defer_manual_serve

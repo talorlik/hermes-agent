@@ -33,6 +33,7 @@ import copy
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -42,6 +43,148 @@ from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+UPDATE_QUARANTINE_FILE = ".update-quarantine.json"
+
+
+class UpdateQuarantineResolutionError(RuntimeError):
+    """Raised when a checkout's repository-common quarantine owner is unprovable."""
+
+
+def _metadata_path(parent: Path, raw: str, *, label: str) -> Path:
+    value = raw.strip()
+    if not value or "\x00" in value:
+        raise UpdateQuarantineResolutionError(f"invalid {label}")
+    path = Path(value)
+    return (path if path.is_absolute() else parent / path).resolve()
+
+
+def _read_metadata_path(path: Path, *, parent: Path, label: str) -> Path:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise UpdateQuarantineResolutionError(f"unreadable {label}: {exc}") from exc
+    return _metadata_path(parent, raw, label=label)
+
+
+def _common_dir_from_metadata(checkout_root: Path) -> Path:
+    git_entry = checkout_root / ".git"
+    if git_entry.is_dir():
+        commondir = git_entry / "commondir"
+        if commondir.exists():
+            common = _read_metadata_path(
+                commondir, parent=git_entry, label="Git commondir"
+            )
+            if not common.is_dir():
+                raise UpdateQuarantineResolutionError(
+                    "Git commondir is not a directory"
+                )
+            return common
+        return git_entry.resolve()
+
+    if git_entry.is_file():
+        try:
+            pointer = git_entry.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise UpdateQuarantineResolutionError(
+                f"unreadable .git pointer: {exc}"
+            ) from exc
+        prefix = "gitdir:"
+        if not pointer.startswith(prefix):
+            raise UpdateQuarantineResolutionError("invalid .git pointer")
+        git_dir = _metadata_path(
+            checkout_root, pointer.removeprefix(prefix), label=".git pointer"
+        )
+        if not git_dir.is_dir():
+            raise UpdateQuarantineResolutionError(
+                ".git pointer target is not a directory"
+            )
+        commondir = git_dir / "commondir"
+        if commondir.exists():
+            common = _read_metadata_path(
+                commondir, parent=git_dir, label="Git commondir"
+            )
+            if not common.is_dir():
+                raise UpdateQuarantineResolutionError(
+                    "Git commondir is not a directory"
+                )
+            return common
+        if (git_dir / "HEAD").is_file() and (git_dir / "objects").is_dir():
+            return git_dir
+        raise UpdateQuarantineResolutionError(
+            "linked-worktree Git metadata has no resolvable commondir"
+        )
+
+    if (checkout_root / "HEAD").is_file() and (checkout_root / "objects").is_dir():
+        return checkout_root.resolve()
+    raise UpdateQuarantineResolutionError(
+        "checkout Git common directory is unresolvable"
+    )
+
+
+def update_quarantine_path(checkout_root: Path) -> Path:
+    """Return a marker path shared by every profile using this checkout."""
+    checkout_root = Path(checkout_root).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout_root), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            check=False,
+        )
+        common_text = result.stdout.strip()
+        if result.returncode == 0 and common_text and "\n" not in common_text:
+            common = _metadata_path(
+                checkout_root, common_text, label="git --git-common-dir output"
+            )
+            if common.is_dir():
+                return common / UPDATE_QUARANTINE_FILE
+    except (Exception, UnicodeError):
+        pass
+    return _common_dir_from_metadata(checkout_root) / UPDATE_QUARANTINE_FILE
+
+
+def write_sync_quarantine(evidence: dict[str, Any], checkout_root: Path) -> Path:
+    """Atomically persist mode-0600 synchronization quarantine evidence."""
+    path = update_quarantine_path(checkout_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"schema": 1, **evidence}, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        with suppress(OSError):
+            tmp.unlink()
+        raise
+    return path
+
+
+def read_sync_quarantine(checkout_root: Path) -> dict[str, Any] | None:
+    """Read an existing quarantine marker, returning opaque evidence on corruption."""
+    try:
+        path = update_quarantine_path(checkout_root)
+    except UpdateQuarantineResolutionError as exc:
+        return {"error": f"cannot resolve updater quarantine marker: {exc}"}
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            payload
+            if isinstance(payload, dict)
+            else {"error": "invalid marker payload"}
+        )
+    except Exception as exc:
+        return {"error": f"unreadable quarantine marker: {exc}"}
+
 
 _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
 COMMAND_BOUNDARY_STOP_REASON = "completed at command boundary"
@@ -124,13 +267,6 @@ class UpdateReceipt:
 
     def skip(self, name: str, reason: str) -> None:
         self.data["skips"].append({"name": name, "reason": reason, "at": _utc_now_iso()})
-
-    def stage(self, name: str, outcome: str, **facts: str) -> None:
-        # Stage END marks: a stage's duration is the gap since the previous mark (or started_at).
-        self.data.setdefault("stages", []).append({"name": name, "outcome": outcome, "at": _utc_now_iso(), **facts})
-
-    def fact(self, key: str, value: Any) -> None:
-        self.data[key] = value
 
     def gateway_restart_result(
         self, *, restarted_services: list | None = None, relaunched_profiles: list | None = None,
@@ -239,16 +375,6 @@ def record_skip(name: str, reason: str) -> None:
     _record("skip", f"update skip {name}", name, reason)
 
 
-def record_stage(name: str, outcome: str, **facts: str) -> None:
-    """Mark the END of a pipeline stage (``success``/``failed``/``skipped``) with a timestamp."""
-    _record("stage", f"update stage {name}", name, outcome, **facts)
-
-
-def record_fact(key: str, value: Any) -> None:
-    """Set one top-level receipt field (e.g. ``initiator``)."""
-    _record("fact", f"update fact {key}", key, value)
-
-
 def record_gateway_restart(**kwargs: Any) -> None:
     """Record the gateway restart phase outcome (see UpdateReceipt)."""
     _record("gateway_restart_result", "gateway restart result", **kwargs)
@@ -332,7 +458,6 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
         with suppress(Exception):  # stable pointer for the dashboard/desktop
             _atomic_bytes(directory / "latest.json", payload)
         _prune_old_receipts(directory)
-        _publish_shared_metrics(receipt.data)
         return path
     except Exception as exc:
         # Visible, not debug: a run that pulled code and left no receipt is exactly the run
@@ -340,69 +465,6 @@ def finalize_update_receipt(outcome: str, fleet: list | None = None, stop_reason
         logger.warning("Could not write update receipt (%s): %s", outcome, exc)
         print(f"  ⚠ Update receipt not written: {exc}")
         return None
-
-
-def _collection_enabled_now() -> Optional[bool]:
-    """Shared-metrics consent via the ALREADY-LOADED config module (never an import: this interpreter
-    predates the checkout swap). None when it cannot tell (not loaded, unreadable config)."""
-    reader = getattr(sys.modules.get("hermes_cli.config"), "read_raw_config_readonly", None)
-    if reader is None:
-        return None
-    try:
-        config: Any = reader()
-    except Exception:
-        return None
-    if type(config) is not dict:  # FailedConfigRead: a fallback, not what the user chose
-        return None
-    for key in ("telemetry", "shared_metrics"):
-        config = config.get(key) if isinstance(config, dict) else None
-    return isinstance(config, dict) and config.get("enabled") is True
-
-
-def _metric_receipt(data: dict[str, Any]) -> dict[str, Any]:
-    """Only what shared_metrics_update.update_receipt_fields reads; never argv or step text."""
-    pre = data.get("pre_update") if isinstance(data.get("pre_update"), dict) else {}
-    return {
-        "update_id": data.get("update_id"), "started_at": data.get("started_at"),
-        "finished_at": data.get("finished_at"), "outcome": data.get("outcome"),
-        "initiator": "desktop" if data.get("initiator") == "desktop" else None,
-        "pre_update": {"commit_date": pre.get("commit_date")},
-        "stages": [
-            {key: mark[key] for key in ("name", "outcome", "at", "mode") if key in mark}
-            for mark in data.get("stages") or () if isinstance(mark, dict)
-        ],
-        "steps": [
-            {"name": "admission", "ok": bool(step.get("ok"))}
-            for step in data.get("steps") or () if isinstance(step, dict) and step.get("name") == "admission"
-        ],
-        "fleet": [{"state": row.get("state")} for row in data.get("fleet") or () if isinstance(row, dict)],
-    }
-
-
-def _publish_shared_metrics(data: dict[str, Any]) -> None:
-    """hermes.update.run/stage from this FINAL receipt; must never fail or slow the update."""
-    with suppress(Exception):
-        pre, post = data.get("pre_update") or {}, data.get("post_update") or {}
-        if data.get("pid") == os.getpid() and not (pre.get("sha") and pre.get("sha") == post.get("sha")):
-            # This interpreter began the run before the checkout swap: importing now would load
-            # pulled code into it. Park the bounded fields (stdlib + loaded modules only); the next
-            # Hermes start records them.
-            from hermes_constants import get_hermes_home
-            from hermes_cli.runtime_state import _atomic_bytes
-
-            pending = get_hermes_home() / "telemetry" / "shared_metrics" / "pending_updates"  # = PENDING_DIRNAME
-            enabled = _collection_enabled_now()
-            if enabled is False:
-                import shutil
-
-                shutil.rmtree(pending, ignore_errors=True)  # opted out: nothing parked may be counted later
-            elif enabled:
-                pending.mkdir(parents=True, exist_ok=True)
-                _atomic_bytes(pending / f"{data.get('update_id')}.json", json.dumps(_metric_receipt(data), default=str).encode())
-            return
-        from hermes_cli.observability.shared_metrics_update import record_update_receipt
-
-        record_update_receipt(data)
 
 
 def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason: str = "") -> Optional[Path]:
