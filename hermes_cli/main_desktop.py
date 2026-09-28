@@ -974,6 +974,10 @@ def _install_rebuilt_desktop_app(desktop_dir: Path) -> tuple[list[Path], list[st
     if rebuilt_exe is None:
         return [], []
     # .../Hermes.app/Contents/MacOS/Hermes -> .../Hermes.app
+    # A checkout that does not own the installed app must not scan running
+    # bundles either: that scan resolves the live Hermes.app under the home.
+    if not _installed_desktop_apps():
+        return [], []
     return _install_rebuilt_macos_bundles(
         rebuilt_exe.parents[2], _installed_desktop_apps(), running=_running_macos_app_bundles())
 
@@ -1015,9 +1019,12 @@ def _installed_desktop_apps() -> list[Path]:
     if sys.platform != "darwin":
         return []
     from hermes_cli.gui_uninstall import packaged_gui_app_paths  # noqa: PLC0415
-    from hermes_cli.main import PROJECT_ROOT  # noqa: PLC0415
+    from hermes_cli import main as cli_main  # noqa: PLC0415
     from hermes_constants import get_default_hermes_root  # noqa: PLC0415
-    if Path(PROJECT_ROOT).resolve() != (get_default_hermes_root() / "hermes-agent").resolve():
+    # Read PROJECT_ROOT at call time. A module-level import captures the checkout
+    # path, so a test that patches hermes_cli.main.PROJECT_ROOT still looked up
+    # the live install under ~/.hermes/hermes-agent.
+    if Path(cli_main.PROJECT_ROOT).resolve() != (get_default_hermes_root() / "hermes-agent").resolve():
         return []
     return _update_owned_macos_bundles(packaged_gui_app_paths())
 
