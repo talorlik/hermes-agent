@@ -50,7 +50,7 @@ except ImportError:
     from cron.model_drift_compat import resolve_cron_model_drift_defaults
     _USING_MODEL_DRIFT_COMPAT = True
 
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import get_fallback_chain, scoped_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
@@ -117,11 +117,43 @@ def _set_cron_session_title(session_db, session_id, base_title):
         return deduped
 
 
-def _fallback_chain_phrase() -> str:
-    """Backup-provider clause for a provider-failure notice: "the backups failed too" vs "none
-    configured" (most installs). Fails open to the former if config can't be read — never crash
-    delivery.
+def _job_route_pinned(job: dict) -> bool:
+    """True when the job carries its own provider, model or endpoint.
+
+    Unpinned jobs store none of these and follow the main model at fire time,
+    so any value is an explicit operator pin.
     """
+    return any(
+        isinstance(job.get(key), str) and job[key].strip()
+        for key in ("provider", "model", "base_url")
+    )
+
+
+def _job_fallback_chain(job: dict, cfg) -> list | None:
+    """The fallback chain this job may walk, or None when the pin rules it out.
+
+    A pinned job never borrows the global chain. An unpinned job inherits it.
+    Same rule as ``scoped_fallback_chain``.
+    """
+    return scoped_fallback_chain(
+        get_fallback_chain(cfg),
+        None,
+        pinned=_job_route_pinned(job),
+        owner="cron job",
+    )
+
+
+def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
+    """Backup-provider clause for a provider-failure notice: "pinned, no fallback" vs "the backups
+    failed too" vs "none configured" (most installs). Fails open to "the backups failed too" if
+    config can't be read — never crash delivery.
+    """
+    if job is not None and _job_route_pinned(job):
+        return (
+            "This job is pinned to its own provider/model, so it does not fall back to "
+            f"`fallback_providers`; `hermes cron edit {job.get('id')} --unpin` lets it follow the "
+            "main model and its fallback chain."
+        )
     try:
         cfg = load_config() or {}
         chain = get_fallback_chain(cfg)
@@ -269,7 +301,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if not job.get("no_agent"):
         notice = provider_failure_notice(
             job_name, job_id, classify_cron_failure_reason(text),
-            backup_provider_phrase=_fallback_chain_phrase(), provider=job.get("provider"))
+            backup_provider_phrase=_fallback_chain_phrase(job), provider=job.get("provider"))
         if notice is not None:
             return notice
 
@@ -546,6 +578,8 @@ _running_lock = threading.Lock()
 # Per in-flight id: time.time() claim instant + the future owning its release (``_FUTURE_PENDING``
 # until pool.submit returns). Past-allowance with no live future = leak; the sweep force-releases.
 _running_since: dict = {}
+# job id -> stale-inflight allowance (s), resolved once per run by get_wedged_job_ids.
+_running_allowance_s: dict = {}
 _running_futures: dict = {}
 
 # Installed in ``_running_futures`` at claim time so a sweep landing before ``pool.submit`` returns
@@ -651,6 +685,7 @@ def release_running_job(job_id: str) -> None:
     with _running_lock:
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
+        _running_allowance_s.pop(job_id, None)
         _running_futures.pop(job_id, None)
         _running_worker_pids.pop(job_id, None)
 
@@ -1029,6 +1064,80 @@ def _shutdown_parallel_pool() -> None:
 
 
 atexit.register(_shutdown_parallel_pool)
+
+
+def discard_parallel_pools(home_keys) -> None:
+    """Drop the shared parallel pool when the caller is discarding homes.
+
+    This fork has one process-global pool, not one pool per home. A non-empty
+    discard still shuts that pool so a host that stopped ticking does not keep
+    its ``cron-parallel`` threads. ``wait=False`` so the caller is not blocked;
+    process exit still drains via ``_shutdown_parallel_pool``.
+    """
+    global _parallel_pool, _parallel_pool_max_workers
+    if not home_keys:
+        return
+    pool = _parallel_pool
+    _parallel_pool = None
+    _parallel_pool_max_workers = None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=False)
+
+
+def _inflight_key(job_id: str, home=None) -> str:
+    """Identity of one in-flight cron run.
+
+    This fork's running set is process-global and keyed by bare job id. The
+    ``home`` argument exists so callers written against the upstream
+    ``(home, job id)`` key still compile; it is not part of the identity here.
+    """
+    del home
+    return job_id
+
+
+def get_wedged_job_ids() -> frozenset[str]:
+    """In-flight job IDs older than their stale-inflight allowance.
+
+    Allowance is ``max(2 * interval, cron.inflight_max_minutes)``, resolved
+    once per run and cached on ``_running_allowance_s`` so a drain that polls
+    this every 0.1s does not re-read jobs.json. This fork's running set is
+    keyed by bare job id.
+    """
+    now = time.time()
+    with _running_lock:
+        ages = {
+            job_id: now - started
+            for job_id, started in _running_since.items()
+            if job_id in _running_job_ids
+        }
+        allowances = {
+            job_id: _running_allowance_s[job_id]
+            for job_id in ages
+            if job_id in _running_allowance_s
+        }
+    if not ages:
+        return frozenset()
+    floor_seconds = _inflight_min_allowance_minutes() * 60.0
+    unresolved = [job_id for job_id in ages if job_id not in allowances]
+    if unresolved:
+        by_id: dict = {}
+        with contextlib.suppress(Exception):
+            from cron.jobs import load_jobs
+
+            by_id = {job.get("id"): job for job in load_jobs()}
+        with _running_lock:
+            for job_id in unresolved:
+                allowance = floor_seconds
+                interval_minutes = _job_interval_minutes(by_id.get(job_id) or {})
+                if interval_minutes:
+                    allowance = max(allowance, 2.0 * interval_minutes * 60.0)
+                allowances[job_id] = allowance
+                if job_id in _running_job_ids:
+                    _running_allowance_s[job_id] = allowance
+    return frozenset(
+        job_id for job_id, age in ages.items()
+        if age >= max(allowances.get(job_id, floor_seconds), floor_seconds)
+    )
 # Per-fire usage audit log; resolves via _get_hermes_home() so profile-scoped paths work.
 def _usage_audit_path() -> Path:
     return _get_hermes_home() / "cron" / "usage_audit.jsonl"
@@ -1585,7 +1694,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
             job_id, "auth" if is_auth else "transient network", resolve_exc)
-        for entry in get_fallback_chain(jc.cfg):
+        for entry in (_job_fallback_chain(job, jc.cfg) or []):
             if not isinstance(entry, dict):
                 continue
             fb_provider = str(entry.get("provider") or "").strip()
@@ -2217,7 +2326,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
-    setup.fallback_model = get_fallback_chain(_cfg) or None
+    setup.fallback_model = _job_fallback_chain(job, _cfg) or None
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
     _init_cron_mcp_tools(job_id)

@@ -111,3 +111,29 @@ def plan_retry(job: Dict[str, Any]) -> bool:
         job.get("name", job.get("id", "?")), attempt + 1, len(RETRY_DELAYS_SECONDS),
         delay, retry_at)
     return True
+
+
+def will_retry(job: Dict[str, Any]) -> bool:
+    """True when ``plan_retry`` would park a re-run for this flagged failure.
+
+    Read-only. Delivery uses this to hold the failure notice until the ladder
+    is exhausted. The decision matches ``plan_retry`` without mutating the job.
+    """
+    if not _is_recurring(job) or job.get("state") == "paused" or not retry_enabled():
+        return False
+    repeat = job.get("repeat") or {}
+    times = repeat.get("times")
+    if times is not None and times > 0 and int(repeat.get("completed") or 0) + 1 >= times:
+        return False
+    state = job.get(STATE_KEY) or {}
+    attempt = int(state.get("attempt") or 0)
+    if attempt >= len(RETRY_DELAYS_SECONDS):
+        return False
+    delay = RETRY_DELAYS_SECONDS[attempt]
+    retry_dt = _hermes_now() + timedelta(seconds=delay)
+    from cron.jobs import _parse_aware
+
+    natural_next = _parse_aware(job.get("next_run_at"))
+    if natural_next is not None and natural_next <= retry_dt:
+        return False
+    return True

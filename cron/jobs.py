@@ -957,6 +957,22 @@ def _parse_aware(value: Any) -> Optional[datetime]:
         return None
 
 
+def _elapsed_seconds(since: datetime, now: datetime) -> float:
+    return (_ensure_aware(now) - _ensure_aware(since)).total_seconds()
+
+
+def _instant_after(now: datetime, seconds: float) -> datetime:
+    return _ensure_aware(now) + timedelta(seconds=seconds)
+
+
+def _instant_before(now: datetime, seconds: float) -> datetime:
+    return _ensure_aware(now) - timedelta(seconds=seconds)
+
+
+def _seconds_after(now: datetime, then: datetime) -> float:
+    return (_ensure_aware(then) - _ensure_aware(now)).total_seconds()
+
+
 def _timezone_offset_mismatch(stored: datetime, current: datetime) -> bool:
     """True when a stored aware timestamp uses a different UTC offset. Naive values return False:
     they are normalized by ``_ensure_aware`` and intentionally never take the offset-repair path."""
