@@ -4,6 +4,15 @@ Pure-data leaf module — must not import from hermes_cli.config. Comments are t
 docs of config.yaml.
 """
 
+# Upstream sandbox defaults. The fork overlay of this file predates these names;
+# callers on the new tip import them, so they live here rather than as literals.
+DEFAULT_SANDBOX_IMAGE = "nousresearch/hermes-sandbox:desktop"
+LEGACY_SANDBOX_IMAGES = ("nikolaik/python-nodejs:python3.11-nodejs20", "nikolaik/python-nodejs:python3.14-nodejs22")
+LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
+# Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
+DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
+LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
+
 
 def _aux(timeout, *, reasoning_effort=True, **extra):
     """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
@@ -325,16 +334,17 @@ DEFAULT_CONFIG = {
         # go first because n/nvm/asdf write PATH exports there without an interactivity guard. Turn
         # off if an rc file misbehaves when sourced non-interactively (exits on TTY check).
         "auto_source_bashrc": True,
-        "docker_image": "nikolaik/python-nodejs:python3.14-nodejs22",
+        "docker_image": DEFAULT_SANDBOX_IMAGE,
         "docker_forward_env": [],
         # Exact key-value env pairs set inside Docker containers (unlike docker_forward_env, which
         # reads host values) — useful under systemd without the user's shell env. Example:
         # {"SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.sock"}
         "docker_env": {},
-        "singularity_image": "docker://nikolaik/python-nodejs:python3.14-nodejs22",
-        "modal_image": "nikolaik/python-nodejs:python3.14-nodejs22",
-        "daytona_image": "nikolaik/python-nodejs:python3.14-nodejs22",
-        "vercel_runtime": "node24",  # vercel_sandbox backend only: node24 | node22 | python3.13
+        "singularity_image": f"docker://{DEFAULT_SANDBOX_IMAGE}",
+        "modal_image": DEFAULT_SANDBOX_IMAGE,
+        "daytona_image": DEFAULT_SANDBOX_IMAGE,
+        "vercel_image": DEFAULT_VERCEL_IMAGE,  # vercel_sandbox backend only: a Vercel-managed or VCR image
+        "vercel_runtime": "",  # deprecated by Vercel; a legacy runtime pin overrides vercel_image
         # Container limits (docker, singularity, modal, daytona, vercel_sandbox; not local/ssh).
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
