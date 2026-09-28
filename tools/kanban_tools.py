@@ -177,6 +177,36 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _persisted_identity() -> str:
+    """Author name stored on comments and events: the active profile, else the OS user."""
+    from hermes_cli.profiles import current_profile_name
+
+    return current_profile_name() or os.environ.get("USER") or os.environ.get("USERNAME") or "worker"
+
+
+def register_current_worker_from_env() -> bool:
+    """Bind this process as the dispatcher-spawned worker for ``HERMES_KANBAN_TASK``.
+
+    Returns False when a newer run already owns the task, so the caller can exit
+    without writing into a reclaimed card. Delegated children must not register:
+    the dispatcher owns the claim.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id or _is_delegated_child_context():
+        return True
+    run_id = _worker_run_id(task_id)
+    if run_id is None:
+        return True
+    from hermes_cli.kanban_db_dispatch import adopt_worker_pid
+
+    try:
+        with _board(None, quiet_close=True) as (kb, conn):
+            return bool(adopt_worker_pid(conn, task_id, run_id, os.getpid()))
+    except Exception:
+        logger.debug("worker registration failed for %s", task_id, exc_info=True)
+        return False
+
+
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
     session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
