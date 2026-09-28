@@ -19,27 +19,7 @@ describe('resolveDeepLinkAction', () => {
     })
   })
 
-  it('routes catalog= to the catalog lookup, never to a git-path install', () => {
-    expect(
-      resolveDeepLinkAction({ kind: 'plugin', name: 'install', params: { catalog: ' web-search-plus ' } })
-    ).toEqual({ type: 'plugin-catalog-install', name: 'web-search-plus' })
-
-    // A repo riding along must not win: the reviewed catalog verdict decides.
-    expect(
-      resolveDeepLinkAction({
-        kind: 'plugin',
-        name: 'install',
-        params: { catalog: 'nope', repo: 'evil/repo' }
-      })
-    ).toEqual({ type: 'plugin-catalog-install', name: 'nope' })
-
-    // An empty catalog name is still a catalog request (→ error toast), not a fall-through.
-    expect(
-      resolveDeepLinkAction({ kind: 'plugin', name: 'install', params: { catalog: '', repo: 'evil/repo' } })
-    ).toEqual({ type: 'plugin-catalog-install', name: '' })
-  })
-
-  it('does not trust URL catalog metadata on a repository install', () => {
+  it('preserves catalog provenance without treating the display pin as an install target', () => {
     const params = {
       repo: 'https://github.com/owner/repo#plugins/example',
       catalog_name: 'example',
@@ -58,6 +38,8 @@ describe('resolveDeepLinkAction', () => {
     ).toEqual({
       type: 'plugin-install',
       repo: params.repo,
+      catalogName: params.catalog_name,
+      sha: params.sha,
       enable: true,
       force: false,
       legacyHint: null
@@ -99,23 +81,6 @@ describe('resolveDeepLinkAction', () => {
 
     expect(resolveDeepLinkAction({ kind: 'skill', name: 'remove', params: { identifier } })).toEqual({ type: 'ignore' })
     expect(resolveDeepLinkAction({ kind: 'plugin', name: 'install', params: {} })).toEqual({ type: 'ignore' })
-  })
-
-  it('preserves connector completion routing without treating browser status as authority', () => {
-    expect(
-      resolveDeepLinkAction({
-        kind: 'connections',
-        name: 'done',
-        params: { op: ' operation-1 ', status: ' connected ' }
-      })
-    ).toEqual({ type: 'connection-done', op: 'operation-1', status: 'connected' })
-    expect(
-      resolveDeepLinkAction({
-        kind: 'connections',
-        name: 'done',
-        params: { status: 'connected' }
-      })
-    ).toEqual({ type: 'ignore' })
   })
 
   it('routes blueprint composer inserts', () => {

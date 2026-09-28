@@ -16,15 +16,15 @@ import { $routeTiles, closeRouteTile, type RouteTile } from '@/store/route-tiles
 import {
   $routesVersion,
   ARTIFACTS_ROUTE,
-  CAPABILITIES_ROUTE,
   contributedRoutes,
   MESSAGING_ROUTE,
-  ROUTES_AREA
+  ROUTES_AREA,
+  SKILLS_ROUTE
 } from '../routes'
 
 import { paneMirror } from './pane-mirror'
 
-const CapabilitiesView = lazy(async () => ({ default: (await import('../capabilities')).CapabilitiesView }))
+const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
 const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
 const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
 
@@ -32,7 +32,7 @@ const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')
 const BUILTIN_PAGES: Record<string, { render: () => ReactNode; title: string }> = {
   [ARTIFACTS_ROUTE]: { render: () => <ArtifactsView />, title: 'Artifacts' },
   [MESSAGING_ROUTE]: { render: () => <MessagingView />, title: 'Messaging' },
-  [CAPABILITIES_ROUTE]: { render: () => <CapabilitiesView />, title: 'Capabilities' }
+  [SKILLS_ROUTE]: { render: () => <SkillsView />, title: 'Capabilities' }
 }
 
 /** Humanize a route path into a tab title: `/my-atlas` → `My Atlas`. */
