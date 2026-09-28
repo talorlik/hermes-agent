@@ -399,7 +399,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CLI-STARTUP: process entrypoint helpers shared by desktop and CLI launch
-- Commits: 4287d10b96b09546d2af49e673fde06f5f5cc47f
+- Commits: 4287d10b96b09546d2af49e673fde06f5f5cc47f, 572db173f7c57b2890a8af6b77eccf5f565bcfa1
 - Owned-Files:
   - hermes_cli/_startup_fast.py
   - hermes_cli/main_desktop.py
@@ -411,9 +411,19 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream owns this startup surface and the fork no longer patches it.
 - Disposition: active
 
+## G-GATEWAY-RESTART-ROUTE: non-supervisor restart drain stays hermetic under launchd
+- Commits: d432bf87ada09ff8f074a8cdfcac928e88f48304
+- Owned-Files:
+  - tests/gateway/test_restart_drain.py
+- Intent: The published drain contract asserts a detached relaunch when supervisor markers are absent. This host re-exports HERMES_LAUNCHD_LABEL to the gateway grandchild, and upstream's test does not clear that marker, so the assertion selected the service route.
+- Protected-Invariant: A /restart with the supervisor markers removed must drain without interrupting the running agent and must request a detached relaunch, not the exit-75 service route.
+- Tests: tests/gateway/test_restart_drain.py
+- Retirement-Condition: Upstream clears HERMES_LAUNCHD_LABEL in this test, or this host no longer exports a launchd job label into the test process.
+- Disposition: active
+
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 33
+- Ledger-Revision: 34
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465
 - Owned-Files:
@@ -422,7 +432,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test.
 - Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal. `Cross-Owner-Commits` maps a work commit only when every changed path already has one effective owner, at least two owners are involved, the commit does not change the ledger, and no entry has already claimed it.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
