@@ -23,6 +23,7 @@ const words = (text: string): string =>
     .filter(Boolean)
     .join(' ')
 
+/** Rank evidence, not a fixed list of products. The model derives outcomes from catalog descriptions; curated examples are optional. */
 export function onboardingRecommendations(
   entries: readonly McpCatalogEntry[],
   { apps = [], context = '' }: OnboardingInterests = {}
@@ -42,6 +43,7 @@ export function onboardingRecommendations(
     const detectedApps = entry.detected_apps ?? []
     const configured = entry.installed && entry.enabled
 
+    // An explicit task can request a disabled integration; mere discovery must not undo that choice.
     if (entry.installed && !entry.enabled && !preferred && !topical) {
       return []
     }
