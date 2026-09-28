@@ -389,37 +389,6 @@ async function listRemoteHermesProfiles(ssh) {
   return parseRemoteProfileListing(listing)
 }
 
-async function readRemoteInstallId(ssh) {
-  // The stable backend identity the roster collapses on (`hermes_cli/install_identity.py`:
-  // `<install root>/install_id`, opaque hex). Read from the INSTALL root, so an ssh connection
-  // pinned to `<root>/profiles/<name>` reports the same id as one pointed at the root — they are
-  // one backend. Read-only: a missing file is left missing (minting identity is the install's job,
-  // never a visiting client's) and simply means "no id", exactly as an older backend reports.
-  const root = remoteInstallRoot(assertSafeRemoteHome(await probeRemoteHermesHome(ssh)))
-  const file = expandRemotePath(`${root}/install_id`)
-  let out = ''
-
-  try {
-    out = await ssh.exec(`if [ -f ${file} ]; then cat ${file}; fi`)
-  } catch (cause) {
-    const error: any = new Error('Could not read the remote Hermes install id.')
-    error.kind = 'transient-transport-error'
-    error.cause = cause
-    throw error
-  }
-
-  const id =
-    String(out || '')
-      .trim()
-      .split('\n')
-      .pop()
-      ?.trim()
-      .toLowerCase() ?? ''
-
-  // Same shape check the minting side guarantees; anything else is not an identity.
-  return /^[0-9a-f]{32}$/.test(id) ? id : undefined
-}
-
 function assertSafeRemoteHome(home) {
   const value = String(home || '').trim()
 
@@ -1135,10 +1104,8 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
     `exec env HERMES_DESKTOP=1${opts.guestOnboarding === true ? ' HERMES_GUEST_ONBOARDING=1' : ''} ${hermes} ${profileArgs}${subCmd}`
 
-  const detachedShell: string = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
-  // The inner shell backgrounds Hermes and reports its PID; backgrounding the
-  // launcher too adds its unrelated PID to the value published in the lock.
-  const detachedSpawn: string = `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(detachedShell)} hermes-update-child "$1")`
+  const detachedShell = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
+  const detachedSpawn = `child=$("$(command -v setsid || echo nohup)" sh -c ${shq(detachedShell)} hermes-update-child "$1" & echo $!)`
 
   if (!opts.ownershipId || !opts.lockMetadata) {
     return withRemoteUpdateMutex(
@@ -1158,7 +1125,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const reservationNonce = validateSpawnNonce(opts.reservationNonce || crypto.randomBytes(8).toString('hex'))
 
   return withRemoteUpdateMutex(
-    `(umask 077 && mkdir -p "$(dirname ${reservation})"); ` +
+    `umask 077 && mkdir -p "$(dirname ${reservation})"; ` +
       // reservation/lockPath/ownerPath are expandRemotePath() output — already
       // shell-quoted fragments ("$HOME"'/…'). Embed raw so the assignment
       // expands $HOME; shq() here would store the quote characters literally
@@ -1181,9 +1148,8 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
       // ${var//pat/rep} is a bashism — this payload runs under plain sh (dash
       // on Ubuntu), which aborts the whole script on it with "Bad
       // substitution" AFTER the child was spawned, orphaning the backend and
-      // skipping the lockfile publication. Replace the quoted PID field with
-      // a JSON number so readLockfile and concurrent spawns accept the record.
-      `lock_json=$(printf '%s' ${shq(metadata)} | sed "s/\\"pid\\":\\"__PID__\\"/\\"pid\\":\${child}/"); ` +
+      // skipping the lockfile publication. Substitute with sed instead.
+      `lock_json=$(printf '%s' ${shq(metadata)} | sed "s/__PID__/\${child}/"); ` +
       `temporary_lock="\${lock}.${reservationNonce}.tmp"; ` +
       `printf '%s' "$lock_json" > "$temporary_lock" && mv -f "$temporary_lock" "$lock" || { kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 76; }; ` +
       `echo "$child"`,
@@ -1774,7 +1740,6 @@ export {
   probeRemotePlatform,
   PROTOCOL_VERSION,
   readLockfile,
-  readRemoteInstallId,
   READY_RE,
   REMOTE_LOCK_DIR,
   remotePidAlive,

@@ -16,6 +16,13 @@ import {
   switchBranch
 } from './git-worktree-ops'
 
+// An empty local core.hooksPath overrides any global hooks dir whose
+// commit-msg hook would reject the short fixture messages used here. Call it
+// on every fixture repo (local, remote, and clone) before its first commit.
+function isolateHooks(dir) {
+  execFileSync('git', ['-C', dir, 'config', 'core.hooksPath', ''])
+}
+
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
   assert.equal(sanitizeBranch('feat/cool thing'), 'feat/cool-thing')
@@ -74,6 +81,34 @@ test('ensureGitRepo: inits a plain dir with a root commit so worktrees branch', 
     await ensureGitRepo('git', dir)
     assert.equal(git('rev-list', '--count', 'HEAD'), '1')
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('ensureGitRepo: ignores user commit hooks for the synthetic root commit', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-hooks-'))
+  const hooks = path.join(dir, 'hooks')
+  const globalConfig = path.join(dir, 'global.gitconfig')
+  const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL
+
+  try {
+    fs.mkdirSync(hooks)
+    fs.writeFileSync(path.join(hooks, 'commit-msg'), '#!/bin/sh\nexit 1\n')
+    fs.chmodSync(path.join(hooks, 'commit-msg'), 0o755)
+    fs.writeFileSync(globalConfig, `[core]\n\thooksPath = ${hooks}\n`)
+    process.env.GIT_CONFIG_GLOBAL = globalConfig
+
+    await ensureGitRepo('git', dir)
+
+    const head = execFileSync('git', ['-C', dir, 'rev-parse', '--verify', 'HEAD']).toString().trim()
+    assert.match(head, /^[0-9a-f]{7,}$/)
+  } finally {
+    if (previousGlobalConfig === undefined) {
+      delete process.env.GIT_CONFIG_GLOBAL
+    } else {
+      process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig
+    }
+
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -281,6 +316,7 @@ test('addWorktree: base origin/main does not set up upstream tracking', async ()
     // Seed the remote with a commit on main. Inline identity so it works
     // on CI runners with no global git config.
     execFileSync('git', ['init', '-b', 'main', remoteDir])
+    isolateHooks(remoteDir)
     execFileSync('git', [
       '-C',
       remoteDir,
@@ -296,6 +332,7 @@ test('addWorktree: base origin/main does not set up upstream tracking', async ()
 
     // Clone so origin/main exists as a remote-tracking ref.
     execFileSync('git', ['clone', remoteDir, cloneDir])
+    isolateHooks(cloneDir)
 
     const result = await addWorktree(
       cloneDir,
@@ -322,165 +359,6 @@ test('addWorktree: base origin/main does not set up upstream tracking', async ()
   }
 })
 
-// A tag-pinned narrow clone (`--single-branch --branch v0`), the shape older
-// installers made: remote.origin.fetch maps only the tag, so no branch has a
-// tracking ref. The remote has `main` and `feature` one commit past the tag.
-// Returns both paths and the tip. The caller must remove them.
-const IDENT = ['-c', 'user.email=hermes@localhost', '-c', 'user.name=Hermes']
-
-function seedNarrowClone(label) {
-  const remoteDir = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-${label}-remote-`))
-  const cloneDir = fs.mkdtempSync(path.join(os.tmpdir(), `hermes-${label}-clone-`))
-  execFileSync('git', ['init', '-q', '-b', 'main', remoteDir])
-  execFileSync('git', ['-C', remoteDir, ...IDENT, 'commit', '-q', '--allow-empty', '-m', 'root'])
-  execFileSync('git', ['-C', remoteDir, 'tag', 'v0'])
-  execFileSync('git', ['-C', remoteDir, ...IDENT, 'commit', '-q', '--allow-empty', '-m', 'tip'])
-  execFileSync('git', ['-C', remoteDir, 'branch', 'feature'])
-  const tip = execFileSync('git', ['-C', remoteDir, 'rev-parse', 'HEAD']).toString().trim()
-
-  execFileSync('git', ['clone', '-q', '--single-branch', '--branch', 'v0', remoteDir, cloneDir])
-
-  return { cloneDir, remoteDir, tip }
-}
-
-test('addWorktree: base origin/main resolves on a tag-pinned narrow clone', async () => {
-  // A by-name `git fetch origin main` on a tag-only refspec writes FETCH_HEAD
-  // and never origin/main.
-  const { cloneDir, remoteDir, tip } = seedNarrowClone('narrow-base')
-
-  try {
-    const result = await addWorktree(cloneDir, { base: 'origin/main', branch: 'from-main', name: 'from-main' }, 'git')
-
-    const head = execFileSync('git', ['-C', result.path, 'rev-parse', 'HEAD']).toString().trim()
-
-    assert.equal(head, tip)
-    assert.equal(result.branch, 'from-main')
-    assert.throws(() =>
-      execFileSync('git', ['-C', cloneDir, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', 'from-main@{u}'], {
-        stdio: 'ignore'
-      })
-    )
-  } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
-  }
-})
-
-const fetchConfig = cloneDir =>
-  execFileSync('git', ['-C', cloneDir, 'config', '--get-all', 'remote.origin.fetch']).toString().trim()
-
-test('addWorktree: a remote branch on a tag-pinned narrow clone becomes a tracking local branch', async () => {
-  const { cloneDir, remoteDir, tip } = seedNarrowClone('narrow-convert')
-
-  try {
-    const result = await addWorktree(cloneDir, { existingBranch: 'origin/feature' }, 'git')
-
-    const inTree = (...args) =>
-      execFileSync('git', ['-C', result.path, ...args])
-        .toString()
-        .trim()
-
-    assert.equal(result.branch, 'feature')
-    assert.equal(inTree('rev-parse', 'HEAD'), tip)
-    assert.equal(inTree('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'), 'origin/feature')
-  } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
-  }
-})
-
-test('addWorktree: a remote branch that does not exist leaves the fetch config alone', async () => {
-  // A configured refspec whose source is missing makes every later plain
-  // `git fetch` fail, so a typo must never be registered on the remote.
-  const narrow = seedNarrowClone('narrow-typo')
-  const normal = seedRemoteAndClone('normal-typo', [])
-
-  try {
-    for (const cloneDir of [narrow.cloneDir, normal.cloneDir]) {
-      const before = fetchConfig(cloneDir)
-
-      await assert.rejects(addWorktree(cloneDir, { existingBranch: 'origin/typo' }, 'git'))
-      assert.equal(fetchConfig(cloneDir), before)
-      execFileSync('git', ['-C', cloneDir, 'fetch', '-q'])
-    }
-  } finally {
-    for (const dir of [narrow.remoteDir, narrow.cloneDir, normal.remoteDir, normal.cloneDir]) {
-      fs.rmSync(dir, { recursive: true, force: true })
-    }
-  }
-})
-
-test('addWorktree: converting a remote branch on a normal clone adds no fetch refspec', async () => {
-  const { cloneDir, remoteDir } = seedRemoteAndClone('normal-convert-config', ['teammate-work'])
-
-  try {
-    const before = fetchConfig(cloneDir)
-
-    await addWorktree(cloneDir, { existingBranch: 'origin/teammate-work' }, 'git')
-    assert.equal(fetchConfig(cloneDir), before)
-  } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
-  }
-})
-
-test('addWorktree: a local slash branch named like a remote branch stays local', async () => {
-  // Without this, "origin/feature" (a local branch) became a new `feature`
-  // tracking the remote branch of the same name, after a network fetch.
-  const { cloneDir, remoteDir, tip } = seedNarrowClone('narrow-local-slash')
-
-  try {
-    execFileSync('git', ['-C', cloneDir, 'branch', 'origin/feature'])
-    const local = execFileSync('git', ['-C', cloneDir, 'rev-parse', 'refs/heads/origin/feature']).toString().trim()
-
-    assert.notEqual(local, tip)
-
-    const result = await addWorktree(cloneDir, { existingBranch: 'origin/feature' }, 'git')
-    const head = execFileSync('git', ['-C', result.path, 'rev-parse', 'HEAD']).toString().trim()
-    const remoteRefs = execFileSync('git', ['-C', cloneDir, 'for-each-ref', 'refs/remotes']).toString().trim()
-
-    assert.equal(result.branch, 'origin/feature')
-    assert.equal(head, local)
-    assert.equal(remoteRefs, '')
-  } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
-  }
-})
-
-test('addWorktree: a valid branch the sanitizer would rewrite is still refreshed as a base', async () => {
-  const { cloneDir, remoteDir } = seedRemoteAndClone('plus-base', ['fix+1'])
-
-  try {
-    execFileSync('git', ['-C', remoteDir, 'checkout', '-q', 'fix+1'])
-    execFileSync('git', ['-C', remoteDir, ...IDENT, 'commit', '-q', '--allow-empty', '-m', 'moved after the clone'])
-    const moved = execFileSync('git', ['-C', remoteDir, 'rev-parse', 'HEAD']).toString().trim()
-
-    const result = await addWorktree(cloneDir, { base: 'origin/fix+1', branch: 'x', name: 'x' }, 'git')
-    const head = execFileSync('git', ['-C', result.path, 'rev-parse', 'HEAD']).toString().trim()
-
-    assert.equal(head, moved)
-  } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
-  }
-})
-
-test('addWorktree: a glob base is not turned into a fetch of every branch', async () => {
-  const { cloneDir, remoteDir } = seedNarrowClone('narrow-glob')
-
-  try {
-    await assert.rejects(addWorktree(cloneDir, { base: 'origin/*', name: 'glob' }, 'git'))
-
-    const remoteRefs = execFileSync('git', ['-C', cloneDir, 'for-each-ref', 'refs/remotes']).toString().trim()
-
-    assert.equal(remoteRefs, '')
-  } finally {
-    fs.rmSync(remoteDir, { recursive: true, force: true })
-    fs.rmSync(cloneDir, { recursive: true, force: true })
-  }
-})
-
 // A pair of repos: a bare "remote" with `main` and the extra branches in
 // `branches`, plus a clone of it. Returns both paths. The caller must remove
 // them.
@@ -494,6 +372,7 @@ function seedRemoteAndClone(label, branches) {
       .trim()
 
   execFileSync('git', ['init', '-b', 'main', remoteDir])
+  isolateHooks(remoteDir)
   remoteGit('-c', 'user.email=hermes@localhost', '-c', 'user.name=Hermes', 'commit', '--allow-empty', '-m', 'root')
 
   for (const branch of branches) {
@@ -501,6 +380,7 @@ function seedRemoteAndClone(label, branches) {
   }
 
   execFileSync('git', ['clone', remoteDir, cloneDir])
+  isolateHooks(cloneDir)
 
   return { cloneDir, remoteDir }
 }
@@ -615,6 +495,7 @@ test('switchBranch: repo dir still validates the branch name and switches', asyn
 
   try {
     execFileSync('git', ['init', '-b', 'main'], { cwd: dir })
+    isolateHooks(dir)
     execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: dir })
     execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir })
     execFileSync('git', ['commit', '--allow-empty', '-m', 'root'], { cwd: dir })

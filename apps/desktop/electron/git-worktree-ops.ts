@@ -2,32 +2,30 @@
 // fresh worktree the lightest way (`git worktree add -b`), list real worktrees,
 // and remove them. Git is the source of truth; the renderer just drives these.
 
+import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
 import { resolveRequestedPathForIpc } from './hardening'
-import { execGit } from './no-console-git'
 
 function runGit(gitBin, args, cwd): Promise<string> {
-  return execGit(gitBin, args, { cwd, timeoutMs: 30_000 }).then(result => {
-    if (result.code !== 0) {
-      const error = new Error(result.stderr || `git exited ${result.code}`) as Error & { stderr?: string }
+  return new Promise((resolve, reject) => {
+    execFile(
+      gitBin,
+      args,
+      { cwd, windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          err.stderr = String(stderr || '')
+          reject(err)
 
-      error.stderr = result.stderr
-      throw error
-    }
+          return
+        }
 
-    return result.stdout
+        resolve(String(stdout || ''))
+      }
+    )
   })
-}
-
-// Fetch `<remote>/<branch>` by explicit refspec; true when the remote has the
-// branch. A tag-pinned narrow clone maps only the tag in remote.<remote>.fetch,
-// so a by-name fetch writes FETCH_HEAD without creating the tracking ref
-// (#125686). Same refspec as `hermes update`: the `+` matters on a depth-1
-// clone, where the new tip need not descend from the old one.
-async function fetchTrackingRef(gitBin, root, remote, branch): Promise<boolean> {
-  return gitOk(gitBin, ['fetch', remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`], root)
 }
 
 // Parse `git worktree list --porcelain`. The first record is the main worktree.
@@ -209,6 +207,11 @@ async function ensureGitRepo(gitBin, dir) {
     await runGit(
       gitBin,
       [
+        // This is a synthetic bootstrap commit created by Hermes, not a user
+        // commit. Global hooks can reject its fixed message and make worktree
+        // initialization unusable, so isolate only this command.
+        '-c',
+        'core.hooksPath=',
         '-c',
         'user.email=hermes@localhost',
         '-c',
@@ -255,29 +258,7 @@ async function addExistingBranchWorktree(gitBin, root, name) {
   // check out. `git worktree add <dir> origin/feature` detaches HEAD. Make a
   // local branch with the same short name that tracks the remote ref. This is
   // what `git switch feature` does for a branch on exactly one remote.
-  let remote = await remoteOfRef(gitBin, root, requested)
-  let fetched = false
-
-  if (
-    !remote &&
-    requested.includes('/') &&
-    !(await gitOk(gitBin, ['show-ref', '--verify', '--quiet', `refs/heads/${requested}`], root))
-  ) {
-    // A tag-pinned narrow clone has no tracking ref for any branch, so the
-    // ref-based reading above misreads "origin/feature" as a local branch. When
-    // no such local branch exists and the remote carries the branch, fetching
-    // it creates the ref; otherwise keep the local-branch reading and its error.
-    const maybeRemote = requested.slice(0, requested.indexOf('/'))
-
-    if (
-      (await gitLine(gitBin, ['remote', 'get-url', maybeRemote], root)) &&
-      (await fetchTrackingRef(gitBin, root, maybeRemote, requested.slice(maybeRemote.length + 1)))
-    ) {
-      remote = maybeRemote
-      fetched = true
-    }
-  }
-
+  const remote = await remoteOfRef(gitBin, root, requested)
   const branch = remote ? requested.slice(remote.length + 1) : requested
 
   if (!remote && branch === (await defaultBranch(gitBin, root))) {
@@ -289,23 +270,17 @@ async function addExistingBranchWorktree(gitBin, root, name) {
   const dir = uniqueDir(path.join(root, '.worktrees', slugify(branch)))
 
   if (remote) {
-    // Best effort freshness: after a failure (offline, branch gone from the
-    // remote) the last known ref is still there to branch from.
-    fetched = fetched || (await fetchTrackingRef(gitBin, root, remote, branch))
-
-    if (!(await gitOk(gitBin, ['worktree', 'add', '--track', '-b', branch, dir, requested], root))) {
-      // `--track` needs remote.<remote>.fetch to map the ref back to a remote
-      // branch; a narrow clone maps only its tag. Branch untracked, then
-      // register the branch and wire upstream, but only for a branch the fetch
-      // just proved exists: a configured refspec whose source is gone makes
-      // every later plain `git fetch` fail.
-      await runGit(gitBin, ['worktree', 'add', '-b', branch, dir, requested], root)
-
-      if (fetched) {
-        await gitOk(gitBin, ['remote', 'set-branches', '--add', remote, branch], root)
-        await gitOk(gitBin, ['branch', `--set-upstream-to=${requested}`, branch], root)
-      }
+    // The remote-tracking ref is stale if the user did not fetch recently. This
+    // fetch is best effort: after a failure, the last known ref is still there
+    // to branch from.
+    try {
+      await runGit(gitBin, ['fetch', remote, branch], root)
+    } catch {
+      // The user is offline, or the branch is gone from the remote. Use the ref
+      // that the repo already has.
     }
+
+    await runGit(gitBin, ['worktree', 'add', '--track', '-b', branch, dir, requested], root)
 
     return { path: dir, branch, repoRoot: root }
   }
@@ -343,12 +318,12 @@ async function addWorktree(repoPath, options, gitBin) {
     if (base.startsWith('origin/')) {
       const remoteBranch = base.slice('origin/'.length)
 
-      // `base` comes straight from IPC, and inside a refspec a glob such as
-      // "origin/*" would fetch every branch: only fetch valid branch names.
-      // The fetch is best effort; git uses the local ref or raises a clear
-      // error below if it is entirely missing.
-      if (await gitOk(gitBin, ['check-ref-format', '--branch', remoteBranch], root)) {
-        await fetchTrackingRef(gitBin, root, 'origin', remoteBranch)
+      try {
+        await runGit(gitBin, ['fetch', 'origin', remoteBranch], root)
+      } catch {
+        // The fetch isn't mandatory, but it would be nice to do if possible.
+        // If it's not possible, just use the local ref of the remote branch.
+        // If it doesn't exist locally, we'll get an error
       }
 
       // When branching off a remote-tracking ref, git auto-sets up tracking
@@ -411,20 +386,10 @@ async function listBranches(repoPath, gitBin) {
   }
 
   try {
-    // Both children own cwd handles: a failed probe must still wait for its
-    // sibling before the caller may remove or switch the repository directory.
-    const probes = await Promise.allSettled([
+    const [localOut, remoteOut] = await Promise.all([
       runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/heads'], resolved),
       runGit(gitBin, ['for-each-ref', '--format=%(refname:short)', '--sort=-committerdate', 'refs/remotes'], resolved)
     ])
-
-    const [local, remote] = probes
-
-    if (local.status === 'rejected' || remote.status === 'rejected') {
-      return []
-    }
-
-    const [localOut, remoteOut] = [local.value, remote.value]
 
     const trees = await listWorktrees(resolved, gitBin)
     const pathByBranch = new Map(trees.filter(tree => tree.branch).map(tree => [tree.branch, tree.path]))
