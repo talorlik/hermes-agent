@@ -6,11 +6,14 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
+import re
+import shutil
 from contextlib import suppress
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger("hermes_cli.update_cmd")  # log-record parity with the origin module
@@ -28,6 +31,21 @@ def _git_ok(git_cmd, args, cwd, **kw) -> bool:
     return _git_stdout(git_cmd, args, cwd, **kw) is not None
 
 
+def _git_run(git_cmd, args, cwd=None, *, check=False):
+    """Run ``git_cmd + args`` and return the CompletedProcess.
+
+    The updater's git runner: capture all output and decode as UTF-8 regardless of the
+    Windows ANSI code page (#52649). ``check=True`` raises on non-zero exit.
+    """
+    return subprocess.run(
+        git_cmd + list(args),
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+        check=check,
+    )
+
+
 def _git_stdout(git_cmd, args, cwd, **kw) -> Optional[str]:
     """Stripped stdout of a successful ``_git_run``; ``None`` on non-zero exit or any exception."""
     from hermes_cli.update_cmd import _git_run
@@ -41,7 +59,12 @@ def _git_stdout(git_cmd, args, cwd, **kw) -> Optional[str]:
 def _prune_orphan_rescue_refs(
     git_cmd, cwd, branch, keep=_ORPHAN_RESCUE_REFS_TO_KEEP, max_age_days=_ORPHAN_RESCUE_REF_MAX_AGE_DAYS
 ) -> None:
-    """Expire old orphan rescue refs (``refs/hermes-update-backups/orphan-<branch>-<ts>-<sha>``).
+    """Expire old rescue refs (``refs/hermes-update-backups/<kind>-<branch>-<ts>-<sha>``).
+
+    ``<kind>`` is ``orphan`` (no common ancestor), ``diverged`` (local commits on the target
+    branch) or ``detached`` (commits made on a detached HEAD the update moved off). All are written
+    before the update moves HEAD and all pin objects, so they expire on the same terms; each kind
+    keeps its own ``keep`` newest.
 
     Each ref pins a possibly multi-GB snapshot against ``git gc``, so a repeatedly corrupted install would
     grow ``.git`` unbounded. Keep the ``keep`` newest AND drop any older than ``max_age_days`` by the
@@ -52,22 +75,63 @@ def _prune_orphan_rescue_refs(
     those objects include a full working-tree snapshot (the autostash orphan commit), which can be multi-GB
     when the tree holds large stray files. See #87694.
     """
-    from hermes_cli.update_cmd import _git_run
+    from hermes_cli.update_cmd_git import _git_run
     with suppress(OSError):
-        prefix = f"refs/hermes-update-backups/orphan-{branch}-"
-        list_result = _git_run(git_cmd, ["for-each-ref", "--format=%(refname)", "--sort=refname", f"{prefix}*"], cwd)
-        if list_result.returncode != 0:
-            return
-        refs = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
-        stale = set(refs[:-keep] if keep > 0 else refs)
-        if max_age_days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-            for ref in refs:
-                with suppress(ValueError):
-                    if datetime.strptime(ref[len(prefix):][:15], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc) < cutoff:
-                        stale.add(ref)
+        stale: set[str] = set()
+        for kind in ("orphan", "diverged", "detached"):
+            prefix = f"refs/hermes-update-backups/{kind}-{branch}-"
+            list_result = _git_run(
+                git_cmd, ["for-each-ref", "--format=%(refname)", "--sort=refname", f"{prefix}*"], cwd)
+            if list_result.returncode != 0:
+                continue
+            refs = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
+            stale |= set(refs[:-keep] if keep > 0 else refs)
+            if max_age_days > 0:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+                for ref in refs:
+                    with suppress(ValueError):
+                        stamp = datetime.strptime(ref[len(prefix):][:15], "%Y%m%d-%H%M%S")
+                        if stamp.replace(tzinfo=timezone.utc) < cutoff:
+                            stale.add(ref)
         for ref in sorted(stale):
             _git_run(git_cmd, ["update-ref", "-d", ref], cwd)
+
+
+def _park_detached_head(git_cmd, cwd, branch) -> None:
+    """Keep commits made on a detached HEAD reachable before the update moves HEAD off it.
+
+    Such commits belong to no branch: once HEAD moves, only the expiring reflog still reaches them,
+    and nothing in the output would name them. When HEAD is detached at a commit no ref contains
+    (the autostash's ``refs/stash`` does not count: it is dropped after the update), write
+    ``refs/hermes-update-backups/detached-<branch>-<ts>-<sha12>`` (the divergence rescue refs'
+    scheme and expiry) and name it. When that write fails, refuse (``sys.exit(1)``) rather than
+    orphan the work. Attached HEADs and already-reachable commits are left alone.
+    """
+    from hermes_cli.update_cmd import _git_run
+    if _git_run(git_cmd, ["symbolic-ref", "-q", "HEAD"], cwd).returncode == 0:
+        return  # on a branch
+    head = _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd)
+    sha = (head.stdout or "").strip()
+    if head.returncode != 0 or not sha:
+        return
+    contains = _git_run(git_cmd, ["for-each-ref", "--contains", sha, "--format=%(refname)"], cwd)
+    holders = [r for r in (contains.stdout or "").split() if r != "refs/stash"]
+    if contains.returncode == 0 and holders:
+        return  # already reachable from a branch, tag, remote or backup ref
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    rescue_ref = f"refs/hermes-update-backups/detached-{branch}-{stamp}-{sha[:12]}"
+    if _git_run(git_cmd, ["update-ref", rescue_ref, sha], cwd).returncode != 0:
+        print(f"✗ HEAD is detached at {sha[:12]}, which no branch or tag contains, and backing it up "
+              f"to {rescue_ref} failed.")
+        print(f"  Update stopped so those commits are not orphaned. Keep them with: "
+              f"git -C {cwd} branch <name> {sha[:12]}")
+        sys.exit(1)
+    count = (_git_run(git_cmd, ["rev-list", "--count", sha, "--not", "--branches", "--tags", "--remotes"],
+                      cwd).stdout or "").strip()
+    print(f"  ⚠ {count or 'Some'} commit(s) made on the detached HEAD are on no branch — backed up to "
+          f"{rescue_ref} before moving HEAD. This backup expires after {_ORPHAN_RESCUE_REF_MAX_AGE_DAYS} days.")
+    print(f"    List them with: git log {rescue_ref} --not --branches --tags --remotes")
+    _prune_orphan_rescue_refs(git_cmd, cwd, branch)
 
 
 def _branch_head_label(git_cmd=None, cwd=None) -> str | None:
@@ -107,7 +171,7 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
     - (False, "disabled"|"dirty"|"unverifiable") — caller must NOT touch the branch. Dirty is the
       genuinely unsafe case: uncommitted work riding an autostash across branches.
     A config read failure must not disable the safety checks: fall through with the default."""
-    from hermes_cli.update_cmd import _git_run
+    from hermes_cli.update_cmd_git import _git_run
     try:
         from hermes_cli.config import load_config
         _update_cfg = (load_config() or {}).get("updates", {})
@@ -264,6 +328,476 @@ def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, i
     return True
 
 
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+
+_SAFE_RECOVERY_REF_RE = re.compile(r"^refs/tags/pre-upstream-sync-[0-9]{8}-[0-9]{6}$")
+
+_SYNC_OPERATION_MARKERS = {
+    "merge": "MERGE_HEAD",
+    "revert": "REVERT_HEAD",
+    "cherry-pick": "CHERRY_PICK_HEAD",
+    "rebase-head": "REBASE_HEAD",
+    "rebase": "rebase-merge",
+    "rebase-apply": "rebase-apply",
+    "sequencer": "sequencer",
+    "bisect": "BISECT_LOG",
+    "bisect-start": "BISECT_START",
+}
+
+@dataclass(frozen=True)
+class GitCommandObservation:
+    """Exact result of one Git boundary, including spawn failures."""
+
+    state: str
+    returncode: int | None
+    stdout: str
+    stderr: str
+    exception: str
+
+    @property
+    def detail(self) -> str:
+        fields = [f"state={self.state}", f"returncode={self.returncode!r}"]
+        if self.stdout:
+            fields.append(f"stdout={self.stdout}")
+        if self.stderr:
+            fields.append(f"stderr={self.stderr}")
+        if self.exception:
+            fields.append(f"exception={self.exception}")
+        return "; ".join(fields)
+
+@dataclass(frozen=True)
+class UpstreamSyncOutcome:
+    """Immutable evidence for one fork-upstream synchronization attempt."""
+
+    phase: str
+    status: str
+    pre_sha: str | None
+    post_sha: str | None
+    clean: bool | None
+    operation_state: str
+    recovery_ref: str | None
+    error: str
+    local_integration_completed: bool = False
+
+    @property
+    def proof_complete(self) -> bool:
+        return (
+            self.pre_sha is not None
+            and self.post_sha is not None
+            and isinstance(self.pre_sha, str)
+            and _FULL_SHA_RE.fullmatch(self.pre_sha) is not None
+            and isinstance(self.post_sha, str)
+            and _FULL_SHA_RE.fullmatch(self.post_sha) is not None
+            and self.clean is True
+            and self.operation_state == "none"
+        )
+
+    @property
+    def safe_to_continue(self) -> bool:
+        if not self.proof_complete or self.error:
+            return False
+        if self.status in {"noop", "not_checked"}:
+            return self.pre_sha == self.post_sha
+        return self.status == "updated" and self.pre_sha != self.post_sha
+
+    @property
+    def safe_to_restore(self) -> bool:
+        return (
+            self.status == "failed"
+            and self.proof_complete
+            and self.pre_sha == self.post_sha
+        )
+
+    @property
+    def changed(self) -> bool:
+        return self.proof_complete and self.pre_sha != self.post_sha
+
+def _capture_checkout_proof(
+    git_cmd: list[str], cwd: Path
+) -> tuple[bool | None, str, str]:
+    """Prove a clean index/worktree and the absence of an active Git operation."""
+    from hermes_cli.update_cmd import _git_run
+
+    try:
+        status = _git_run(
+            git_cmd, ["status", "--porcelain=v1", "--untracked-files=all"], cwd
+        )
+        if status.returncode != 0:
+            return None, "unknown", (status.stderr or "git status failed").strip()
+        git_dir_result = _git_run(git_cmd, ["rev-parse", "--absolute-git-dir"], cwd)
+        git_dir_text = git_dir_result.stdout.strip()
+        if git_dir_result.returncode != 0 or not git_dir_text:
+            return (
+                not bool(status.stdout.strip()),
+                "unknown",
+                (
+                    git_dir_result.stderr
+                    or "could not prove the absolute Git operation directory"
+                ).strip(),
+            )
+        git_dir = Path(git_dir_text)
+        active = [
+            name
+            for name, marker in _SYNC_OPERATION_MARKERS.items()
+            if (git_dir / marker).exists()
+        ]
+        return (
+            not bool(status.stdout.strip()),
+            ",".join(active) if active else "none",
+            "",
+        )
+    except Exception as exc:
+        return None, "unknown", str(exc)
+
+def _safe_recovery_ref(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if _FULL_SHA_RE.fullmatch(value) or _SAFE_RECOVERY_REF_RE.fullmatch(value):
+        return value
+    return None
+
+def _finish_sync_outcome(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    phase: str,
+    status: str,
+    pre_sha: str | None,
+    recovery_ref: str | None,
+    error: str = "",
+    local_integration_completed: bool = False,
+) -> UpstreamSyncOutcome:
+    """Capture post-state and make incomplete or contradictory evidence fail closed."""
+    from hermes_cli.update_cmd import _capture_checkout_proof, _capture_head_sha
+
+    post_sha = _capture_head_sha(git_cmd, cwd)
+    clean, operation_state, proof_error = _capture_checkout_proof(git_cmd, cwd)
+    evidence_errors = [
+        message
+        for message in (error, proof_error)
+        if isinstance(message, str) and message
+    ]
+    if proof_error and not isinstance(proof_error, str):
+        evidence_errors.append("invalid checkout-proof error detail")
+    if not isinstance(pre_sha, str) or _FULL_SHA_RE.fullmatch(pre_sha) is None:
+        evidence_errors.append("missing or invalid pre-sync HEAD SHA")
+    if not isinstance(post_sha, str) or _FULL_SHA_RE.fullmatch(post_sha) is None:
+        evidence_errors.append("missing or invalid post-sync HEAD SHA")
+    if clean is not True:
+        evidence_errors.append(
+            "worktree or index is dirty or could not be proven clean"
+        )
+    if operation_state != "none":
+        evidence_errors.append(f"Git operation state is {operation_state}")
+    if status in {"noop", "not_checked"} and pre_sha != post_sha:
+        evidence_errors.append("a no-op synchronization changed HEAD")
+    if status == "updated" and pre_sha == post_sha:
+        evidence_errors.append("an updated synchronization did not change HEAD")
+    if evidence_errors and status not in {
+        "failed",
+        "rollback_failed",
+        "outcome_unknown",
+    }:
+        status = "failed"
+    return UpstreamSyncOutcome(
+        phase=phase,
+        status=status,
+        pre_sha=pre_sha,
+        post_sha=post_sha,
+        clean=clean,
+        operation_state=operation_state,
+        recovery_ref=_safe_recovery_ref(recovery_ref),
+        error="; ".join(dict.fromkeys(evidence_errors)),
+        local_integration_completed=local_integration_completed,
+    )
+
+def _observe_git_command(
+    git_cmd: list[str],
+    args: list[str],
+    cwd: Path,
+    *,
+    absent_returncodes: set[int] | None = None,
+    network: bool = False,
+) -> GitCommandObservation:
+    """Capture a Git command without collapsing non-zero and spawn failure evidence."""
+    from hermes_cli.update_cmd import _git_run
+
+    try:
+        result = _git_run(git_cmd, args, cwd, network=network)
+    except Exception as exc:
+        return GitCommandObservation(
+            state="failed",
+            returncode=None,
+            stdout="",
+            stderr="",
+            exception=f"{type(exc).__name__}: {exc}",
+        )
+    returncode = int(result.returncode)
+    state = (
+        "succeeded"
+        if returncode == 0
+        else "absent"
+        if returncode in (absent_returncodes or set())
+        else "failed"
+    )
+    return GitCommandObservation(
+        state=state,
+        returncode=returncode,
+        stdout=str(result.stdout or ""),
+        stderr=str(result.stderr or ""),
+        exception="",
+    )
+
+def _observe_upstream_remote(git_cmd: list[str], cwd: Path) -> GitCommandObservation:
+    """Observe upstream presence: success, confirmed absence, or probe failure."""
+    return _observe_git_command(
+        git_cmd, ["remote", "get-url", "upstream"], cwd, absent_returncodes={2}
+    )
+
+def _add_upstream_remote_observed(
+    git_cmd: list[str], cwd: Path
+) -> GitCommandObservation:
+    return _observe_git_command(
+        git_cmd, ["remote", "add", "upstream", OFFICIAL_REPO_URL], cwd
+    )
+
+def _push_fork_with_upstream_observed(
+    git_cmd: list[str], cwd: Path
+) -> GitCommandObservation:
+    return _observe_git_command(
+        git_cmd,
+        ["push", "origin", "main"],
+        cwd,
+        network=True,
+    )
+
+def _verify_origin_main_postcondition(
+    git_cmd: list[str], cwd: Path, expected_sha: str | None
+) -> GitCommandObservation:
+    """Prove that the pushed ``origin/main`` resolves to the integrated local HEAD."""
+    if (
+        not isinstance(expected_sha, str)
+        or _FULL_SHA_RE.fullmatch(expected_sha) is None
+    ):
+        return GitCommandObservation(
+            state="failed",
+            returncode=None,
+            stdout="",
+            stderr="",
+            exception="missing or invalid integrated local HEAD SHA",
+        )
+    observation = _observe_git_command(
+        git_cmd,
+        ["ls-remote", "--exit-code", "origin", "refs/heads/main"],
+        cwd,
+        network=True,
+    )
+    if observation.state != "succeeded":
+        return observation
+    fields = observation.stdout.strip().split()
+    actual_sha = fields[0] if len(fields) == 2 else None
+    actual_ref = fields[1] if len(fields) == 2 else None
+    if (
+        actual_sha is None
+        or _FULL_SHA_RE.fullmatch(actual_sha) is None
+        or actual_ref != "refs/heads/main"
+        or actual_sha.lower() != expected_sha.lower()
+    ):
+        return GitCommandObservation(
+            state="failed",
+            returncode=observation.returncode,
+            stdout=observation.stdout,
+            stderr=observation.stderr,
+            exception=(
+                "origin/main postcondition mismatch: "
+                f"expected={expected_sha}; observed={actual_sha or '<unresolved>'}"
+            ),
+        )
+    return observation
+
+_FORK_SYNC_TEST_PATHS = (
+    "tests/hermes_cli/test_fork_sync_strategy.py",
+    "tests/hermes_cli/test_update_post_pull_syntax_guard.py",
+)
+
+def _subprocess_detail(result: subprocess.CompletedProcess[str]) -> str:
+    """Return up to eight lines from each output stream, preserving both."""
+    sections: list[str] = []
+    for label, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+        lines = stream.strip().splitlines()
+        if lines:
+            sections.append(f"{label}:\n" + "\n".join(lines[-8:]))
+    return "\n".join(sections)
+
+def _run_fork_sync_tests(cwd: Path) -> tuple[bool, str]:
+    """Bootstrap and run credential-free updater tests before a fork push."""
+    python = sys.executable
+    try:
+        probe = subprocess.run(
+            [python, "-c", "import pytest, pytest_asyncio"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        if probe.returncode != 0:
+            from hermes_cli.managed_uv import ensure_uv
+
+            uv_bin = ensure_uv()
+            if not uv_bin:
+                return (
+                    False,
+                    "uv is unavailable; cannot install updater test dependencies",
+                )
+            install = subprocess.run(
+                [
+                    str(uv_bin),
+                    "pip",
+                    "install",
+                    "--python",
+                    python,
+                    "pytest==9.1.1",
+                    "pytest-asyncio==1.3.0",
+                ],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5 * 60,
+            )
+            if install.returncode != 0:
+                return False, _subprocess_detail(install)
+
+        result = subprocess.run(
+            [python, "-m", "pytest", *_FORK_SYNC_TEST_PATHS, "-q"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15 * 60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, ""
+    return False, _subprocess_detail(result)
+
+def _rollback_fork_sync_candidate(
+    git_cmd: list[str], cwd: Path, rollback_ref: str
+) -> bool:
+    """Reset a failed upstream candidate and report whether rollback succeeded."""
+    from hermes_cli.update_cmd import _no_prompt_git_kwargs
+
+    try:
+        rollback_result = subprocess.run(
+            git_cmd + ["reset", "--hard", rollback_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_no_prompt_git_kwargs(),
+        )
+    except OSError as exc:
+        print(f"  ✗ Rollback could not start: {exc}")
+        return False
+    if rollback_result.returncode == 0:
+        print(
+            f"  ✓ Rolled back to {rollback_ref[:10]} - nothing was pushed to your fork."
+        )
+        return True
+    print("  ✗ Rollback failed. Recover manually with:")
+    print(f"    cd {cwd} && git reset --hard {rollback_ref}")
+    if rollback_result.stderr.strip():
+        print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+    return False
+
+def _validate_fork_sync_candidate(
+    git_cmd: list[str],
+    cwd: Path,
+    rollback_ref: str,
+    *,
+    rollback_on_failure: bool = True,
+) -> bool:
+    """Validate merged upstream code and roll it back on any owned failure."""
+    from hermes_cli.update_cmd import _validate_critical_files_syntax
+
+    def fail() -> bool:
+        if rollback_on_failure:
+            _rollback_fork_sync_candidate(git_cmd, cwd, rollback_ref)
+        return False
+
+    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
+    if not syntax_ok:
+        print("\n  ✗ Merged code has a syntax error in a critical file:")
+        print(f"    {failing_path}")
+        if syntax_error:
+            for line in str(syntax_error).splitlines()[:6]:
+                print(f"      {line}")
+        return fail()
+
+    print("→ Running targeted updater tests before syncing the fork...")
+    tests_ok, test_detail = _run_fork_sync_tests(cwd)
+    if not tests_ok:
+        print("  ✗ Fork sync targeted updater tests failed:")
+        if test_detail:
+            for line in test_detail.splitlines():
+                print(f"    {line}")
+        return fail()
+    print("  ✓ Targeted updater tests passed")
+    return True
+
+def _offer_upstream_remote_observed(
+    git_cmd: list[str], cwd: Path, *, assume_yes: bool, input_fn
+) -> tuple[str, str]:
+    """Offer setup and retain exact add-command evidence on failure."""
+    from hermes_cli.update_cmd import (
+        _add_upstream_remote_observed,
+        _mark_skip_upstream_prompt,
+    )
+
+    print(
+        "\nℹ Your fork is not tracking the official Hermes repository.\n"
+        "  This means you may miss updates from NousResearch/hermes-agent.\n"
+    )
+    if assume_yes or (
+        input_fn is None and not (sys.stdin.isatty() and sys.stdout.isatty())
+    ):
+        print(
+            "  Skipping upstream setup (non-interactive run).\n"
+            f"  Add it later with: {_UPSTREAM_ADD_CMD}"
+        )
+        return "declined", ""
+    if input_fn is not None:
+        response = (
+            input_fn("Add official repo as 'upstream' remote? [y/N]", "n")
+            .strip()
+            .lower()
+        )
+    else:
+        try:
+            response = (
+                input("Add official repo as 'upstream' remote? [Y/n]: ").strip().lower()
+            )
+        except (EOFError, KeyboardInterrupt, UnicodeDecodeError):
+            print()
+            response = "n"
+    if response not in {"", "y", "yes"}:
+        print(f"  Skipped. Run '{_UPSTREAM_ADD_CMD}' to add later.")
+        _mark_skip_upstream_prompt()
+        return "declined", ""
+    print("→ Adding upstream remote...")
+    result = _add_upstream_remote_observed(git_cmd, cwd)
+    if result.state != "succeeded":
+        print("  ✗ Failed to add upstream remote. Upstream sync failed.")
+        return "failed", result.detail
+    print("  ✓ Added upstream: https://github.com/NousResearch/hermes-agent.git")
+    return "available", ""
+
 def _fork_sync_strategy() -> str:
     """Return the validated fork synchronization policy."""
     try:
@@ -278,97 +812,321 @@ def _fork_sync_strategy() -> str:
         logger.debug("Could not read updates.fork_sync_strategy: %s", exc)
     return "ff_only"
 
+def _sync_with_upstream_observed(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    phase: str,
+    assume_yes: bool = False,
+    input_fn=None,
+    _upstream_available: bool = False,
+) -> UpstreamSyncOutcome:
+    """Run the complete mutating sync behind a BaseException recovery boundary."""
+    from hermes_cli.update_cmd import _capture_head_sha
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: bool = False, input_fn=None) -> bool:
-    """Offer to add ``upstream``, compare origin/main vs upstream/main, ff-pull when strictly behind, then push origin.
+    pre_sha: str | None = None
+    try:
+        pre_sha = _capture_head_sha(git_cmd, cwd)
+        return _sync_with_upstream_observed_impl(
+            git_cmd,
+            cwd,
+            phase=phase,
+            pre_sha=pre_sha,
+            assume_yes=assume_yes,
+            input_fn=input_fn,
+            _upstream_available=_upstream_available,
+        )
+    except BaseException as exc:
+        return _finish_sync_outcome(
+            git_cmd,
+            cwd,
+            phase=phase,
+            status="outcome_unknown",
+            pre_sha=pre_sha,
+            recovery_ref=pre_sha,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
-    Returns True only when origin/main was actually verified against upstream/main; False when the check never
-    happened, so the caller never reports "up to date" on an origin-only compare. Fetches only upstream/main:
-    a bare fetch drags in thousands of auto-generated branches.
+def _sync_with_upstream_observed_impl(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    phase: str,
+    pre_sha: str | None,
+    assume_yes: bool = False,
+    input_fn=None,
+    _upstream_available: bool = False,
+) -> UpstreamSyncOutcome:
+    """Attempt one fork sync and return complete, immutable checkout evidence."""
+    from hermes_cli.update_cmd import (
+        _capture_checkout_proof,
+        _count_commits_between,
+        _no_prompt_git_kwargs,
+        _observe_upstream_remote,
+        _offer_upstream_remote_observed,
+        _push_fork_with_upstream_observed,
+        _should_skip_upstream_prompt,
+    )
 
-    See #97052.
-    """
-    from hermes_cli.update_cmd import _count_commits_between, _has_upstream_remote, _no_prompt_git_kwargs, _should_skip_upstream_prompt
-    if not _has_upstream_remote(git_cmd, cwd) and (
-        _should_skip_upstream_prompt() or not _offer_upstream_remote(git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn)
-    ):
-        return False
+    clean_before, operation_before, proof_error = _capture_checkout_proof(git_cmd, cwd)
+
+    def finish(
+        status: str,
+        error: str = "",
+        recovery_ref: str | None = None,
+        *,
+        local_integration_completed: bool = False,
+    ) -> UpstreamSyncOutcome:
+        detail = "; ".join(
+            message
+            for message in (error, proof_error)
+            if isinstance(message, str) and message
+        )
+        if proof_error and not isinstance(proof_error, str):
+            detail = "; ".join(
+                message
+                for message in (detail, "invalid checkout-proof error detail")
+                if message
+            )
+        return _finish_sync_outcome(
+            git_cmd,
+            cwd,
+            phase=phase,
+            status=status,
+            pre_sha=pre_sha,
+            recovery_ref=recovery_ref or pre_sha,
+            error=detail,
+            local_integration_completed=local_integration_completed,
+        )
+
+    if not isinstance(pre_sha, str) or _FULL_SHA_RE.fullmatch(pre_sha) is None:
+        print("  ✗ Could not capture the pre-sync HEAD. Upstream sync failed.")
+        return finish("failed", "missing or invalid pre-sync HEAD SHA")
+    if clean_before is not True or operation_before != "none":
+        return finish("failed", "pre-sync checkout is not clean and operation-free")
+    if not _upstream_available:
+        remote = _observe_upstream_remote(git_cmd, cwd)
+        if remote.state == "failed":
+            return finish("failed", f"upstream remote probe failed: {remote.detail}")
+        if remote.state == "absent":
+            if _should_skip_upstream_prompt():
+                return finish("not_checked")
+            remote_outcome, remote_error = _offer_upstream_remote_observed(
+                git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn
+            )
+            if remote_outcome == "failed":
+                return finish(
+                    "failed", f"upstream remote creation failed: {remote_error}"
+                )
+            if remote_outcome != "available":
+                return finish("not_checked")
+
     print("\n→ Fetching upstream...")
     try:
-        subprocess.run(git_cmd + ["fetch", "upstream", "main", "--quiet"], cwd=cwd, capture_output=True, check=True, **_no_prompt_git_kwargs())
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return False
+        subprocess.run(
+            git_cmd + ["fetch", "upstream", "main", "--quiet"],
+            cwd=cwd,
+            capture_output=True,
+            check=True,
+            **_no_prompt_git_kwargs(),
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print("  ✗ Failed to fetch upstream. Upstream sync failed.")
+        return finish("failed", f"upstream fetch failed: {exc}")
+
     origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
-    upstream_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "upstream/main")
+    upstream_ahead = _count_commits_between(
+        git_cmd, cwd, "origin/main", "upstream/main"
+    )
     if origin_ahead < 0 or upstream_ahead < 0:
-        print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return False
+        print("  ✗ Could not compare branches. Upstream sync failed.")
+        return finish("failed", "could not compare origin/main with upstream/main")
+
+    strategy = _fork_sync_strategy()
+    if origin_ahead > 0 and strategy != "merge":
+        print(
+            f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
+            "  Skipping upstream sync to preserve your changes.\n"
+            "  If you want to merge upstream changes, run:\n    git pull upstream main\n"
+            "  (set updates.fork_sync_strategy: merge in config.yaml to do this automatically)"
+        )
+        return finish("noop")
+    if upstream_ahead == 0:
+        print("  ✓ Fork is up to date with upstream")
+        return finish("noop")
+
+    sync_tag = f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    recovery_ref = f"refs/tags/{sync_tag}"
+    try:
+        tag_result = subprocess.run(
+            git_cmd + ["tag", sync_tag],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_no_prompt_git_kwargs(),
+        )
+    except OSError as exc:
+        print(
+            "  ✗ Could not create the pre-upstream-sync recovery tag. Upstream sync failed."
+        )
+        return finish("failed", f"recovery tag creation failed: {exc}")
+    if tag_result.returncode != 0:
+        detail = (tag_result.stderr or tag_result.stdout or "unknown Git error").strip()
+        print(
+            "  ✗ Could not create the pre-upstream-sync recovery tag. Upstream sync failed."
+        )
+        print(f"  Git reported: {detail}")
+        return finish("failed", f"recovery tag creation failed: {detail}")
+
     if origin_ahead > 0:
-        if _fork_sync_strategy() != "merge":
-            print(
-                f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
-                "  Skipping upstream sync to preserve your changes.\n"
-                "  If you want to merge upstream changes, run:\n    git pull upstream main\n"
-                "  (set updates.fork_sync_strategy: merge in config.yaml to do this automatically)"
-            )
-            return True
-        if upstream_ahead == 0:
-            print("  ✓ Fork is up to date with upstream")
-            return True
         print(
             f"\n→ Fork has {origin_ahead} commit(s) of its own and is "
             f"{upstream_ahead} commit(s) behind upstream"
         )
         print("→ Merging upstream/main (updates.fork_sync_strategy: merge)...")
-        subprocess.run(
-            git_cmd + ["tag", f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"],
-            cwd=cwd, capture_output=True, check=False, **_no_prompt_git_kwargs(),
-        )
-        merge_result = subprocess.run(
-            git_cmd + ["merge", "--no-edit", "upstream/main"],
-            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            **_no_prompt_git_kwargs(),
-        )
-        if merge_result.returncode != 0:
-            subprocess.run(
-                git_cmd + ["merge", "--abort"],
-                cwd=cwd, capture_output=True, check=False, **_no_prompt_git_kwargs(),
+        try:
+            merge_result = subprocess.run(
+                git_cmd + ["merge", "--no-edit", "upstream/main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                **_no_prompt_git_kwargs(),
             )
+        except OSError as exc:
+            rollback_ok = _rollback_fork_sync_candidate(git_cmd, cwd, pre_sha)
+            status = "failed" if rollback_ok else "rollback_failed"
+            error = f"upstream merge failed: {exc}"
+            if not rollback_ok:
+                error += "; rollback reset failed"
+            return finish(status, error, recovery_ref)
+        if merge_result.returncode != 0:
+            with suppress(OSError):
+                subprocess.run(
+                    git_cmd + ["merge", "--abort"],
+                    cwd=cwd,
+                    capture_output=True,
+                    check=False,
+                    **_no_prompt_git_kwargs(),
+                )
+            rollback_ok = _rollback_fork_sync_candidate(git_cmd, cwd, pre_sha)
             print(
                 "  ✗ Could not merge upstream/main (conflict or dirty tree) - "
                 "sync stopped, nothing was changed."
             )
             print(f"  Resolve manually: cd {cwd} && git merge upstream/main")
-            print("  Then push your fork: git push origin main")
-            return False
-        print("  ✓ Merged upstream/main (your commits preserved)\n→ Syncing fork...")
-        if _sync_fork_with_upstream(git_cmd, cwd):
-            print("  ✓ Fork synced with upstream")
-        else:
-            print(
-                "  ℹ Merged upstream locally but couldn't push to fork (no write access?)\n"
-                "    Your local repo is updated, but your fork on GitHub may be behind."
-            )
-        return True
-    if upstream_ahead == 0:
-        print("  ✓ Fork is up to date with upstream")
-        return True
-    print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
-    try:
-        subprocess.run(git_cmd + ["pull", "--ff-only", "upstream", "main"], cwd=cwd, check=True, **_no_prompt_git_kwargs())
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
-        return False
-    print("  ✓ Updated from upstream\n→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
-        print("  ✓ Fork synced with upstream")
+            if not rollback_ok:
+                return finish(
+                    "rollback_failed",
+                    "upstream merge failed; rollback reset failed",
+                    recovery_ref,
+                )
+            return finish("failed", "upstream merge failed", recovery_ref)
     else:
         print(
-            "  ℹ Got updates from upstream but couldn't push to fork (no write access?)\n"
+            f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream..."
+        )
+        try:
+            subprocess.run(
+                git_cmd + ["pull", "--ff-only", "upstream", "main"],
+                cwd=cwd,
+                check=True,
+                **_no_prompt_git_kwargs(),
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print("  ✗ Failed to pull from upstream. Upstream sync failed.")
+            return finish("failed", f"upstream pull failed: {exc}", recovery_ref)
+
+    validation_error = ""
+    try:
+        candidate_valid = _validate_fork_sync_candidate(
+            git_cmd, cwd, pre_sha, rollback_on_failure=False
+        )
+    except Exception as exc:
+        candidate_valid = False
+        validation_error = f"candidate validation raised: {exc}"
+    if not candidate_valid:
+        rollback_ok = _rollback_fork_sync_candidate(git_cmd, cwd, pre_sha)
+        print("  Try the sync again once the candidate passes validation.")
+        error = validation_error or "upstream candidate validation failed"
+        if not rollback_ok:
+            return finish(
+                "rollback_failed", f"{error}; rollback reset failed", recovery_ref
+            )
+        return finish("failed", error, recovery_ref)
+
+    action = (
+        "Merged upstream/main (your commits preserved)"
+        if origin_ahead > 0
+        else "Updated from upstream"
+    )
+    print(f"  ✓ {action}\n→ Syncing fork...")
+    push_error = ""
+    push = _push_fork_with_upstream_observed(git_cmd, cwd)
+    if push.state == "succeeded":
+        print("  ✓ Fork synced with upstream")
+    else:
+        push_error = (
+            f"fork push failed; local upstream update is retained; {push.detail}"
+        )
+        print(
+            "  ℹ Updated locally but couldn't push to fork (no write access?)\n"
             "    Your local repo is updated, but your fork on GitHub may be behind."
         )
-    return True
+    outcome = finish(
+        "updated",
+        push_error,
+        recovery_ref,
+        local_integration_completed=True,
+    )
+    if push.state != "succeeded" or not outcome.safe_to_continue:
+        return outcome
+    remote_proof = _verify_origin_main_postcondition(git_cmd, cwd, outcome.post_sha)
+    if remote_proof.state == "succeeded":
+        return outcome
+    return UpstreamSyncOutcome(
+        phase=outcome.phase,
+        status="failed",
+        pre_sha=outcome.pre_sha,
+        post_sha=outcome.post_sha,
+        clean=outcome.clean,
+        operation_state=outcome.operation_state,
+        recovery_ref=outcome.recovery_ref,
+        error=f"origin/main postcondition was not proven; {remote_proof.detail}",
+        local_integration_completed=True,
+    )
+
+def _sync_with_upstream_if_needed(
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    assume_yes: bool = False,
+    input_fn=None,
+) -> bool:
+    """Preserve the legacy checked/not-checked contract for external callers."""
+    from hermes_cli.update_cmd import _has_upstream_remote, _should_skip_upstream_prompt
+
+    upstream_available = _has_upstream_remote(git_cmd, cwd)
+    if not upstream_available:
+        if _should_skip_upstream_prompt():
+            return False
+        upstream_available = _offer_upstream_remote(
+            git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn
+        )
+        if not upstream_available:
+            return False
+    outcome = _sync_with_upstream_observed(
+        git_cmd,
+        cwd,
+        phase="legacy",
+        assume_yes=assume_yes,
+        input_fn=input_fn,
+        _upstream_available=True,
+    )
+    return outcome.status == "noop" or outcome.local_integration_completed
 
 
 def _has_http_code(stderr: str, *codes: str) -> bool:
@@ -392,6 +1150,14 @@ _FETCH_FAILURE_RULES = (
      " `git remote -v` points at a public repo."),
     (lambda s: "Authentication failed" in s,
      "✗ Authentication failed — check your git credentials or SSH key."),
+    # SSH auth failures never say "Authentication failed" — OpenSSH prints its own
+    # "Permission denied (publickey)"/"Host key verification failed" and git wraps
+    # it as "Could not read from remote repository", which otherwise fell through
+    # to the generic message below and left an SSH-remote user with no idea their
+    # key (or lack of one) was the cause (#82169).
+    (lambda s: "Permission denied (publickey)" in s or "Host key verification failed" in s,
+     "✗ SSH authentication failed — check your SSH key is added to GitHub, or switch"
+     " `origin` to HTTPS: `git remote set-url origin https://github.com/NousResearch/hermes-agent.git`."),
 )
 
 
@@ -438,7 +1204,7 @@ def _portable_git_candidates() -> list:
     profile-scoped HERMES_HOME (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must look
     there (monerostar review, #87876).
     """
-    from hermes_cli.update_cmd import get_default_hermes_root, get_hermes_home
+    from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
     with suppress(Exception):
         candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
@@ -455,8 +1221,9 @@ def _locate_real_git() -> Optional[Path]:
     invoked directly (#87876).
     """
     candidates = [
-        Path(r"C:\Program Files\Git\mingw64\libexec\git-core\git.exe"),
-        Path(r"C:\Program Files (x86)\Git\mingw64\libexec\git-core\git.exe"),
+        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
+        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        for arch in ("clangarm64", "mingw64", "mingw32")
     ] + _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
@@ -483,7 +1250,7 @@ def _npm_lockfile_owners(repo_root: Path) -> set[Path]:
     owners = {Path(".")}
     try:
         import json
-        package = json.loads((repo_root / "package.json").read_text(encoding="utf-8"))
+        package = json.loads((repo_root / "package.json").read_text(encoding="utf-8-sig"))
         workspaces = package.get("workspaces", [])
         if isinstance(workspaces, dict):
             workspaces = workspaces.get("packages", [])
@@ -507,7 +1274,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
     lock that is the root or ANY workspace ``package.json`` (reverting it under a dirty ``apps/desktop``
     manifest desyncs spec and lock and every later ``npm ci`` fails, #112378); a nested lock is kept only
     with its sibling manifest. Best-effort."""
-    from hermes_cli.update_cmd import _git_run
+    from hermes_cli.update_cmd_git import _git_run
     with suppress(Exception):
         diff = _git_run(git_cmd, ["diff", "--name-only"], repo_root)
         if diff.returncode != 0:
@@ -545,7 +1312,7 @@ def _normalize_managed_eol(git_cmd, repo_root):
     reuses its build-pinned ``install.ps1`` forever — so ``hermes update``, which ships with the checkout
     itself, is the only path left that can fix them. See #67730.
     """
-    from hermes_cli.update_cmd import _git_run
+    from hermes_cli.update_cmd_git import _git_run
     # -c, not config: evaluate the tree as it WOULD look pinned, persisting nothing.
     probe = git_cmd + ["-c", "core.autocrlf=false"]
 

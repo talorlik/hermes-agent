@@ -1047,6 +1047,7 @@ from hermes_cli.main_desktop import (  # frozen updater surface: update_cmd*.py 
     _desktop_macos_relaunchable_fixup,
     _desktop_packaged_executable,
     _install_rebuilt_desktop_app,
+    _installed_desktop_apps,
 )
 from hermes_cli.main_web_build import (
     _sweep_stale_bytecode_if_checkout_changed,
@@ -2359,6 +2360,13 @@ def select_provider_and_model(args=None):
         _clear_stale_openai_base_url()
 
 
+
+def _detect_venv_python_processes(*, exclude_pids: set[int] | None = None) -> list[tuple[int, str, str]]:
+    # Shim so an updater already running across the checkout swap still resolves
+    # the old name. Do not scan or kill. Current checks use update_cmd_windows.
+    return []
+
+
 # Frozen updater surface (PEP 562 ``__getattr__`` below): the frozen
 # ``hermes_cli/update_cmd*.py`` files resolve these names via ``_m().<name>``
 # on hermes_cli.main; importing update_cmd eagerly would cost every ``hermes``
@@ -2367,25 +2375,32 @@ def select_provider_and_model(args=None):
 _FROZEN_UPDATER_SURFACE: dict[str, tuple[str, ...]] = {
     "hermes_cli.update_cmd": (
         "_abort_dependency_sync_if_self_locked", "_assess_parked_branch_switch",
-        "_capture_active_lazy_features", "_capture_active_tool_dependencies",
+        "_capture_active_tool_dependencies",
         "_cold_start_windows_gateway_after_update", "_defer_update_for_self_lock",
         "_dependency_sync_would_rewrite", "_detect_self_loaded_native_modules",
-        "_detect_venv_python_processes", "_discard_stashed_changes",
+        "_discard_stashed_changes",
         "_filter_non_gateway_concurrent_instances", "_fleet_probe_expected_runtimes",
-        "_get_origin_url", "_handoff_reapable_backend_pids", "_ledger_manual_serve_holders",
-        "_ledger_reapable_backend_pids", "_leftover_pausable_gateway_pids", "_npm_lockfile_changed",
-        "_orphaned_desktop_backend_pids", "_park_stashed_changes",
+        "_get_origin_url", "_park_stashed_changes",
         "_pause_windows_gateways_for_update", "_print_parked_branch_kept_notice",
         "_print_parked_branch_skip_warning", "_reapply_plugin_python_dependencies",
-        "_refresh_active_lazy_features", "_refresh_active_memory_provider_dependencies",
         "_refresh_bootstrap_cache_scripts", "_refresh_windows_gateway_launchers",
-        "_relaunch_stopped_serves",
         "_restore_active_tool_dependencies", "_restore_stashed_changes",
         "_resume_windows_gateways_after_update", "_run_logged_subprocess", "_run_pre_update_backup",
-        "_stash_local_changes_if_needed", "_stop_process_trees", "_sync_with_upstream_if_needed",
+        "_stash_local_changes_if_needed", "_sync_with_upstream_if_needed",
         "_upgrade_pip_before_lazy_refresh", "_venv_launcher_ancestors",
         "_wait_for_windows_update_gateway_exit", "_warn_orphaned_update_autostashes",
         "_write_update_incomplete_marker",
+    ),
+    "hermes_cli.old_updater_deps": (
+        "_capture_active_lazy_features", "_handoff_reapable_backend_pids",
+        "_ledger_manual_serve_holders", "_ledger_reapable_backend_pids",
+        "_leftover_pausable_gateway_pids", "_npm_lockfile_changed",
+        "_orphaned_desktop_backend_pids", "_refresh_active_lazy_features",
+        "_refresh_active_memory_provider_dependencies", "_relaunch_stopped_serves",
+        "_stop_process_trees",
+    ),
+    "hermes_cli.update_cmd_maint": (
+        "_purge_stale_hermes_modules", "_reload_updated_runtime_modules",
     ),
     "hermes_cli.dashboard_procs": (
         "_detect_concurrent_hermes_instances", "_kill_stale_dashboard_processes",
@@ -2625,12 +2640,18 @@ def cmd_update(args):
         # exit code (no-op if already finalized), then let the exit proceed.
         _code = _update_exit.code if isinstance(_update_exit.code, int) else 1
         _finalize_update_receipt(_code, f"sys.exit({_code})")
+        if gateway_mode and _code:
+            from hermes_cli.update_cmd_fleet import _write_gateway_update_exit_code
+            _write_gateway_update_exit_code(False)
         _update_handoff_exit_code = (
             _update_exit.code if isinstance(_update_exit.code, int) else 0
         )
         raise
     except BaseException as _update_exc:
         _finalize_update_receipt(1, f"{type(_update_exc).__name__}: {_update_exc}")
+        if gateway_mode:
+            from hermes_cli.update_cmd_fleet import _write_gateway_update_exit_code
+            _write_gateway_update_exit_code(False)
         raise
     else:
         from hermes_cli.update_receipt import COMMAND_BOUNDARY_STOP_REASON
