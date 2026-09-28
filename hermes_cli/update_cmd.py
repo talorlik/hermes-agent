@@ -235,6 +235,30 @@ def _record_pre_update_backup_outcome(args, snapshot_id) -> None:
 
 
 
+def _map_ssl_cert_file_for_git(git_cmd) -> None:
+    """Point git's libcurl at the same CA bundle Python already trusts.
+
+    git ignores ``SSL_CERT_FILE`` (its libcurl reads only ``GIT_SSL_CAINFO`` /
+    ``http.sslCAInfo``), so on a network with a TLS-inspecting proxy whose
+    corporate root lives only in that variable the channel read succeeds and
+    the very next ``git fetch`` dies with "certificate signer not trusted".
+    Written into ``os.environ`` once so every git child the updater spawns sees
+    it: the network fetches (via ``_no_prompt_git_kwargs``) and the partial-clone
+    checkout's lazy promisor fetches (which inherit the process env).
+
+    An explicit ``GIT_SSL_CAINFO`` or a configured ``http.sslCAInfo`` wins:
+    the env var outranks the config file in git's precedence, so mapping over
+    either would silently override a deliberate choice.
+    """
+    bundle = os.environ.get("SSL_CERT_FILE")
+    if not bundle or os.environ.get("GIT_SSL_CAINFO"):
+        return
+    configured = _git_run(git_cmd, ["config", "--get", "http.sslCAInfo"])
+    if configured.returncode == 0 and configured.stdout.strip():
+        return
+    os.environ["GIT_SSL_CAINFO"] = bundle
+
+
 def _git_run(git_cmd, args, cwd=None, *, check=False, network=False):
     """Run git capturing utf-8 text (default cwd: checkout); ``network=True`` disables the
     terminal prompt so an HTTP 401 fails fast instead of hanging, and bounds the wait."""

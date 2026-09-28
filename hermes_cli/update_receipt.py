@@ -268,6 +268,15 @@ class UpdateReceipt:
     def skip(self, name: str, reason: str) -> None:
         self.data["skips"].append({"name": name, "reason": reason, "at": _utc_now_iso()})
 
+    def stage(self, name: str, outcome: str, **facts: str) -> None:
+        # Stage END marks: a stage's duration is the gap since the previous mark (or started_at).
+        self.data.setdefault("stages", []).append(
+            {"name": name, "outcome": outcome, "at": _utc_now_iso(), **facts}
+        )
+
+    def fact(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
     def gateway_restart_result(
         self, *, restarted_services: list | None = None, relaunched_profiles: list | None = None,
         externally_supervised_profiles: list | None = None, killed_pids: list | None = None,
@@ -373,6 +382,16 @@ def record_step(name: str, ok: bool, detail: str = "") -> None:
 def record_skip(name: str, reason: str) -> None:
     """Record a skipped step WITH the reason it was skipped."""
     _record("skip", f"update skip {name}", name, reason)
+
+
+def record_stage(name: str, outcome: str, **facts: str) -> None:
+    """Mark the end of a pipeline stage. No-op when no receipt is active."""
+    _record("stage", f"update stage {name}", name, outcome, **facts)
+
+
+def record_fact(key: str, value: Any) -> None:
+    """Attach one fact to the active receipt. No-op when no receipt is active."""
+    _record("fact", f"update fact {key}", key, value)
 
 
 def record_gateway_restart(**kwargs: Any) -> None:
