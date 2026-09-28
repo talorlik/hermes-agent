@@ -54,7 +54,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 `retiring` (scheduled for removal by a named plan item).
 
 ## G-UPDATE-FORKSYNC: automatic upstream merge in `hermes update`
-- Commits: 08f93e614a62790a6bd29c1397c603c2181f1161, 21a38d4dc2b9301a75ac219da8f19b103813ec6d, 7de663b05eaf30157e51e795d008ed526a52c785, 5f6aeab598ad280d33903e10e4158397220bf264, b63893c1ac74800637b70efd0e74c07fcbe9175d, 2e2a5082f58f01addb00a3b60646da5dd7555e4c, 2f79ad2996d8d6d62736942ce65c88c50cf32a55, 6a00376ed41f2ec30802c30cfa07c9a7858abaf7, 780b21e1bbad1951cfa8cfa30ed2cc6d8c9e1cb0
+- Commits: 074b4b9dcc6c281619e357749397f69e9fe631e9, 08cbe89e17662e79a2290a4e051cb114b64cf072, b9776c3870ee6938ac2806eeb08c3eeccad1bfd1
 - Owned-Files:
   - hermes_cli/update_cmd.py
   - hermes_cli/update_cmd_fleet.py
@@ -76,7 +76,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: 82867a2110f6cfa500913f34fa3984f11ab8222b, c25ff2c605ddaf51941a69593e9e11a7abcd9b83, 9d9273e016485af63cad0bb0ebdb8f86469d8e98, 161b03e4d05d955b7246e7536d8e122fcafd1403, ed8cbe13f277229896b7c03945152891a7d35c83, 075205dd17d1c09a43d3332d9cdd3002baafd891, 424f8b423fe798eb9660b606940a322cea718d57, d87a667d7d1c87891f4618a336263cfa383e1bd0, dd36cd7a9d0759be4d36546254f4f85327ccf49a, 2bd5dea2ae19009478e1618cc14043c3e7253d61, 6a19104b72543483923aa619cdfc09f6d246b125, f7ed2fdfc31fba4e1c53068c3d9cc6974c1719e1, fbde468e17a1cc57199d6e03fe69a44eb7b90722, b416b65b79acc4fd8e1143adab428b16d416e96a, 1fe4789920d70228426e329317537a1fcf9b6d51, 147a6c0334dccf2a24305481ec3f0daabc54c989, 9d98c1090f4a83a457cf80ddcb92c9e2f9008c4b
+- Commits: d7cf45920d38a9823c03562a97494c25ca5fea61
 - Owned-Files:
   - cron/deferrals.py
   - cron/delivery_queue.py
@@ -126,7 +126,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-LIFECYCLE: durable Kanban lifecycle contracts and CAS guards
-- Commits: 97a8adab283e5b3e292d1cca4dd019149c62d544, b14684474269d1e7b32a881fdf387fa6b85ca13f, 690611dd293b2ebea1d98628f4e7d8a3cf7de14f, 4996728aa28bfc3ac1b05b42d6625c6af79b8138, f496346d2ee17a48295de9f1140108bc4ff35942, f8443d665d5deba0177057559d987d0a116a5314, 18e0b13a50e23f70d67aa345ebbc22be79f82d50, e742bfb874138deca7d797d941a1b834ff067f76, 39a6be8ba3339a26b73f637bde3785cf0781cbed, 49019067125ff63a3be2d65aaf37f7469dc630b0, 9a27c914ae3fd0d9700946e806fb038b61ecf288, 66b92833a99cc2e9176809b24ca63b67d0b467b5, 7adbe4ecbfefa5796995149aae49d69e9bb8fb4d, cbd0d6ba095a0ac5064c25c66cdc77d3a4423659, bac93d67aed81f5d36fd0974259539bb86e8efba, 7e3cf6f09b6317533d6522d115bfe7f3650c23ab, 6fa1a258cabe1c28dc630fe6e333b9064297401f, 07139edff9f9d0904b705db7db0476f8728926e1
+- Commits: 1ab971057377815a36ce2c521dd794d9d1798f4f, e84910466496b942b0a9bada5e455ad16a0a8d68
 - Owned-Files:
   - hermes_cli/kanban.py
   - hermes_cli/kanban_db.py
@@ -154,7 +154,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: 32c89389f6160452984c9cf8a19b935970489935, d14ebfd1076ed44af75ddd7c70b849bc934b66b9, 5426f0f3125703d2f4275394e0dad549c1875642, deaea591f92190e1317ea0c6d4970f8df5edce78, cd71ff7d1fcd4cb34e9e805b4fba6c56a45a419c, 6b929aebd4a424be5c6a5cac1b30efcc28b1611f, 70e3bdefe385b2f0e9597233c2cff9b0f00f7b41, a19b189a244bcf9f5299e33ba6cc84ebd6fae8e4
+- Commits: 1c6bc9f3afd9efd69dc3a0a0d1a8fbfeed6036cc, 4b1fe5f7723202224e13d62b91825532b8b84aba
 - Owned-Files:
   - agent/agent_init.py
   - hermes_cli/_parser.py
@@ -173,7 +173,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-TELEGRAM-MDV2: escape chunk indicators on the standalone Telegram send path
-- Commits: 8b89f7f69a3f10dda431cb1ac177e2f949c2aa60
+- Commits: 2e8d488bf455889389f9e9f93c3f6f59bacb24e9
 - Owned-Files:
   - tools/send_message_senders.py
   - tests/tools/test_send_message_tool.py
@@ -184,7 +184,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-SKILL-CLAUDE-OAUTH: verify Claude OAuth before delegation, current model examples
-- Commits: 016208fc9758e047e289044ce2594dd0f9750378, b47a5ffa51fd38d793dc19d230691b0c824f721a
+- Commits: 7092df93ffe4bb3cbc8984494cd27e4bca3ed2b3
 - Owned-Files:
   - skills/autonomous-ai-agents/claude-code/SKILL.md
   - tests/skills/test_claude_code_skill.py
@@ -195,7 +195,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DOCS-GITHUB-WORKTREE: worktree cleanup guidance after PR merge
-- Commits: 0dc6cfe4bd2c33fc3d1cf5e5ea813f19ad5ccd91
+- Commits: 351dfab6e78e200feaf5c838c8fb5ddb0e228c0f
 - Owned-Files:
   - skills/software-development/github/references/pr-workflow.md
   - website/docs/user-guide/skills/bundled/github/github-github-pr-workflow.md
@@ -206,7 +206,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-TEST-ISOLATION: isolate desktop test fixtures and mutex paths
-- Commits: 23435ad9c87c62e313d6bd68abd95a6ff4382b46
+- Commits: 9f241f683a6aa4e3dd7472fd125dc2d862cf1e8b
 - Owned-Files:
   - apps/desktop/electron/git-review-ops.test.ts
   - apps/desktop/electron/git-worktree-ops.test.ts
@@ -223,7 +223,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-SESSION-HISTORY: keep earlier prompts and profile-default new sessions
-- Commits: none
+- Commits: 9c61aea2d1d212f3b7491c62f6c16e51970344c4
 - Owned-Files:
   - apps/desktop/src/app/chat/history-window.test.tsx
   - apps/desktop/src/app/chat/index.tsx
@@ -237,7 +237,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-SKILLS-CATALOG: desktop skills catalog, deeplink install, and host confirm
-- Commits: none
+- Commits: 813d849627e0b9c315eba83ed4b0986304b63aac
 - Owned-Files:
   - apps/desktop/src/app/capabilities/index.test.tsx
   - apps/desktop/src/app/chat/route-tile.tsx
@@ -269,7 +269,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-PROFILE-SWITCHER: desktop sidebar profile switcher
-- Commits: none
+- Commits: b1446a740800503e909c44ca717a0c238c838a3e
 - Owned-Files:
   - apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.tsx
 - Intent: Own the remaining unowned conflict path that blocked the 2026-09-21 live `cc_resolve_upstream_conflict` prepare (`inc-hu-verify-20260921-r27b`, `f4680448-0887-37e0-92f5-b40cc9d4aa24`) as `unknown_fork_change` after G-DESKTOP-SKILLS-CATALOG took the catalog/deeplink set. Keep the desktop sidebar profile switcher during upstream merges.
@@ -279,7 +279,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-CONNECTORS: desktop connector and MCP setup extras
-- Commits: none
+- Commits: 1f319e8451c6691e2111940e302b7f3149683344
 - Owned-Files:
   - apps/desktop/electron/main.ts
   - apps/desktop/src/components/assistant-ui/connector-tool.tsx
@@ -293,7 +293,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ELECTRON-PATCH: Electron patched-release bump
-- Commits: 63a29f4ca9f11bbc25e8cac0bfcf732939a2bcb4
+- Commits: a511d303943b14105f53e31f5c134fee3b45ad0a
 - Owned-Files:
   - apps/desktop/package.json
   - package.json
@@ -316,7 +316,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: absorbed-upstream
 
 ## G-DASHBOARD-LOOPBACK: loopback Desktop backends exempt from public_url gate
-- Commits: none
+- Commits: da5beef7a1b61077bb1a476da3064bf0735f405b
 - Owned-Files:
   - hermes_cli/web_server.py
   - tests/hermes_cli/test_web_server.py
@@ -327,7 +327,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: absorbed-upstream
 
 ## G-SYNC-RESIDUE: retired trailing-newline residue from upstream sync merges
-- Commits: none
+- Commits: bde5333c178ddf8bb1868ee72f770e7a14e5726b
 - Owned-Files:
   - tests/test_engines_satisfiable.py
   - tests/agent/test_turn_finalizer_final_response_persistence.py
@@ -339,7 +339,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: absorbed-upstream
 
 ## G-UPSTREAM-HYGIENE: repair integration residue during upstream sync
-- Commits: 36cb1d0ed9fbde8e78466531b33d01187f6c110c
+- Commits: cb993066b647344bf0552e0d1c32a5e2f78b8208
 - Reconciliations: 68f8ab91e3a3b0aa5cb3c8d114fa60b253f227bd
 - Owned-Files:
   - tests/cron/test_estop.py
@@ -352,7 +352,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-DESKTOP-UPDATE-20260921: desktop and TUI test/component extras
-- Commits: none
+- Commits: 5c5e59401bbc76f289d1f12c8dcdf03b2220aa5c
 - Owned-Files:
   - apps/desktop/electron/command-screenshot-monitor.test.ts
   - apps/desktop/electron/command-screenshot-monitor.ts
@@ -398,18 +398,32 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream carries equivalent desktop/TUI behavior, or the extras are explicitly retired.
 - Disposition: active
 
+## G-CLI-STARTUP: process entrypoint helpers shared by desktop and CLI launch
+- Commits: 4287d10b96b09546d2af49e673fde06f5f5cc47f
+- Owned-Files:
+  - hermes_cli/_startup_fast.py
+  - hermes_cli/main_desktop.py
+  - tests/hermes_cli/test_cli_entrypoint_imports.py
+  - tests/hermes_cli/test_cli_module_imports.py
+- Intent: Own the CLI startup helpers the integrate replay left unowned, plus the desktop launch module and entrypoint import test that call the same process entrypoint. This is not the oneshot zero-tool invariant.
+- Protected-Invariant: Desktop launch and the CLI import contract must resolve these helpers from the checkout under test, not from an unrelated live install, when the checkout is not the installed app.
+- Tests: tests/hermes_cli/test_cli_module_imports.py, tests/hermes_cli/test_desktop_profile_launch.py
+- Retirement-Condition: Upstream owns this startup surface and the fork no longer patches it.
+- Disposition: active
+
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 32
-- History-Reconciliations: 66f9ff9229aef76ab980329544294d287ed70ea7
+- Ledger-Revision: 33
+- History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
+- Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - website/docs/developer-guide/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`.
-- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite.
+- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal. `Cross-Owner-Commits` maps a work commit only when every changed path already has one effective owner, at least two owners are involved, the commit does not change the ledger, and no entry has already claimed it.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
 - Disposition: active

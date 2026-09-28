@@ -34,6 +34,10 @@ is limited to the pinned three-dot changed path set, including both sides of
 renames and reversibly decoded non-UTF-8 names. Every current path must have
 exactly one owner, or an explicit Path-Precedence row naming one of its owners.
 Missing and ambiguous current paths fail closed. Precedence never invents an owner.
+`Cross-Owner-Commits` on G-FORK-LEDGER maps a published work commit whose paths
+already have effective owners, but more than one of them. It cannot map an
+unowned path, a single-owner commit, a ledger edit, or a commit another entry
+already claims.
 A path may be declared once; a repeated row fails closed whether the winner
 is the same or conflicting, and is reported in invalid_precedence. The
 winner is the token after the last `: <ID>`, so colon and quoted paths stay
@@ -1375,6 +1379,87 @@ def _resolve_current_paths(
     return path_owners, unowned, ambiguous
 
 
+
+def _apply_cross_owner_commits(
+    repo: Path,
+    entries: list[LedgerEntry],
+    work_shas: set[str],
+    path_cache: dict[str, set[str]],
+    effective_owners: dict[str, str],
+    claims: dict[str, list[str]],
+    ledger_rel: str,
+) -> None:
+    """Map a published commit that already has owners, but more than one.
+
+    This does not hide first-parent work and does not invent an owner. A
+    single-owner commit must use a normal claim. An unowned path stays a
+    failure.
+    """
+    others = [
+        entry for entry in entries
+        if entry.entry_id != "G-FORK-LEDGER" and "Cross-Owner-Commits" in entry.fields
+    ]
+    for entry in others:
+        entry.problems.append(
+            "Cross-Owner-Commits may be declared only by G-FORK-LEDGER"
+        )
+    ledger_entries = [entry for entry in entries if entry.entry_id == "G-FORK-LEDGER"]
+    if len(ledger_entries) != 1:
+        return
+    entry = ledger_entries[0]
+    raw = entry.fields.get("Cross-Owner-Commits", "")
+    if not raw:
+        return
+    seen: set[str] = set()
+    for token in (part for part in _SPEC_SPLIT.split(raw) if part):
+        if token in seen:
+            entry.problems.append(
+                f"duplicate Cross-Owner-Commits declaration: {token}"
+            )
+            continue
+        seen.add(token)
+        if not _FULL_SHA.fullmatch(token):
+            entry.problems.append(
+                "Cross-Owner-Commits requires full 40-character object IDs: "
+                f"{token}"
+            )
+            continue
+        if token not in work_shas:
+            entry.problems.append(
+                "Cross-Owner-Commits commit is outside evaluated work range: "
+                f"{token}"
+            )
+            continue
+        if token not in path_cache:
+            path_cache[token] = commit_changed_paths(repo, token)
+        paths = path_cache[token]
+        if ledger_rel in paths:
+            entry.problems.append(
+                f"Cross-Owner-Commits commit changes the ledger: {token}"
+            )
+            continue
+        missing = sorted(path for path in paths if path not in effective_owners)
+        if missing:
+            entry.problems.append(
+                f"Cross-Owner-Commits commit {token} has unowned or ambiguous "
+                "paths: " + ", ".join(missing)
+            )
+            continue
+        owners = {effective_owners[path] for path in paths}
+        if len(owners) < 2:
+            entry.problems.append(
+                "Cross-Owner-Commits commit has a single effective owner: "
+                f"{token}"
+            )
+            continue
+        if token in claims:
+            entry.problems.append(
+                f"Cross-Owner-Commits commit is already claimed: {token}"
+            )
+            continue
+        claims.setdefault(token, []).append(entry.entry_id)
+
+
 def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -> dict:
     ledger_rel = _ledger_repo_rel(repo, ledger_path)
     repo = Path(_git(repo, "rev-parse", "--show-toplevel")).resolve()
@@ -1486,6 +1571,15 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         for sha in valid_claimed:
             claims.setdefault(sha, []).append(entry.entry_id)
 
+    _apply_cross_owner_commits(
+        repo,
+        entries,
+        work_shas,
+        path_cache,
+        effective_owners,
+        claims,
+        ledger_rel,
+    )
     duplicate_claims = [
         {"sha": sha, "entries": ",".join(ids)}
         for sha, ids in claims.items()

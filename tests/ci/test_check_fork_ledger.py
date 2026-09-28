@@ -1021,3 +1021,63 @@ def test_repo_ledger_entry_ids_are_unique():
     entries = mod.parse_ledger(ledger.read_text(encoding="utf-8"))
     ids = [e.entry_id for e in entries]
     assert len(ids) == len(set(ids)), f"duplicate entry ids: {ids}"
+
+
+def test_cross_owner_commit_maps_only_when_no_single_owner_can_claim(tmp_path):
+    """A published commit with two effective owners maps only through the explicit field."""
+    repo = tmp_path / "cross-owner"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "base.py", "BASE = 1\n", "chore: upstream base")
+    _git(repo, "checkout", "-b", "fork-main")
+    mixed = _commit_file(repo, "a.py", "A = 1\n", "feat: touch a")
+    # Second path in the same commit: amend is a new commit, so write both before commit.
+    # The helper already committed a.py. Add b.py as its own commit, then we need one
+    # commit that changes both. Rebuild that commit.
+    _git(repo, "reset", "--soft", "HEAD~1")
+    (repo / "b.py").write_text("B = 1\n", encoding="utf-8")
+    _git(repo, "add", "a.py", "b.py")
+    _git(repo, "commit", "-m", "feat: touch two owners")
+    mixed = _git(repo, "rev-parse", "HEAD")
+    single = _commit_file(repo, "a.py", "A = 2\n", "fix: touch only a")
+    body = (
+        _entry("G-A", "owner a", commits="none", owned_files=["a.py"])
+        + _entry("G-B", "owner b", commits="none", owned_files=["b.py"])
+        + (
+            "## G-FORK-LEDGER: fixture ledger\n"
+            "- Commits: self\n"
+            f"- Cross-Owner-Commits: {mixed}\n"
+            "- Owned-Files:\n"
+            "  - docs/FORK_CHANGES.md\n"
+            "- Intent: Record the cross-owner commit.\n"
+            "- Protected-Invariant: Single-owner commits stay on normal claims.\n"
+            "- Tests: tests/ci/test_check_fork_ledger.py\n"
+            "- Retirement-Condition: The fixture is gone.\n"
+            "- Disposition: active\n"
+        )
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    assert single in {item["sha"] for item in payload["unmapped_commits"]}
+    assert mixed not in {item["sha"] for item in payload["unmapped_commits"]}
+    refused = _entry("G-A", "owner a", commits=single, owned_files=["a.py"])
+    body = body.replace(
+        _entry("G-A", "owner a", commits="none", owned_files=["a.py"]),
+        refused,
+        1,
+    )
+    body = body.replace(
+        f"- Cross-Owner-Commits: {mixed}\n",
+        f"- Cross-Owner-Commits: {mixed}, {single}\n",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1
+    problems = " ".join(
+        problem
+        for entry in payload["invalid_entries"]
+        for problem in entry["problems"]
+    )
+    assert "single effective owner" in problems
