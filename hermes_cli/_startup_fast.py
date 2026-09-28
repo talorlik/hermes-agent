@@ -102,6 +102,15 @@ def is_global_fast_version_argv(argv: list[str]) -> bool:
     return argv in (["--version"], ["-V"])
 
 
+def is_termux_fast_version_argv(argv: list[str]) -> bool:
+    """Termux fast-CLI version check. Same argv shapes as the global fast path.
+
+    main._try_termux_fast_cli_launch calls this before the full parser so
+    ``--version`` can print without the heavy import wall. Tests replace it.
+    """
+    return is_global_fast_version_argv(argv)
+
+
 def is_desktop_ssh_backend_argv(argv: list[str]) -> bool:
     """Is ``argv`` the Desktop client's SSH backend spawn (``serve --ssh-session-token-file``)?
 
