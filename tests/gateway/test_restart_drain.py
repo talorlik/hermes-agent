@@ -24,6 +24,9 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
+    # launchd stamps the job label on the wrapper and re-exports it to the
+    # grandchild. XPC_SERVICE_NAME=0 is not that marker; HERMES_LAUNCHD_LABEL is.
+    monkeypatch.delenv("HERMES_LAUNCHD_LABEL", raising=False)
     # Hermeticity: neutralize the real container probe (see
     # test_restart_service_detection.py) — /.dockerenv on a containerized CI
     # runner would otherwise route via_service=True under this test.
