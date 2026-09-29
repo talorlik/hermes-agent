@@ -72,7 +72,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Intent: `updates.fork_sync_strategy: merge` makes `hermes update` merge `upstream/main` into `main` (fork commits preserved, recovery tag before merge, post-merge syntax guard with rollback, candidate test run before push, no-op pull accepted). Default stays `ff_only`; unknown values fall back to `ff_only`.
 - Protected-Invariant: An update never force-pushes or rewrites `main`; a conflict or a post-merge syntax/test failure aborts with the pre-merge SHA restored and nothing pushed; upstream code merged by the sync cannot reach origin unchecked.
 - Tests: tests/hermes_cli/test_fork_sync_strategy.py, tests/hermes_cli/test_cmd_update.py
-- Retirement-Condition: Upstream ships an equivalent fork-sync merge strategy in `hermes update`, or the fork stops carrying local commits (P5/P6 cutover replaces the mechanism with `cc_hermes_update` + `cc_resolve_upstream_conflict` and upstream absorbs the remainder).
+- Retirement-Condition: Upstream ships an equivalent fork-sync merge strategy in `hermes update`, or the fork stops carrying local commits.
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
@@ -423,7 +423,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 34
+- Ledger-Revision: 35
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465
 - Owned-Files:
@@ -432,7 +432,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test. Revision 35 removes the retired update-workflow name from the fork-sync retirement condition.
 - Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal. `Cross-Owner-Commits` maps a work commit only when every changed path already has one effective owner, at least two owners are involved, the commit does not change the ledger, and no entry has already claimed it.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
