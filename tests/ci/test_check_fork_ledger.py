@@ -937,6 +937,47 @@ def test_pre_resolved_conflict_sync_merge_is_exempt(tmp_path):
         ),
     )
     code, payload = _run_checker(repo)
+    assert code == 1, payload
+    assert sync_merge not in payload.get("sync_merges", [])
+
+
+def test_fitted_conflict_sync_merge_is_exempt(tmp_path):
+    repo = tmp_path / "fitted-sync"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'base'\n", "base")
+    _git(repo, "checkout", "-b", "fork-main")
+    pre_resolved = _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'fork'\nEXTRA = 'fork'\n",
+        "fork customization",
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'upstream'\n", "upstream change")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode == 1
+    (repo / "shared.py").write_text("VALUE = 'upstream'\nEXTRA = 'fork'\n")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream with fitted conflict")
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(
+        repo,
+        _entry(
+            "G-SHARED",
+            "fitted shared path",
+            commits=pre_resolved,
+            owned_files=["shared.py"],
+        ),
+    )
+    code, payload = _run_checker(repo)
     assert code == 0, payload
     assert sync_merge in payload["sync_merges"]
 

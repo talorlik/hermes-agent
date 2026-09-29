@@ -469,6 +469,53 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     )
 
 
+
+def _blob_text(repo: Path, entry: tuple[str, str, str] | None) -> str | None:
+    if entry is None or entry[1] != "blob":
+        return None
+    return _git_bytes(repo, "cat-file", "-p", entry[2]).decode("utf-8", "surrogateescape")
+
+
+def _upstream_lines_kept(upstream: str, actual: str, fork: str) -> bool:
+    """True when every upstream line survives and every extra line came from the fork."""
+    if bytes((0,)) in upstream.encode("utf-8", "surrogateescape"):
+        return actual == upstream
+    if bytes((0,)) in actual.encode("utf-8", "surrogateescape"):
+        return False
+    required = upstream.splitlines()
+    live = actual.splitlines()
+    index = 0
+    for line in required:
+        while index < len(live) and live[index] != line:
+            index += 1
+        if index >= len(live):
+            return False
+        index += 1
+    upstream_lines = set(required)
+    fork_lines = set(fork.splitlines())
+    return all(line in upstream_lines or line in fork_lines for line in live)
+
+
+def _conflict_fit_allowed(
+    repo: Path,
+    first: tuple[str, str, str] | None,
+    upstream: tuple[str, str, str] | None,
+    actual: tuple[str, str, str] | None,
+) -> bool:
+    """Accept upstream text with fork insertions. Reject a wholesale fork file."""
+    if upstream is None:
+        return actual == first
+    if actual is None or actual[1] != "blob" or upstream[1] != "blob":
+        return False
+    if actual[0] != upstream[0]:
+        return False
+    return _upstream_lines_kept(
+        _blob_text(repo, upstream) or "",
+        _blob_text(repo, actual) or "",
+        _blob_text(repo, first) or "",
+    )
+
+
 def _is_clean_upstream_sync(
     repo: Path, sha: str, parents: list[str], upstream_oid: str
 ) -> bool:
@@ -504,8 +551,8 @@ def _is_clean_upstream_sync(
     if not separator:
         return False
 
-    # A conflicted sync is exempt only when the fork resolved every conflict
-    # before the merge and the merge retained those exact first-parent paths.
+    # A conflicted sync is exempt only when content conflicts keep upstream lines
+    # and extras come from the fork. A wholesale fork file is not exempt.
     # Directory-rename suggestions name both the proposed destination and the
     # original source, so retaining the original ledger path is also auditable.
     conflict_paths = {
@@ -566,13 +613,23 @@ def _is_clean_upstream_sync(
         if expected_entries.get(path) != actual_entries.get(path)
     }
 
-    # Every conflicted destination must retain the first-parent object,
-    # including exact absence for an upstream deletion or rename suggestion.
+    # Rename suggestions keep the original fork path. Content conflicts must
+    # keep every upstream line. A wholesale fork file is not an exempt sync.
+    upstream_entries = tree_entries(upstream_parent)
+    rename_paths = set(relocation_sources) | set(relocation_sources.values())
     if any(
         actual_entries.get(path) != first_entries.get(path)
-        for path in conflict_paths
+        for path in conflict_paths & rename_paths
     ):
         return False
+    for path in conflict_paths - rename_paths:
+        if not _conflict_fit_allowed(
+            repo,
+            first_entries.get(path),
+            upstream_entries.get(path),
+            actual_entries.get(path),
+        ):
+            return False
 
     allowed = set(conflict_paths)
     for source, destination in relocation_sources.items():
