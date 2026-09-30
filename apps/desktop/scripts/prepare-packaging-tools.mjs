@@ -28,6 +28,25 @@ export function pinnedPackageRoot(source, name) {
   return directory
 }
 
+/**
+ * electron-builder 27 alpha compiles app-builder-lib to dist/. 26.15.3, the pin
+ * this fork keeps, compiles it to out/ and records that in package.json main.
+ * A missing probe fails closed instead of importing the other layout.
+ * @param {string} builderRoot @returns {string}
+ */
+export function builderCompiledRoot(builderRoot) {
+  const manifest = JSON.parse(fs.readFileSync(path.join(builderRoot, 'package.json'), 'utf8'))
+  if (manifest.name !== 'app-builder-lib' || typeof manifest.main !== 'string') {
+    throw new Error('app-builder-lib package.json has no usable main')
+  }
+  const compiled = path.resolve(builderRoot, path.dirname(manifest.main))
+  const probe = path.join(compiled, 'util', 'electronGet.js')
+  if (!fs.existsSync(probe)) {
+    throw new Error(`app-builder-lib ${manifest.version} main ${manifest.main} has no util/electronGet.js`)
+  }
+  return compiled
+}
+
 /** @param {string} target @returns {'x64' | 'arm64'} */
 export function packagingTargetArch(target) {
   if (target === `${process.platform}-x64`) return 'x64'
@@ -80,7 +99,8 @@ async function preparePackagingTools({ source, out, cache, target = `${process.p
  */
 async function acquirePackagingTools({ source, out, cache, target, formats, builderRoot, config, dmgbuild }) {
   /** @param {string} relative */
-  const load = (relative) => import(pathToFileURL(path.join(builderRoot, 'dist', relative)).href)
+  const compiled = builderCompiledRoot(builderRoot)
+  const load = (relative) => import(pathToFileURL(path.join(compiled, relative)).href)
   const [electronGet, sevenZip, icons] = await Promise.all([
     load('util/electronGet.js'), load('toolsets/7zip.js'), load('toolsets/icons.js'),
   ])
@@ -113,7 +133,7 @@ async function acquirePackagingTools({ source, out, cache, target, formats, buil
   }
   if (formats.includes('AppImage')) {
     const appimage = await load('toolsets/appimage.js')
-    const { Arch } = await import(pathToFileURL(path.join(builderRoot, 'dist/index.js')).href)
+    const { Arch } = await import(pathToFileURL(path.join(compiled, 'index.js')).href)
     const tools = await appimage.getAppImageTools(config.toolsets?.appimage, Arch[packagingTargetArch(target)], resourcesDir)
     toolsets.appimage = copyTool(path.dirname(tools.mksquashfs), path.join(out, 'appimage'))
   }
