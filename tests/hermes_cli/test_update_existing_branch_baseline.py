@@ -77,6 +77,62 @@ def test_same_commit_switch_is_still_a_noop(checkout):
     assert prepare(root).commit_count == 0
 
 
+def test_fork_matching_origin_runs_observed_upstream_sync(checkout, monkeypatch):
+    root, _old, tip = checkout
+    git(root, "checkout", "-q", "--detach", tip)
+    seen = []
+
+    def fake_sync(_git_cmd, cwd, *, phase, assume_yes, input_fn):
+        seen.append((phase, Path(cwd), assume_yes, input_fn))
+        sha = git(root, "rev-parse", "HEAD")
+        return update_cmd.UpstreamSyncOutcome(
+            phase=phase,
+            status="noop",
+            pre_sha=sha,
+            post_sha=sha,
+            clean=True,
+            operation_state="none",
+            recovery_ref=sha,
+            error="",
+        )
+
+    monkeypatch.setattr(update_cmd, "_sync_with_upstream_observed", fake_sync)
+    plan = prepare(root, is_fork=True)
+    assert seen == [("prepare", root, True, None)]
+    assert plan.commit_count == 0
+    assert plan.upstream_checked is True
+
+
+def test_post_origin_pull_runs_observed_upstream_sync(checkout, monkeypatch):
+    root, old, tip = checkout
+    git(root, "checkout", "-q", "main")
+    git(root, "reset", "--hard", old)
+    seen = []
+
+    def fake_sync(_git_cmd, cwd, *, phase, assume_yes, input_fn):
+        seen.append((phase, Path(cwd), assume_yes, input_fn))
+        sha = git(root, "rev-parse", "HEAD")
+        return update_cmd.UpstreamSyncOutcome(
+            phase=phase,
+            status="noop",
+            pre_sha=sha,
+            post_sha=sha,
+            clean=True,
+            operation_state="none",
+            recovery_ref=sha,
+            error="",
+        )
+
+    monkeypatch.setattr(update_cmd, "_sync_with_upstream_observed", fake_sync)
+    update_cmd._pull_updates(
+        ["git"], "main", None, prompt_for_restore=False, gw_input_fn=None,
+        discard_local_changes=False, keep_stash=False, sync_upstream=True,
+        assume_yes=True,
+    )
+    assert seen == [("post_origin_pull", root, True, None)]
+    assert git(root, "rev-parse", "HEAD") == tip
+
+
 @pytest.mark.parametrize("parked", [False, True])
 def test_syntax_failure_returns_to_original_checkout_without_rewriting_main(checkout, parked):
     root, old, tip = checkout

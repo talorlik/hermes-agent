@@ -938,7 +938,7 @@ def _pull_updates(
                 git_cmd, branch, pre_sync_sha or pre_pull_sha, in_place_update=in_place_update,
                 _windows_gateway_resume=_windows_gateway_resume)
             _enforce_upstream_sync_outcome(
-                _m()._sync_with_upstream_observed(
+                _sync_with_upstream_observed(
                     git_cmd, _m().PROJECT_ROOT, phase="post_origin_pull",
                     assume_yes=assume_yes, input_fn=gw_input_fn),
                 git_cmd, auto_stash_ref, prompt_for_restore=prompt_for_restore,
@@ -1105,7 +1105,7 @@ def _prepare_checkout_for_update(
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
     if commit_count == 0 and is_fork and branch == "main" and not release_tag:
-        outcome = _m()._sync_with_upstream_observed(
+        outcome = _sync_with_upstream_observed(
             git_cmd, _m().PROJECT_ROOT, phase="prepare",
             assume_yes=assume_yes, input_fn=gw_input_fn)
         _enforce_upstream_sync_outcome(
