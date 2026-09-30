@@ -448,7 +448,7 @@ export const ru = defineLocale({
       'view.toggleProfileRail': 'Показать / скрыть панель профилей',
       'view.toggleSimpleMode': 'Переключить простой режим',
       'view.showFiles': 'Показать браузер файлов',
-      'view.showBrowser': 'Открыть браузер',
+      'view.showBrowser': 'Переключить браузер',
       'view.toggleHud': 'Включить / выключить режим HUD',
       'hud.snapToPointer': 'Переместить HUD под курсор (глобально, пока HUD открыт)',
       'view.showTerminal': 'Показать / скрыть терминал',
@@ -720,6 +720,9 @@ export const ru = defineLocale({
       system: { label: 'Системная', description: 'Следовать настройкам ОС' }
     },
     appearance: {
+      chatTextScaleTitle: 'Размер текста чата',
+      chatTextScaleDesc:
+        'Масштабирует текст беседы и поле ввода относительно масштаба интерфейса. Размер боковых панелей и элементов управления не меняется.',
       title: 'Внешний вид',
       intro: 'Только для приложения. Режим — это яркость, тема — палитра и оформление чата.',
       colorMode: 'Цветовой режим',
@@ -2013,7 +2016,8 @@ export const ru = defineLocale({
     gatewayStopped: 'Шлюз сообщений остановлен',
     hermesActiveSessions: (version, count) => `Hermes ${version} · Активные сеансы: ${count}`,
     restartGateway: 'Перезапустить шлюз',
-    openBrowser: 'Открыть браузер',
+    openBrowser: 'Переключить браузер',
+    toggleBrowser: 'Переключить браузер',
     gatewayRestartFailed: 'Не удалось перезапустить шлюз.',
     sharedGatewayRestartTitle: 'Перезапустить общий шлюз?',
     sharedGatewayRestartDescription: bots => `Все боты на этом устройстве переподключатся: ${bots}`,
@@ -3721,6 +3725,7 @@ export const ru = defineLocale({
       openStarmap: 'Открыть граф памяти',
       turnRunning: 'Выполняется',
       contextUsage: 'Использование контекста',
+      compressions: count => `Сжатий: ${count}`,
       contextUsagePanel: {
         categories: {
           conversation: 'Диалог',
@@ -3752,6 +3757,10 @@ export const ru = defineLocale({
     }
   },
   rightSidebar: {
+    terminalReadOnly: 'Вывод только для чтения',
+    terminalReadOnlyHelp:
+      'Чтобы ответить на запрос, остановите фоновую команду и запустите её в новом терминале. Он откроет отдельную оболочку и не подключится к этому процессу.',
+    terminalOpenInteractive: 'Открыть новый терминал',
     aria: 'Правая боковая панель',
     panelsAria: 'Панели правой боковой панели',
     files: 'Файловая система',
@@ -3912,6 +3921,7 @@ export const ru = defineLocale({
     hideTabStrip: 'Скрыть вкладки',
     showStripTab: title => `Показать ${title}`,
     hideStripTab: title => `Скрыть ${title}`,
+    zoneMenuLabel: title => `Параметры зоны для ${title}`,
     lastTabKeptTitle: 'Последняя вкладка остаётся',
     lastTabKeptBody:
       'В этой зоне нужна хотя бы одна видимая вкладка. Сначала покажите другую вкладку или сверните всю боковую панель.',
@@ -4048,13 +4058,9 @@ export const ru = defineLocale({
       placeholder: 'Введите ваш ответ…',
       skip: 'Пропустить',
       skipped: 'Пропущено',
-      continueLabel: 'Продолжить',
+      noAnswer: 'Нет ответа',
       confirmAndContinueLabel: 'Подтвердить и продолжить',
-      answeredBadge: 'Ответ дан',
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
-      lateAnswer: (question, choice) => `Re: «${question}» — мой ответ: ${choice}`,
-      lateAnswerTip: 'Составить этот ответ как продолжение',
-      lateAnswerHint: 'Этот промпт больше не ждёт. Выберите вариант, чтобы составить его как сообщение-продолжение.',
       notDelivered:
         'Этот вопрос не дошёл до приложения, поэтому ответить здесь нельзя. Нажмите «Стоп», чтобы завершить ход, и ответьте в чате.'
     },

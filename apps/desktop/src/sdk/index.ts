@@ -108,6 +108,7 @@ import type { PaginatedSessions, UsageStats } from '@/types/hermes'
 
 import { pluginDecisions, profiles, skills, toolsets } from './bridge'
 import { composerHost } from './composer'
+import { i18nHost } from './i18n'
 import { planPluginOpenSession } from './plugin-open-session-plan'
 import { sessionsHost } from './sessions'
 import { desktopSettings } from './settings'
@@ -209,6 +210,8 @@ const $focusedSessionProfile = computed(
 export interface PluginProfileRoute {
   connectionId: string
   mode: 'local' | 'remote'
+  /** Electron's authoritative registry primary. Absent on older shells. */
+  primary?: true
   /** Desktop profile used to select the connection route. */
   profile: string
   /** Backend Hermes profile served by that route. */
@@ -1632,7 +1635,12 @@ export const host = {
    *  active instance changes on a profile swap. */
   getGateway: (): HermesGateway | null => $gateway.get(),
 
-  composer: composerHost
+  composer: composerHost,
+
+  /** Language packs: `host.i18n.registerAppLocale(id, { endonym, rtl?,
+   *  translations })` adds a whole UI language at runtime (see `sdk/i18n.ts`);
+   *  `host.i18n.languageOptions()` lists what the switcher shows. */
+  i18n: i18nHost
 }
 
 // -- react bridge -------------------------------------------------------------
@@ -1890,6 +1898,9 @@ export { type GrabScroll, useGrabScroll } from '@/hooks/use-grab-scroll'
  *  pane whose label must track the locale pairs that `title` with
  *  `data.tabTitle: () => <LocalizedTabTitle select={t => ...} />`. */
 export {
+  type AppLocaleRegistration,
+  type BundledLocale,
+  type LanguageOption,
   type Locale,
   LocalizedTabTitle,
   type PluginI18n,

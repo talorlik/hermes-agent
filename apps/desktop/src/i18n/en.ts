@@ -791,7 +791,7 @@ export const en: Translations = {
       'view.toggleProfileRail': 'Toggle profile rail',
       'view.toggleSimpleMode': 'Toggle Simple mode',
       'view.showFiles': 'Show file browser',
-      'view.showBrowser': 'Open browser',
+      'view.showBrowser': 'Toggle browser',
       'view.toggleHud': 'Toggle HUD mode',
       'hud.snapToPointer': 'Move HUD to pointer (global, while HUD is open)',
       'view.showTerminal': 'Toggle terminal',
@@ -1165,6 +1165,9 @@ export const en: Translations = {
       system: { label: 'System', description: 'Follow OS appearance' }
     },
     appearance: {
+      chatTextScaleTitle: 'Chat Text Size',
+      chatTextScaleDesc:
+        'Scales conversation text and the message editor relative to UI Scale. Sidebars and controls stay the same size.',
       title: 'Appearance',
       intro: 'Desktop-only. Mode is brightness; theme is palette and chat chrome.',
       colorMode: 'Color Mode',
@@ -2844,7 +2847,8 @@ export const en: Translations = {
     gatewayStopped: 'Messaging gateway stopped',
     hermesActiveSessions: (version, count) => `Hermes ${version} · Active sessions ${count}`,
     restartGateway: 'Restart gateway',
-    openBrowser: 'Open browser',
+    openBrowser: 'Toggle browser',
+    toggleBrowser: 'Toggle browser',
     gatewayRestartFailed: 'Gateway restart failed.',
     sharedGatewayRestartTitle: 'Restart the shared gateway?',
     sharedGatewayRestartDescription: bots => `All bots on this device reconnect: ${bots}`,
@@ -4755,6 +4759,7 @@ export const en: Translations = {
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
       contextUsage: 'Context usage',
+      compressions: count => `Compressions: ${count}`,
       systemResources: {
         title: 'System Resources',
         loading: 'Resources…',
@@ -4796,6 +4801,10 @@ export const en: Translations = {
   },
 
   rightSidebar: {
+    terminalReadOnly: 'Read-only output',
+    terminalReadOnlyHelp:
+      'To answer prompts, stop the background command and run it in a new terminal. The new terminal opens a separate shell; it does not connect to this process.',
+    terminalOpenInteractive: 'Open new terminal',
     aria: 'Right sidebar',
     panelsAria: 'Right sidebar panels',
     files: 'File system',
@@ -4844,6 +4853,7 @@ export const en: Translations = {
     closePane: 'Close preview pane',
     loading: 'Loading preview',
     unavailable: 'Preview unavailable',
+    missingTarget: 'That path does not exist on this computer',
     opening: 'Opening...',
     hide: 'Hide',
     openPreview: 'Open preview',
@@ -4969,6 +4979,7 @@ export const en: Translations = {
     hideTabStrip: 'Hide tabs',
     showStripTab: title => `Show ${title}`,
     hideStripTab: title => `Hide ${title}`,
+    zoneMenuLabel: title => `Zone options for ${title}`,
     lastTabKeptTitle: 'Last tab stays',
     lastTabKeptBody: 'This zone needs at least one visible tab. Show another tab first, or collapse the whole sidebar.',
     toggleStripTab: title => `Toggle ${title} tab`,
@@ -5125,6 +5136,10 @@ export const en: Translations = {
         stream_drop: {
           title: 'The reply was cut off',
           body: 'The connection dropped before the reply finished. Retry to send it again.'
+        },
+        no_reply: {
+          title: "The reply didn't finish",
+          body: 'Hermes ended this turn without a reply. Retry to send it again.'
         },
         upstream_blocked: {
           title: 'A firewall blocked the request',
@@ -5306,13 +5321,9 @@ export const en: Translations = {
       placeholder: 'Type your answer…',
       skip: 'Skip',
       skipped: 'Skipped',
-      continueLabel: 'Continue',
+      noAnswer: 'No answer',
       confirmAndContinueLabel: 'Confirm and continue',
-      answeredBadge: 'Answered',
       questionProgress: (answered, total) => `${answered} of ${total} answered`,
-      lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
-      lateAnswerTip: 'Draft this answer as a follow-up message',
-      lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.',
       notDelivered:
         "This question didn't reach the app, so it can't be answered here. Press Stop to end the turn, then reply in chat."
     },

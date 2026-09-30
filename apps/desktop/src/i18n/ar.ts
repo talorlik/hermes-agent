@@ -426,7 +426,7 @@ export const ar = defineLocale({
       'view.toggleRightSidebar': 'تبديل متصفح الملفات',
       'view.toggleReview': 'تبديل لوحة المراجعة',
       'view.showFiles': 'إظهار متصفح الملفات',
-      'view.showBrowser': 'فتح المتصفح',
+      'view.showBrowser': 'تبديل المتصفح',
       'view.showTerminal': 'إظهار الطرفية',
       'view.closeTab': 'إغلاق علامة التبويب',
       'view.reopenTab': 'إعادة فتح علامة التبويب المغلقة',
@@ -720,6 +720,9 @@ export const ar = defineLocale({
       }
     },
     appearance: {
+      chatTextScaleTitle: 'حجم نص المحادثة',
+      chatTextScaleDesc:
+        'يضبط حجم نص المحادثة ومحرر الرسائل نسبةً إلى مقياس الواجهة. يبقى حجم الأشرطة الجانبية وعناصر التحكم كما هو.',
       title: 'المظهر',
       intro: 'خصص مظهر Hermes Desktop.',
       colorMode: 'نمط الألوان',
@@ -1539,7 +1542,8 @@ export const ar = defineLocale({
     gatewayStopped: 'البوابة متوقفة',
     hermesActiveSessions: (version, count) => `Hermes ${version} لديه ${count} جلسة نشطة`,
     restartGateway: 'إعادة تشغيل البوابة',
-    openBrowser: 'فتح المتصفح',
+    openBrowser: 'تبديل المتصفح',
+    toggleBrowser: 'تبديل المتصفح',
     gatewayRestartFailed: 'فشل إعادة تشغيل البوابة.',
     sharedGatewayRestartTitle: 'إعادة تشغيل البوابة المشتركة؟',
     sharedGatewayRestartDescription: bots => `تتم إعادة اتصال جميع البوتات على هذا الجهاز: ${bots}`,
@@ -3009,6 +3013,7 @@ export const ar = defineLocale({
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
       contextUsage: 'استخدام السياق',
+      compressions: count => `مرات الضغط: ${count}`,
       focusedSince: 'منذ التركيز',
       focusedSinceTitle: 'الوقت منذ تركيز هذه المحادثة — وليس مدة الدور',
       yoloOn: 'YOLO مفعل',
@@ -3023,6 +3028,10 @@ export const ar = defineLocale({
     }
   },
   rightSidebar: {
+    terminalReadOnly: 'مخرجات للقراءة فقط',
+    terminalReadOnlyHelp:
+      'للرد على المطالبات، أوقف الأمر الذي يعمل في الخلفية وشغّله في طرفية جديدة. تفتح الطرفية الجديدة صدفة منفصلة ولا تتصل بهذه العملية.',
+    terminalOpenInteractive: 'فتح طرفية جديدة',
     aria: 'الشريط الجانبي الأيمن',
     panelsAria: 'لوحات الشريط الأيمن',
     files: 'الملفات',
@@ -3178,6 +3187,7 @@ export const ar = defineLocale({
     hideTabStrip: 'إخفاء علامات التبويب',
     showStripTab: title => `إظهار ${title}`,
     hideStripTab: title => `إخفاء ${title}`,
+    zoneMenuLabel: title => `خيارات المنطقة لـ ${title}`,
     lastTabKeptTitle: 'يبقى آخر تبويب',
     lastTabKeptBody:
       'تحتاج هذه المنطقة إلى تبويب مرئي واحد على الأقل. أظهر تبويبا آخر أولا، أو اطو الشريط الجانبي بأكمله.',
@@ -3356,9 +3366,7 @@ export const ar = defineLocale({
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',
       skip: 'تخطي',
-      continueLabel: 'متابعة',
       confirmAndContinueLabel: 'تأكيد ومتابعة',
-      answeredBadge: 'تمت الإجابة',
       questionProgress: (answered, total) => `تمت الإجابة على ${answered} من ${total}`
     },
     tool: {

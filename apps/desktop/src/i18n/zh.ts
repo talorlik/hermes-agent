@@ -498,7 +498,7 @@ export const zh = defineLocale({
       'view.toggleProfileRail': '切换配置档案栏',
       'view.toggleSimpleMode': '切换简洁模式',
       'view.showFiles': '显示文件浏览器',
-      'view.showBrowser': '打开浏览器',
+      'view.showBrowser': '切换浏览器',
       'view.showTerminal': '显示终端',
       'view.selectionToComposer': '将选区发送到输入框',
       'view.terminalCopy': '复制终端选区',
@@ -850,6 +850,8 @@ export const zh = defineLocale({
       system: { label: '跟随系统', description: '跟随系统外观' }
     },
     appearance: {
+      chatTextScaleTitle: '聊天文字大小',
+      chatTextScaleDesc: '相对于界面缩放调整对话文字和消息输入框的字号。侧边栏和控件大小保持不变。',
       title: '外观',
       intro: '这些是仅桌面端的显示偏好。模式控制明暗；主题控制强调色与对话界面样式。',
       colorMode: '颜色模式',
@@ -2644,7 +2646,8 @@ export const zh = defineLocale({
     gatewayStopped: '消息网关已停止',
     hermesActiveSessions: (version, count) => `Hermes ${version} · 活跃会话 ${count}`,
     restartGateway: '重启网关',
-    openBrowser: '打开浏览器',
+    openBrowser: '切换浏览器',
+    toggleBrowser: '切换浏览器',
     gatewayRestartFailed: '网关重启失败。',
     sharedGatewayRestartTitle: '重启共享网关？',
     sharedGatewayRestartDescription: bots => `此设备上的所有机器人都会重新连接：${bots}`,
@@ -4454,6 +4457,7 @@ export const zh = defineLocale({
       openStarmap: '打开记忆图谱',
       turnRunning: '运行中',
       contextUsage: '上下文用量',
+      compressions: count => `压缩次数：${count}`,
       systemResources: {
         title: '系统资源',
         loading: '资源…',
@@ -4495,6 +4499,10 @@ export const zh = defineLocale({
   },
 
   rightSidebar: {
+    terminalReadOnly: '只读输出',
+    terminalReadOnlyHelp:
+      '如需回应提示，请停止后台命令，再在新终端中运行。新终端会打开独立的 shell，不会连接到此进程。',
+    terminalOpenInteractive: '打开新终端',
     aria: '右侧边栏',
     panelsAria: '右侧边栏面板',
     files: '文件系统',
@@ -4666,6 +4674,7 @@ export const zh = defineLocale({
     hideTabStrip: '隐藏标签',
     showStripTab: title => `显示 ${title}`,
     hideStripTab: title => `隐藏 ${title}`,
+    zoneMenuLabel: title => `${title} 的区域选项`,
     lastTabKeptTitle: '保留最后一个标签',
     lastTabKeptBody: '该区域至少需要一个可见标签。请先显示另一个标签，或折叠整个侧边栏。',
     toggleStripTab: title => `切换 ${title} 标签`,
@@ -4880,13 +4889,9 @@ export const zh = defineLocale({
       placeholder: '输入你的答案…',
       skip: '跳过',
       skipped: '已跳过',
-      continueLabel: '继续',
+      noAnswer: '未回答',
       confirmAndContinueLabel: '确认并继续',
-      answeredBadge: '已回答',
       questionProgress: (answered, total) => `已回答 ${answered}/${total}`,
-      lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
-      lateAnswerTip: '将此回答起草为后续消息',
-      lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。',
       notDelivered: '此问题未送达应用，无法在此回答。请按停止结束本轮，然后在聊天中回复。'
     },
     catalogInstall: {

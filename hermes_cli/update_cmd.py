@@ -26,7 +26,7 @@ from hermes_cli.update_channel import adopt_retired_channel
 from pm.receipt import accept_worker_receipt as _accept_completion_pm_receipt
 from hermes_cli import update_receipt as _completion_receipt, update_cmd_config as _completion_config
 from hermes_cli._old_updater import stop_for_relaunch
-from hermes_cli._early_recovery import interrupted_pull_marker
+from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker
 from hermes_cli import update_cmd_check as _check
 
 # Re-exports: every split-module name stays reachable (and monkeypatchable) as update_cmd.<name>.
@@ -184,7 +184,10 @@ def _no_prompt_git_kwargs() -> dict:
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "Never"
-    return {"stdin": subprocess.DEVNULL, "env": env}
+    # Every network git spawn (fetch/pull/shallow heal) runs under a console-less
+    # desktop backend on Windows; hide the per-spawn console (#117781).
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    return {"stdin": subprocess.DEVNULL, "env": env, "creationflags": windows_hide_flags()}
 
 
 _UPDATE_CRITICAL_FILES = (
@@ -261,12 +264,20 @@ def _map_ssl_cert_file_for_git(git_cmd) -> None:
 
 def _git_run(git_cmd, args, cwd=None, *, check=False, network=False):
     """Run git capturing utf-8 text (default cwd: checkout); ``network=True`` disables the
-    terminal prompt so an HTTP 401 fails fast instead of hanging, and bounds the wait."""
+    terminal prompt so an HTTP 401 fails fast instead of hanging, and bounds the wait.
+
+    Every spawn carries ``windows_hide_flags()``: the updater's git children run under the
+    console-less desktop backend, and a bare spawn flashes a console window each (#117781)."""
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    # ``_no_prompt_git_kwargs()`` already carries the hide flags for network
+    # calls, so layer them instead of passing the keyword twice.
+    spawn_kwargs = {"timeout": NETWORK_GIT_TIMEOUT_SECONDS, **_no_prompt_git_kwargs()} if network else {}
+    spawn_kwargs.setdefault("creationflags", windows_hide_flags())
     try:
         return subprocess.run(
             git_cmd + args, cwd=_m().PROJECT_ROOT if cwd is None else cwd, capture_output=True,
             text=True, encoding="utf-8", errors="replace", check=check,
-            **({"timeout": NETWORK_GIT_TIMEOUT_SECONDS, **_no_prompt_git_kwargs()} if network else {}))
+            **spawn_kwargs)
     except subprocess.TimeoutExpired as exc:
         # subprocess.run already killed the child; the checkout stays consistent because
         # fetch writes to tmp_pack_* and only renames on success. Report as a failed run
@@ -1376,6 +1387,17 @@ def _apply_pulled_update(
 
 def _cmd_update_impl(args, gateway_mode: bool):
     """Apply the update; the command boundary owns errors, receipts and stdio."""
+    # Marks this frame as the CURRENT updater for
+    # _old_updater.in_historical_update(); historical on-disk updaters do not
+    # declare this local, so only they hand off through retired shims.
+    _hermes_current_updater_frame = True
+    git_operation = git_operation_in_progress(_m().PROJECT_ROOT)
+    if git_operation:
+        root = _m().PROJECT_ROOT
+        print(f"✗ Cannot update while a Git {git_operation} is in progress in {root}.")
+        print(f"  Finish it or run `git {git_operation} --abort`, then re-run `hermes update`.")
+        sys.exit(1)
+
     opts = _resolve_update_options(args, gateway_mode)
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
 
@@ -1492,11 +1514,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Fetching updates...")
         if release_sha:
-            fetch_result = _git_run(git_cmd, ["fetch", "--no-tags", "origin", target_ref], network=True)
+            fetch_args = ["fetch", "--no-tags", "origin", target_ref]
         else:
-            fetch_result = _git_run(
-                git_cmd, ["fetch", "origin", _check.tracking_refspec("origin", branch)], network=True)
+            fetch_args = ["fetch", "origin", _check.tracking_refspec("origin", branch)]
+        from hermes_cli.gitlock import fetch_with_partial_clone_recovery, is_partial_clone_pack_objects_crash
+        # Marking the unmarked packs clears the git 2.53+ partial-clone pack-objects crash (#124272).
+        fetch_result = fetch_with_partial_clone_recovery(
+            lambda gc, a: _git_run(gc, a, network=True), git_cmd, fetch_args, _m().PROJECT_ROOT)
         if fetch_result.returncode != 0:
+            if is_partial_clone_pack_objects_crash(fetch_result.stderr or ""):
+                print("✗ git still crashed after marking this checkout's packs. See 'Fetch fails with"
+                      " should_include_obj' in https://hermes-agent.nousresearch.com/docs/getting-started/updating")
             _print_fetch_failure(fetch_result.stderr)
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(1)

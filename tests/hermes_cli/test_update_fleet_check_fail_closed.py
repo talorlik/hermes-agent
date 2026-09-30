@@ -105,3 +105,31 @@ def test_unmapped_stops_are_not_expected_rows():
     out.stopped_unmapped_pids.discard(102)
     pre, killed = out.fleet_probe_signals()
     assert _fleet_probe_expected_runtimes(_plan([]), pre, None, out.restarted_services, killed)
+
+
+def test_unrecovered_dashboard_marks_update_incomplete(monkeypatch, tmp_path):
+    from hermes_cli import main, update_cmd, update_cmd_fleet as fleet, update_receipt
+
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(fleet, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd_maint._refresh_dashboard_after_update",
+        lambda **kw: {4242},
+    )
+    monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda plan: [])
+    monkeypatch.setattr("hermes_cli.update_inventory.report_unaccounted_runtimes", lambda rows: False)
+    monkeypatch.setattr("hermes_cli.gateway_migrate.maybe_auto_migrate_after_update", lambda: None)
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **kwargs: [])
+    restart = fleet._GatewayRestartOutcome(
+        incomplete=False, phase_errors=[], pre_restart_gateway_pids=[], restarted_services=[],
+        failed_or_stale_units=[], relaunched_profiles=[], externally_supervised_profiles=[], killed_pids=set(),
+    )
+    update_receipt.begin_update_receipt()
+
+    with pytest.raises(SystemExit) as failure:
+        fleet._verify_fleet_after_update(
+            restart, _pre_update_plan=_plan([]), _windows_gateway_resume=None, update_complete=True,
+        )
+
+    assert failure.value.code == 1
+    assert restart.incomplete is True
