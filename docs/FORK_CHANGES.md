@@ -234,7 +234,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Protected-Invariant: Upstream merges must not drop the history-window keep-earlier-prompts behavior or the profile-default new-session route without an explicit ledger retirement.
 - Tests: apps/desktop/src/app/chat/history-window.test.tsx, apps/desktop/src/app/session/hooks/default-new-session.test.tsx
 - Retirement-Condition: Upstream carries equivalent history-window and profile-default new-session behavior.
-- Disposition: active
+- Disposition: absorbed-upstream
 
 ## G-DESKTOP-SKILLS-CATALOG: desktop skills catalog, deeplink install, and host confirm
 - Commits: 813d849627e0b9c315eba83ed4b0986304b63aac
@@ -266,7 +266,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Protected-Invariant: Upstream merges must not drop the desktop skills catalog, deeplink install, or host-confirm surfaces without an explicit ledger retirement.
 - Tests: apps/desktop/src/app/skills/catalog-browser.test.tsx, apps/desktop/src/lib/deeplink-routes.test.ts, apps/desktop/src/store/skill-deeplink-install.test.ts, apps/desktop/src/components/confirm-host.test.tsx
 - Retirement-Condition: Upstream carries equivalent catalog, deeplink-install, and host-confirm behavior.
-- Disposition: active
+- Disposition: absorbed-upstream
 
 ## G-DESKTOP-PROFILE-SWITCHER: desktop sidebar profile switcher
 - Commits: b1446a740800503e909c44ca717a0c238c838a3e
@@ -276,7 +276,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Protected-Invariant: Upstream merges must not drop the desktop sidebar profile switcher without an explicit ledger retirement.
 - Tests: apps/desktop/src/app/chat/sidebar/profile-dropdown-switcher.test.tsx
 - Retirement-Condition: Upstream carries equivalent sidebar profile-switcher behavior.
-- Disposition: active
+- Disposition: absorbed-upstream
 
 ## G-DESKTOP-CONNECTORS: desktop connector and MCP setup extras
 - Commits: 1f319e8451c6691e2111940e302b7f3149683344
@@ -290,7 +290,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Protected-Invariant: Upstream merges must not drop those desktop connector/MCP setup extras without an explicit ledger retirement.
 - Tests: apps/desktop/src/components/onboarding-chat/onboarding-recommendations-runbook.test.ts
 - Retirement-Condition: Upstream carries equivalent connector/MCP setup behavior and the runbook test, or the extras are explicitly retired.
-- Disposition: active
+- Disposition: absorbed-upstream
 
 ## G-ELECTRON-PATCH: Electron patched-release bump
 - Commits: a511d303943b14105f53e31f5c134fee3b45ad0a
@@ -392,10 +392,10 @@ change; entry is removed after the next clean sync shows no residual delta),
   - apps/desktop/src/store/suggestion-providers/mcp.test.ts
   - ui-tui/src/__tests__/createGatewayEventHandler.test.ts
   - ui-tui/src/hooks/useCompletion.ts
-- Intent: Own the fork-only desktop and TUI extras that blocked live `cc_resolve_upstream_conflict` prepare (`9570d49b-788b-3f5d-802a-d67bd9af9080` and `43da0509-fce4-3e2e-83be-96d10a857147`) as `unknown_fork_change` after pin fixes. Keep fork desktop components, tests, bot features, TUI gateway event handlers, and hooks during upstream merges.
-- Protected-Invariant: Upstream merges must not drop these desktop/TUI extras without an explicit ledger retirement.
+- Intent: Own commit `5c5e59401bbc76f289d1f12c8dcdf03b2220aa5c`, which still changes these paths. The desktop paths were restored to upstream pin `547248908bf07e22dc21eec20fe416684f55a596` because they were stale pre-move copies and broke `npm run build`. The remaining fork delta is `ui-tui/src/__tests__/createGatewayEventHandler.test.ts`: fork-only cases for goal status prefixes, spinner filtering, `moa.aggregating`, the `/agents` nudge, and ttl self-expiry. Those cases stay until upstream ships them or they are explicitly retired. The other owned paths are listed because the commit claim must cover every path that commit changes, not because they still differ from the pin.
+- Protected-Invariant: Upstream merges must not drop the remaining TUI gateway-event cases in `ui-tui/src/__tests__/createGatewayEventHandler.test.ts` without an explicit ledger retirement. Restored desktop paths in this entry match the pin and are not a second delta.
 - Tests: apps/desktop/electron/command-screenshot-monitor.test.ts, apps/desktop/electron/command-screenshot.test.ts, apps/desktop/electron/github-api-auth.test.ts, apps/desktop/src/app/chat/hooks/use-composer-actions.test.ts, apps/desktop/src/app/session/hooks/use-message-stream/gateway-event/server-requests.test.ts, apps/desktop/src/app/settings/toolset-config-panel.test.tsx, apps/desktop/src/components/assistant-ui/thread/response-group.test.tsx, apps/desktop/src/components/assistant-ui/thread/timeline-rail.test.tsx, apps/desktop/src/components/boot-failure-cause.test.ts, apps/desktop/src/components/onboarding/free-tier-setup-notice.test.tsx, apps/desktop/src/plugins/hermes-bots/bot-row.test.tsx, apps/desktop/src/plugins/hermes-bots/group-activity.test.ts, apps/desktop/src/plugins/hermes-bots/group-chat-view-members.test.ts, apps/desktop/src/plugins/hermes-bots/group-chat.test.ts, apps/desktop/src/plugins/hermes-bots/group-rounds.test.ts, apps/desktop/src/plugins/hermes-bots/relay.test.ts, apps/desktop/src/store/gateway-connection-lifecycle.test.ts, apps/desktop/src/store/gateway.test.ts, apps/desktop/src/store/hub-actions.blocked.test.ts, apps/desktop/src/store/suggestion-providers/mcp.test.ts, ui-tui/src/__tests__/createGatewayEventHandler.test.ts
-- Retirement-Condition: Upstream carries equivalent desktop/TUI behavior, or the extras are explicitly retired.
+- Retirement-Condition: Upstream carries the remaining TUI gateway-event cases, or those cases are explicitly retired.
 - Disposition: active
 
 ## G-CLI-STARTUP: process entrypoint helpers shared by desktop and CLI launch
@@ -423,16 +423,16 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self
-- Ledger-Revision: 36
+- Ledger-Revision: 37
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
-- Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465
+- Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - website/docs/developer-guide/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test. Revision 35 removes the retired update-workflow name from the fork-sync retirement condition. Revision 36 rejects a conflicted sync that keeps the wholesale fork file and accepts one that keeps upstream lines with fork insertions on top.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test. Revision 35 removes the retired update-workflow name from the fork-sync retirement condition. Revision 36 rejects a conflicted sync that keeps the wholesale fork file and accepts one that keeps upstream lines with fork insertions on top. Revision 37 retires the desktop entries whose current trees match upstream pin `547248908bf07e22dc21eec20fe416684f55a596`, because the stale fork copies broke `npm run build`. G-DESKTOP-UPDATE-20260921 stays active: `ui-tui/src/__tests__/createGatewayEventHandler.test.ts` still differs from that pin.
 - Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal. `Cross-Owner-Commits` maps a work commit only when every changed path already has one effective owner, at least two owners are involved, the commit does not change the ledger, and no entry has already claimed it.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
