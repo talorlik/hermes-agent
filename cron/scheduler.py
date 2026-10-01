@@ -4330,6 +4330,14 @@ def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
             "model" if axis == "model" else "model_provider")
     return snapshot
 
+_PLUGIN_COMPAT_LAZY = {
+    'BOT_CHAT_PLATFORM': ('cron.scheduler_delivery', 'BOT_CHAT_PLATFORM'),
+    'SharedRouteAdapters': ('cron.scheduler_preflight', 'SharedRouteAdapters'),
+    'cron_delivery_targets': ('cron.scheduler_delivery', 'cron_delivery_targets'),
+    'parse_bot_chat_deliver_token': ('cron.scheduler_delivery', 'parse_bot_chat_deliver_token'),
+}
+
+
 def __getattr__(name):  # PEP 562 — lazy so no import cycles
     target = _PLUGIN_COMPAT_LAZY.get(name)
     if target is None:
