@@ -4064,6 +4064,8 @@ export const ru = defineLocale({
       skipped: 'Пропущено',
       noAnswer: 'Нет ответа',
       confirmAndContinueLabel: 'Подтвердить и продолжить',
+      singleSelectHint: 'Выберите один',
+      multiSelectHint: 'Выберите все подходящие',
       questionProgress: (answered, total) => `Ответ дан на ${answered} из ${total}`,
       notDelivered:
         'Этот вопрос не дошёл до приложения, поэтому ответить здесь нельзя. Нажмите «Стоп», чтобы завершить ход, и ответьте в чате.'
