@@ -1122,3 +1122,135 @@ def test_cross_owner_commit_maps_only_when_no_single_owner_can_claim(tmp_path):
         for problem in entry["problems"]
     )
     assert "single effective owner" in problems
+
+
+def _conflict_drop_repo(tmp_path: Path, name: str) -> dict[str, str]:
+    """Fork merge that keeps the fork file, then upstream moves on."""
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'base'\n", "base")
+    _git(repo, "checkout", "-b", "fork-main")
+    custom = _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'fork'\nEXTRA = 'fork'\n",
+        "fork customization",
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'upstream'\n", "upstream change")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo,
+        env=_GIT_ENV,
+        capture_output=True,
+        text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream by keeping the fork file")
+    bad = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'upstream-now'\n", "upstream moves on")
+    _git(repo, "checkout", "fork-main")
+    return {"repo": str(repo), "custom": custom, "bad": bad}
+
+
+def test_repaired_conflict_merge_passes_only_when_tip_keeps_upstream_lines(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "repaired-conflict")
+    repo = Path(fx["repo"])
+    _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'upstream-now'\nEXTRA = 'fork'\n",
+        "restore upstream lines",
+    )
+    restored = _git(repo, "rev-parse", "HEAD")
+    body = (
+        _entry(
+            "G-SHARED",
+            "shared path",
+            commits=f"{fx['custom']}, {restored}",
+            owned_files=["shared.py"],
+        )
+        + (
+            "## G-FORK-LEDGER: fixture ledger\n"
+            "- Commits: self\n"
+            f"- Repaired-Conflict-Merges: {fx['bad']}\n"
+            "- Owned-Files:\n"
+            "  - docs/FORK_CHANGES.md\n"
+            "- Intent: Record a conflict merge only after the tip keeps upstream lines.\n"
+            "- Protected-Invariant: A listed merge stays a failure if the tip drops a line.\n"
+            "- Tests: tests/ci/test_check_fork_ledger.py\n"
+            "- Retirement-Condition: The fixture is gone.\n"
+            "- Disposition: active\n"
+        )
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert fx["bad"] in payload["repaired_conflict_merges"]
+    assert fx["bad"] not in {item["sha"] for item in payload["unmapped_commits"]}
+    assert fx["bad"] not in payload["sync_merges"]
+
+
+def test_repaired_conflict_merge_stays_unmapped_without_the_lines(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "unrepaired-conflict")
+    repo = Path(fx["repo"])
+    body = (
+        _entry(
+            "G-SHARED",
+            "shared path",
+            commits=fx["custom"],
+            owned_files=["shared.py"],
+        )
+        + (
+            "## G-FORK-LEDGER: fixture ledger\n"
+            "- Commits: self\n"
+            f"- Repaired-Conflict-Merges: {fx['bad']}\n"
+            "- Owned-Files:\n"
+            "  - docs/FORK_CHANGES.md\n"
+            "- Intent: Refuse a repair listing that did not restore upstream lines.\n"
+            "- Protected-Invariant: Listing the SHA is not a waiver.\n"
+            "- Tests: tests/ci/test_check_fork_ledger.py\n"
+            "- Retirement-Condition: The fixture is gone.\n"
+            "- Disposition: active\n"
+        )
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    assert fx["bad"] in {item["sha"] for item in payload["unmapped_commits"]}
+    problems = " ".join(
+        problem
+        for entry in payload["invalid_entries"]
+        for problem in entry["problems"]
+    )
+    assert "shared.py" in problems
+    assert "does not keep current upstream lines" in problems
+
+
+def test_restored_conflict_merge_stays_unmapped_when_unlisted(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "unlisted-repair")
+    repo = Path(fx["repo"])
+    _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'upstream-now'\nEXTRA = 'fork'\n",
+        "restore upstream lines",
+    )
+    restored = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(
+        repo,
+        _entry(
+            "G-SHARED",
+            "shared path",
+            commits=f"{fx['custom']}, {restored}",
+            owned_files=["shared.py"],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    assert fx["bad"] in {item["sha"] for item in payload["unmapped_commits"]}

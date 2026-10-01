@@ -38,6 +38,12 @@ Missing and ambiguous current paths fail closed. Precedence never invents an own
 already have effective owners, but more than one of them. It cannot map an
 unowned path, a single-owner commit, a ledger edit, or a commit another entry
 already claims.
+`Repaired-Conflict-Merges` on G-FORK-LEDGER maps a published conflict merge that
+dropped upstream lines only when the checked tip still keeps every current
+upstream line of each conflict path, in upstream order. Listing the SHA is not
+enough. A tip that drops a line leaves the commit unmapped and names the path.
+The SHA stays in `repaired_conflict_merges` so the old merge remains visible.
+
 A path may be declared once; a repeated row fails closed whether the winner
 is the same or conflicting, and is reported in invalid_precedence. The
 winner is the token after the last `: <ID>`, so colon and quoted paths stay
@@ -646,6 +652,181 @@ def _is_clean_upstream_sync(
         allowed.add(source)
 
     return changed <= allowed
+
+
+def _tree_entries(repo: Path, treeish: str) -> dict[str, tuple[str, str, str]]:
+    entries: dict[str, tuple[str, str, str]] = {}
+    raw = _git_bytes(repo, "ls-tree", "-r", "-z", treeish)
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, path = record.split(b"\t", 1)
+            mode, kind, oid = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise CheckerError("malformed git ls-tree output") from exc
+        entries[path.decode("utf-8", errors="surrogateescape")] = (
+            mode.decode("ascii"),
+            kind.decode("ascii"),
+            oid.decode("ascii"),
+        )
+    return entries
+
+
+def _merge_conflict_paths(repo: Path, first: str, upstream_parent: str) -> set[str]:
+    proc = _run_git(
+        repo,
+        "merge-tree",
+        "--write-tree",
+        "--messages",
+        "--name-only",
+        "-z",
+        first,
+        upstream_parent,
+    )
+    if proc.returncode not in {0, 1}:
+        detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise CheckerError(f"git merge-tree failed (exit {proc.returncode}): {detail}")
+    tree_section, _separator, _message = proc.stdout.partition(b"\0\0")
+    if proc.returncode == 0:
+        return set()
+    return {
+        raw.decode("utf-8", errors="surrogateescape")
+        for raw in tree_section.split(b"\0")[1:]
+        if raw
+    }
+
+
+def _tip_missing_upstream_lines(
+    repo: Path,
+    conflict_paths: set[str],
+    upstream_oid: str,
+    fork_oid: str,
+) -> list[str]:
+    """Paths whose current upstream lines are absent from the checked tip."""
+    upstream_entries = _tree_entries(repo, upstream_oid)
+    tip_entries = _tree_entries(repo, fork_oid)
+    missing: list[str] = []
+    for path in sorted(conflict_paths):
+        upstream = upstream_entries.get(path)
+        actual = tip_entries.get(path)
+        if upstream is None:
+            if actual is not None:
+                missing.append(path)
+            continue
+        # Pass the tip as the fork text so later fork insertions are allowed.
+        # Upstream lines must still occur in order. A missing upstream blob
+        # that the tip still carries is not a repair.
+        if not _conflict_fit_allowed(repo, actual, upstream, actual):
+            missing.append(path)
+    return missing
+
+
+def _classify_repaired_conflict_merges(
+    repo: Path,
+    entries: list[LedgerEntry],
+    upstream_oid: str,
+    fork_oid: str,
+    work_shas: set[str],
+    sync_set: set[str],
+) -> list[str]:
+    """Map a conflict merge only when the tip still keeps upstream lines.
+
+    The listing does not waive the commit. Verification uses the checked tip
+    and the current upstream ref, so a later drop of those lines fails closed.
+    """
+    declarers = [
+        entry for entry in entries if "Repaired-Conflict-Merges" in entry.fields
+    ]
+    for entry in declarers:
+        if entry.entry_id != "G-FORK-LEDGER":
+            entry.problems.append(
+                "Repaired-Conflict-Merges may be declared only by G-FORK-LEDGER"
+            )
+    ledger_entries = [
+        entry for entry in declarers if entry.entry_id == "G-FORK-LEDGER"
+    ]
+    if len(ledger_entries) != 1:
+        if len(ledger_entries) > 1:
+            for entry in ledger_entries:
+                entry.problems.append(
+                    "Repaired-Conflict-Merges requires one unique G-FORK-LEDGER entry"
+                )
+        return []
+    entry = ledger_entries[0]
+    tokens = [
+        token
+        for token in _SPEC_SPLIT.split(entry.fields["Repaired-Conflict-Merges"])
+        if token
+    ]
+    if not tokens:
+        entry.problems.append("Repaired-Conflict-Merges cannot be empty")
+        return []
+    repaired: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in seen:
+            entry.problems.append(
+                f"duplicate Repaired-Conflict-Merges declaration: {token}"
+            )
+            continue
+        seen.add(token)
+        if not _FULL_SHA.fullmatch(token):
+            entry.problems.append(
+                "Repaired-Conflict-Merges requires full 40-character object IDs: "
+                f"{token}"
+            )
+            continue
+        if token in sync_set:
+            entry.problems.append(
+                "Repaired-Conflict-Merges commit is already a clean upstream sync: "
+                f"{token}"
+            )
+            continue
+        if token not in work_shas:
+            entry.problems.append(
+                "Repaired-Conflict-Merges commit is outside evaluated work range: "
+                f"{token}"
+            )
+            continue
+        parents = _git(repo, "show", "-s", "--format=%P", token).split()
+        if len(parents) != 2:
+            entry.problems.append(
+                "Repaired-Conflict-Merges commit must have exactly two parents: "
+                f"{token}"
+            )
+            continue
+        first_parent, upstream_parent = parents
+        if not _is_ancestor(repo, upstream_parent, upstream_oid):
+            entry.problems.append(
+                "Repaired-Conflict-Merges upstream parent is not an ancestor of "
+                f"upstream: {token}"
+            )
+            continue
+        if _is_ancestor(repo, first_parent, upstream_oid):
+            entry.problems.append(
+                "Repaired-Conflict-Merges first parent must not be upstream: "
+                f"{token}"
+            )
+            continue
+        conflict_paths = _merge_conflict_paths(repo, first_parent, upstream_parent)
+        if not conflict_paths:
+            entry.problems.append(
+                "Repaired-Conflict-Merges commit is not a conflicted upstream merge: "
+                f"{token}"
+            )
+            continue
+        missing = _tip_missing_upstream_lines(
+            repo, conflict_paths, upstream_oid, fork_oid
+        )
+        if missing:
+            entry.problems.append(
+                f"Repaired-Conflict-Merges commit {token} does not keep current "
+                "upstream lines: " + ", ".join(missing)
+            )
+            continue
+        repaired.append(token)
+    return repaired
 
 
 
@@ -1550,6 +1731,12 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
     )
     sync_set = set(sync_merges)
     work_shas = {commit["sha"] for commit in work}
+    repaired = _classify_repaired_conflict_merges(
+        repo, entries, upstream_oid, fork_oid, work_shas, sync_set
+    )
+    repaired_set = set(repaired)
+    work = [commit for commit in work if commit["sha"] not in repaired_set]
+    work_shas -= repaired_set
     changed = fork_changed_paths(repo, upstream_oid, fork_oid)
     path_owners, unowned, ambiguous = _resolve_current_paths(
         changed, declared_owners, effective_owners
@@ -1662,9 +1849,10 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         "upstream_oid": upstream_oid,
         "fork_oid": fork_oid,
         "counts": {
-            "fork_only_commits": len(work_shas | sync_set | history_set),
+            "fork_only_commits": len(work_shas | sync_set | history_set | repaired_set),
             "work_commits": len(work),
             "sync_merges": len(sync_set),
+            "repaired_conflict_merges": len(repaired),
             "history_reconciliations": len(history_reconciliations),
             "retired_history_commits": len(history_set)
             - sum(
@@ -1687,11 +1875,13 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
         "invalid_precedence": invalid_precedence,
         "path_owners": path_owners,
         "sync_merges": sync_merges,
+        "repaired_conflict_merges": repaired,
         "history_reconciliations": history_reconciliations,
         "partition": {
             "work": sorted(work_shas),
             "sync": sorted(sync_set),
             "history": sorted(history_set),
+            "repaired": sorted(repaired_set),
         },
     }
 
