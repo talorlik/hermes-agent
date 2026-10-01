@@ -1516,7 +1516,8 @@ export const deOverrides = {
       fileReadMaxChars: 'Maximale Zeichenzahl, die Hermes aus einer Dateianfrage lesen kann.',
       approvals: {
         mode: 'Wie Hermes Befehle behandelt, die eine explizite Genehmigung benötigen.',
-        timeout: 'Wie lange Genehmigungsaufforderungen warten, bevor sie ablaufen.'
+        timeout:
+          'Wie lange Genehmigungsaufforderungen auf Messaging-Plattformen warten, bevor sie ablaufen. App und Terminal warten, bis du antwortest.'
       },
       security: {
         redactSecrets: 'Erkannte Geheimnisse nach Möglichkeit aus modellsichtbarem Inhalt ausblenden.'
@@ -5464,6 +5465,7 @@ export const deOverrides = {
       branchNewChat: 'In neuem Chat abzweigen',
       react: 'Reagieren',
       dismissError: 'Fehler schließen',
+      responseStopped: 'Antwort gestoppt',
       errorLayers: {
         auth: 'Authentifizierungsfehler',
         billing: 'Keine Credits mehr',

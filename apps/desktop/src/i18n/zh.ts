@@ -1212,7 +1212,7 @@ export const zh = defineLocale({
       fileReadMaxChars: 'Hermes 单次文件读取可读取的最大字符数。',
       approvals: {
         mode: 'Hermes 如何处理需要显式审批的命令。',
-        timeout: '审批提示在超时前等待的时长。'
+        timeout: '消息平台上的审批提示在超时前等待的时长。应用和终端会一直等到你回复。'
       },
       security: {
         redactSecrets: '尽可能从模型可见内容中隐藏检测到的密钥。'
@@ -4556,6 +4556,8 @@ export const zh = defineLocale({
 
   preview: {
     tab: '预览',
+    pin: '固定到工作区',
+    unpin: '从工作区取消固定',
     closePane: '关闭预览面板',
     loading: '正在加载预览',
     unavailable: '预览不可用',

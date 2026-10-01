@@ -1050,7 +1050,8 @@ export const ja = defineLocale({
       fileReadMaxChars: 'Hermes が 1 回のファイル読み取りで取得できる最大文字数です。',
       approvals: {
         mode: '明示的な承認が必要なコマンドを Hermes がどう扱うかを設定します。',
-        timeout: '承認プロンプトがタイムアウトするまで待つ時間です。'
+        timeout:
+          'メッセージングプラットフォームで承認プロンプトがタイムアウトするまで待つ時間です。アプリとターミナルは回答するまで待ちます。'
       },
       security: {
         redactSecrets: '検出したシークレットを、可能な限りモデルから見える内容から隠します。'
@@ -3582,6 +3583,8 @@ export const ja = defineLocale({
 
   preview: {
     tab: 'プレビュー',
+    pin: 'ワークスペースにピン留め',
+    unpin: 'ワークスペースからピン留めを外す',
     closePane: 'プレビューペインを閉じる',
     loading: 'プレビューを読み込み中',
     unavailable: 'プレビューは利用できません',
