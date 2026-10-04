@@ -88,6 +88,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    # Terminal intent + per-execution delivery evidence (cron.outbox writes these in the same
+    # transaction as the outbox row; record_delivery() for sends that bypass the outbox).
+    # ``outcome`` is stamped by the durable enqueue BEFORE the terminal write so a crash between
+    # "result produced" and finish_execution still leaves the run's intent queryable.
+    add_column_if_missing(conn, "executions", "outcome", "outcome TEXT")
+    add_column_if_missing(conn, "executions", "delivery_target", "delivery_target TEXT")
+    add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
+    add_column_if_missing(
+        conn, "executions", "delivery_attempts",
+        "delivery_attempts INTEGER NOT NULL DEFAULT 0",
+    )
+    add_column_if_missing(conn, "executions", "delivery_error", "delivery_error TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -294,10 +306,11 @@ def finish_execution(
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?, outcome=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, status, execution_id, _PROCESS_ID,
+             os.getpid()),
         )
         if cur.rowcount != 1:
             return None

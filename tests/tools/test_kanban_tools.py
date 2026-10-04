@@ -80,13 +80,6 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
-    """The model tool serves the versioned snapshot envelope but keeps the
-    established last-50 events cap at this consumer only; the raw
-    ``build_task_snapshot`` collection stays complete (full log via CLI)."""
-    # The raw versioned snapshot is complete -- the cap is not applied there.
-    assert payload["schema_version"] == kb.TASK_SNAPSHOT_SCHEMA_VERSION
-    # Model-tool consumer cap: exactly the LAST 50 events, same item shape,
-    # no truncation metadata (exact prior output contract).
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -596,7 +589,6 @@ def test_heartbeat_extends_claim_expires(worker_env):
 def _expire_claim(conn, tid):
     conn.execute("UPDATE tasks SET claim_expires = 1 WHERE id = ?", (tid,))
     conn.commit()
-        # Author defaults to HERMES_PROFILE env we set in the fixture
 
 
 def test_worker_the_dispatcher_never_recorded_keeps_its_claim_or_never_starts(monkeypatch, worker_env):
@@ -651,9 +643,6 @@ def test_reclaim_loses_to_a_worker_registering_mid_sweep(monkeypatch, worker_env
 
 def test_comment_rejects_caller_supplied_author(worker_env):
     """Reject an undeclared author override before a worker can forge a comment."""
-    under an authoritative-looking name like ``hermes-system`` and
-    poison the next worker's prompt context. Cross-task commenting
-    itself remains unrestricted (see #19713); only the author override
     from tools import kanban_tools as kt
     out = kt._handle_comment({
         "task_id": worker_env, "body": "hi", "author": "hermes-system",
@@ -664,7 +653,6 @@ def test_comment_rejects_caller_supplied_author(worker_env):
     conn = kbc.connect()
     try:
         assert kb.list_comments(conn, worker_env) == []
-        # Author comes from HERMES_PROFILE in the fixture, not the
         out = kt._handle_comment({"task_id": worker_env, "body": "hi"})
         assert json.loads(out)["ok"]
         assert kb.list_comments(conn, worker_env)[0].author == "test-worker"
@@ -873,14 +861,6 @@ def test_worker_lifecycle_through_tools(worker_env):
 # ---------------------------------------------------------------------------
 
 
-    """KANBAN_GUIDANCE is injected into every kanban-capable process's system
-    tax paid on every spawn. Bound it as an invariant, not a change-detector:
-    the ceiling (8000 chars, roughly 2000 tokens) leaves headroom above the
-    current ~6.2k chars for tight additions, while catching accidental bloat
-    (pasted docs, duplicated sections) before it ships to every worker.
-        f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
-    contract: decisions are made by the orchestrator before fan-out and
-    assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
@@ -1022,21 +1002,6 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Optional ``board`` parameter — per-call DB override
-# The dispatcher pins the active board via HERMES_KANBAN_BOARD env var,
-# but a Telegram-side orchestrator handling multiple boards needs to be
-# able to route a single tool call to a specific board's DB without
-# restarting Hermes. These tests pin that ``board=<slug>`` argument
-# routes each handler to that board's sqlite file, and that omitting
-# ``board`` preserves the legacy env-driven resolution.
-    Returns ``("default", "alt")`` slugs. The default board has one
-    pre-existing task ``seed_default``; ``alt`` has ``seed_alt``. No
-    # Make sure neither HERMES_KANBAN_DB nor HERMES_KANBAN_BOARD pin a
-    """When ``board`` is omitted or None, behaviour is unchanged from
-    before this feature — calls land on whatever the env resolves to.
-    Regression guard against accidentally rewiring default resolution."""
-    # Sanity: the env-resolved path is the legacy default DB, NOT an
-    # 'alt' board path. Confirms the override path was not silently
 # kanban_create auto-subscribe behaviour
 #
 # When a worker calls kanban_create from inside a session that has a
@@ -1220,9 +1185,6 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 # ---------------------------------------------------------------------------
 # Attachments — kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------
-    """Opt the SSRF guard into private/loopback targets for local fixtures.
-    Mirrors a user setting HERMES_ALLOW_PRIVATE_URLS on a private network.
-    Resets the url_safety process-lifetime cache on both sides so the
 
 
 def test_attach_url_rejects_non_http_scheme(worker_env):

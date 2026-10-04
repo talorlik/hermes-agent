@@ -1338,23 +1338,43 @@ def _reclaim_fds_best_effort() -> None:
 
 
 def drain_delivery_queue(adapters, loop) -> int:
-    """Send queued worker results through this gateway's live adapters."""
-    from cron.delivery_queue import _path, drain
+    """Send queued worker results and exact outbox rows through this gateway's live adapters.
 
-    # Only restart-safe workers create the queue file.  Every gateway (macOS,
-    # Windows, launchd, Docker) runs this housekeeping tick, so skip the sqlite
-    # open/create entirely until a worker has actually queued something.
-    if not _path().exists():
+    Exact rows live in ``cron/executions.db`` (``cron.outbox``) and admitted Bot Chat rows settle
+    from their receipts inside ``drain`` (``reconcile_admitted``), so this runs whenever either
+    durable store exists, not only after a restart-safe worker created ``deliveries.db``. Homes
+    that never fired a job skip the sqlite open/create entirely."""
+    from cron import delivery_queue as _queue
+    from cron.outbox import _db_path as _outbox_db_path
+
+    if not _queue._path().exists() and not _outbox_db_path().exists():
         return 0
-    return drain(
-        lambda queued_job, queued_content, queued_for_failure: _deliver_result(
+
+    def _send(queued_job, queued_content, queued_for_failure, **exact):
+        # ``exact`` = {destination, outbox_id} for exact rows; legacy rows re-resolve their route.
+        return _deliver_result(
             queued_job,
             queued_content,
             adapters=adapters,
             loop=loop,
             for_failure=queued_for_failure,
+            **exact,
         )
-    )
+
+    return _queue.drain(_send)
+
+
+def _replay_delivery_backlog(adapters, loop) -> None:
+    """Tick-time housekeeping: pending deliveries are retried BEFORE any new run is dispatched.
+    Faults are logged, never allowed to block dispatch; a shutdown (``BaseException``) propagates."""
+    try:
+        _retry_pending_deliveries(adapters, loop)
+    except Exception as exc:
+        logger.error("Delivery backlog replay failed: %s", exc, exc_info=True)
+    try:
+        drain_delivery_queue(adapters, loop)
+    except Exception as exc:
+        logger.error("Delivery queue drain failed: %s", exc, exc_info=True)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -2989,9 +3009,82 @@ class _RunDelivery:
     side_effect_ownership_lost: bool = False
 
 
+def _deliver_run_result(
+    job: dict, content: str, *, success: bool, error, execution_id: Optional[str], adapters, loop,
+) -> Optional[str]:
+    """Producer entry for one run's delivery (normal and crash-alert paths alike).
+
+    Resolves the concrete fanout ONCE, atomically persists every destination plus the execution's
+    terminal intent (``cron.outbox.enqueue_deliveries_with_intent``) under one projection
+    generation, then transports each row under that owned generation
+    (``_attempt_concrete_deliveries``). Nothing is sent when the durable intent cannot be written:
+    the content lands in the local fallback and the enqueue error is the delivery error. Jobs
+    without a resolvable target keep the legacy ``_deliver_result`` disposition (``local`` /
+    origin-less ``origin``)."""
+    from cron import outbox as _outbox
+
+    for_failure = not success
+    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    if not targets:
+        return _deliver_result(job, content, adapters=adapters, loop=loop, for_failure=for_failure)
+    # A restart-safe external worker owns no transport: it hands the send to the live gateway
+    # through the durable legacy queue (``enqueue_and_wait``), which the gateway's housekeeping
+    # drains with relay/E2EE parity. That handoff is already durable; moving worker-owned runs
+    # onto the exact outbox contract is a separate change.
+    external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
+    if (adapters is None and external_execution
+            and external_execution == str(job.get("execution_id") or "")):
+        return _deliver_result(job, content, adapters=None, loop=loop, for_failure=for_failure)
+    target_expr = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
+    try:
+        entries = _outbox.enqueue_deliveries_with_intent(
+            execution_id=execution_id,
+            job_id=job["id"],
+            target=target_expr,
+            destinations=targets,
+            content=content,
+            intent_success=success,
+            intent_error=str(error) if error else None,
+            job=job,
+        )
+    except Exception as exc:
+        logger.error("Job '%s': durable delivery intent could not be written: %s", job["id"], exc)
+        return _outbox.write_enqueue_failure_fallback(
+            execution_id=execution_id, job_id=job["id"], target=target_expr, content=content,
+            error=exc)
+    return _attempt_concrete_deliveries(
+        job, content, entries, targets, adapters=adapters, loop=loop, for_failure=for_failure)
+
+
+def _publish_run_projection_status(job: dict, execution_id: Optional[str]) -> None:
+    """After ``mark_job_run``, copy the status the store recorded onto this run's projection
+    generation. ``cron.jobs.get_job`` overlays a FINALIZED projection verbatim, and the outbox
+    settles rows (and may finalize the generation) BEFORE ``mark_job_run`` runs; without this
+    republish a settled in-run delivery would overlay the outbox's own vocabulary
+    (``completed``/``failed``) over the store's (``ok``/``error``/``delivery_queued``). The
+    owning invocation is authoritative for its own run; a late backlog settlement after the run
+    keeps correcting the store through the finalized projection. Never raises."""
+    revision = job.get("_delivery_projection_revision")
+    if not execution_id or revision is None:
+        return
+    try:
+        from cron import outbox
+        from cron.jobs import load_jobs
+
+        stored = next((j for j in load_jobs() if j["id"] == job["id"]), None)
+        if stored is None:
+            return
+        outbox.publish_job_delivery_projection_status(
+            job["id"], execution_id=str(execution_id), expected_revision=int(revision),
+            last_status=stored.get("last_status"),
+            last_delivery_error=stored.get("last_delivery_error"))
+    except Exception as exc:
+        logger.debug("Job '%s': could not publish run status to its projection: %s", job["id"], exc)
+
+
 def _save_compose_deliver(
     d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
-    adapters, loop, verbose: bool, execution_token,
+    adapters, loop, verbose: bool, execution_token, execution_id: Optional[str] = None,
 ) -> None:
     """Save output, compose the notice and deliver it (both side effects run under the fire-claim
     fence; a lost claim raises ``_FireClaimLostDuringSideEffect`` for the caller)."""
@@ -3056,14 +3149,16 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
-            d.delivery_error = _deliver_result(
+            # Failure summaries (and drift/blocked-config alerts composed into deliver_content on
+            # the failure path) honor the job's failure_deliver override (NS-788) via success=False.
+            d.delivery_error = _deliver_run_result(
                 job,
                 deliver_content,
+                success=d.success,
+                error=d.error,
+                execution_id=execution_id,
                 adapters=adapters,
                 loop=loop,
-                # Failure summaries (and drift/blocked-config alerts composed into deliver_content
-                # on the failure path) honor the job's failure_deliver override (NS-788).
-                for_failure=not d.success,
             )
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -3116,13 +3211,15 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
-    marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+    self_removed = self_removal_delivery_allowed(job["id"])
+    marked = self_removed or mark_job_run(job["id"], d.success, d.error, **mark_kwargs)
     if fire_owner is not None and not marked:
         finish_execution(
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    if marked and not self_removed:
+        _publish_run_projection_status(job, execution_id)
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -3143,9 +3240,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, execution_id: Optional[str] = None,
 ) -> tuple[Optional[str], str]:
-    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
+    """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome).
+    Same durable protocol as the normal path: intent + outbox row before the send."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
@@ -3153,14 +3251,16 @@ def _deliver_crash_failure(
         return None, "suppressed_acked"
     delivery_error = None
     try:
-        delivery_error = _deliver_result(
+        delivery_error = _deliver_run_result(
             job,
             # Same text as the normal failure delivery: this run also counts toward
             # failure_streak, so the nudge must leave through here too.
             _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            success=False,
+            error=err_text,
+            execution_id=execution_id,
             adapters=adapters,
             loop=loop,
-            for_failure=True,
         )
     except Exception as delivery_exc:
         delivery_error = str(delivery_exc)
@@ -3260,6 +3360,13 @@ def _run_one_job_body(
         if not external_owner and mark_execution_running(execution_id) is None:
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
             return True
+        # The delivery producer keys everything on the job's own execution id; the direct path
+        # above minted one without attaching it.
+        job.setdefault("execution_id", execution_id)
+        # This execution's delivery projection generation starts now (best-effort), so the settled
+        # projection of an OLDER execution never overlays this run, and the fanout re-stamps the
+        # token with the revision its atomic publication creates.
+        _admit_run_delivery_generation(job, execution_id)
 
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
         # resolve credentials, so the scope must span delivery too (reset in the outer finally).
@@ -3337,7 +3444,7 @@ def _run_one_job_body(
         try:
             _save_compose_deliver(
                 d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
-                execution_token=execution_token)
+                execution_token=execution_token, execution_id=execution_id)
         except _FireClaimLostDuringSideEffect:
             d.side_effect_ownership_lost = True
         finally:
@@ -3409,7 +3516,7 @@ def _run_one_job_body(
             and not _fire_claim_ownership_lost()
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
-                job, _err_text, adapters=adapters, loop=loop)
+                job, _err_text, adapters=adapters, loop=loop, execution_id=execution_id)
         try:
             if (
                 not _consume_interrupted_flag(job["id"], execution_token)
@@ -3420,7 +3527,8 @@ def _run_one_job_body(
                     mark_kwargs["expected_fire_owner"] = fire_owner
                 if isinstance(e, Exception):
                     mark_kwargs["delivery_error"] = delivery_error
-                mark_job_run(job["id"], False, _err_text, **mark_kwargs)
+                if mark_job_run(job["id"], False, _err_text, **mark_kwargs):
+                    _publish_run_projection_status(job, execution_id)
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error("Failed to record interrupted run for job %s: %s", job["id"], record_err)
@@ -4295,6 +4403,11 @@ from cron.scheduler_tick import tick  # noqa: E402
 from cron.scheduler_delivery import (  # noqa: E402
     _deliver_result, _delivery_lane_value, _normalize_deliver_value, _resolve_delivery_target,
     _resolve_delivery_targets,
+)
+from cron.scheduler_delivery_run import (  # noqa: E402
+    admit_run_delivery_generation as _admit_run_delivery_generation,
+    attempt_concrete_deliveries as _attempt_concrete_deliveries,
+    retry_pending_deliveries as _retry_pending_deliveries,
 )
 from cron.scheduler_script import (  # noqa: E402
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,

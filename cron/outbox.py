@@ -472,7 +472,7 @@ def configure_exact_delivery(
                    SET job_json=?, generation=generation+1, updated_at=?
                    WHERE id=? AND exact_state IN ('READY','RETRYABLE_FAILED')""",
                 (
-                    json.dumps(job, ensure_ascii=False, sort_keys=True),
+                    json.dumps(job, ensure_ascii=False, sort_keys=True, default=str),
                     _hermes_now().isoformat(),
                     str(outbox_id),
                 ),
@@ -622,10 +622,13 @@ def _finalize_projection_if_settled_in(
         if failures
         else ("failed" if bool(row["for_failure"]) else "completed")
     )
+    # Settling finalizes the generation WITHOUT rotating its revision: the owning invocation
+    # publishes its aggregate (``update_job`` CAS on this same token, see
+    # ``scheduler_delivery._record_delivery_verification``) after the last row settles, and late
+    # callbacks carry this token too. Only a new generation (``begin``) retires it.
     conn.execute(
         """UPDATE cron_job_delivery_projection
-           SET last_status=?, last_delivery_error=?, finalized=1,
-               revision=revision+1, updated_at=?
+           SET last_status=?, last_delivery_error=?, finalized=1, updated_at=?
            WHERE job_id=? AND execution_id=? AND revision=? AND finalized=0""",
         (
             job_status,
@@ -1221,6 +1224,40 @@ def get_job_delivery_projection(job_id: str) -> Optional[Dict[str, Any]]:
     return result
 
 
+def publish_job_delivery_projection_status(
+    job_id: str,
+    *,
+    execution_id: str,
+    expected_revision: int,
+    last_status: Optional[str],
+    last_delivery_error: Optional[str],
+) -> bool:
+    """The owning run publishes the status it recorded in the job store onto its own projection
+    generation (finalized or not), without rotating the revision.
+
+    Settlement (``_finalize_projection_if_settled_in``) can finalize a generation while the run
+    that admitted it is still alive and about to write ``jobs.json``; the read-side overlay in
+    ``cron.jobs.get_job`` must then show what that run recorded, not the outbox's own status
+    vocabulary. A generation that has since been retired (``begin`` for a newer execution) is left
+    alone: the CAS fails and nothing is written.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE cron_job_delivery_projection
+               SET last_status=?, last_delivery_error=?, updated_at=?
+               WHERE job_id=? AND execution_id=? AND revision=?""",
+            (
+                last_status,
+                _sanitize_error(last_delivery_error),
+                _hermes_now().isoformat(),
+                str(job_id),
+                str(execution_id),
+                int(expected_revision),
+            ),
+        )
+    return cur.rowcount == 1
+
+
 def finalize_job_delivery_projection(
     job_id: str,
     *,
@@ -1292,7 +1329,6 @@ def enqueue_deliveries_with_intent(
     queued_job.setdefault("id", str(job_id))
     if execution_id is not None:
         queued_job.setdefault("execution_id", str(execution_id))
-    job_json = json.dumps(queued_job, ensure_ascii=False, sort_keys=True)
 
     def existing_publication(
         conn: sqlite3.Connection,
@@ -1342,6 +1378,12 @@ def enqueue_deliveries_with_intent(
                     "revision"
                 ]
             )
+            # The durable snapshot carries the generation it was admitted under, so a late
+            # replay/callback publishes with the ORIGINAL token (and is rejected once rotated).
+            queued_job["_delivery_projection_revision"] = projection_revision
+        # ``default=str``: the live job record may carry non-JSON scalars (datetimes from a
+        # provider payload); the snapshot must never make the durable enqueue fail.
+        job_json = json.dumps(queued_job, ensure_ascii=False, sort_keys=True, default=str)
         for outbox_id, destination_json in pending:
             destination_hash = hashlib.sha256(destination_json.encode()).hexdigest()
             conn.execute(

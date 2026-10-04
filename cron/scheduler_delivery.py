@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from cron.scheduler_delivery_run import DestinationDeliveryOutcome, _begin_delivery_run  # noqa: F401
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -1050,6 +1051,10 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
             target = _resolve_single_delivery_target(job, part, from_broadcast=from_broadcast)
             if not target:
                 continue
+            # Integer and string spellings of one thread are one canonical destination; the
+            # durable exact contract (cron.outbox) only accepts string thread ids.
+            if target.get("thread_id") is not None:
+                target["thread_id"] = str(target["thread_id"])
             key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
             kept = seen.get(key)
             if kept is None:
@@ -1234,7 +1239,24 @@ def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
 def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
     """Persist ``last_delivery_unverified``: list of ``platform:chat_id`` targets acked with no
     evidence, or None, alongside queued Bot Chat receipts. Never raises (bookkeeping must not fail a
-    delivery)."""
+    delivery).
+
+    Generation ownership: the CAS tokens handed to ``update_job`` are the ones THIS invocation
+    carries on its own job record: ``job["execution_id"]`` (attached by claim_fire/run_one_job)
+    and ``job["_delivery_projection_revision"]`` (the revision the producer that began this run's
+    projection generation handed to the invocation; see ``cron.scheduler_delivery_run``). The
+    newest projection row is never consulted here: borrowing its execution/revision would relabel
+    a stale callback as the current generation and defeat the CAS.
+
+    An owned execution id WITHOUT an owned revision is a partial token and refuses the store
+    write. Execution identity alone is not a generation: one execution can begin several
+    projection generations (re-admission, a retried fanout), so reading the projection and
+    adopting its revision because the execution id matches would relabel a stale callback as
+    the newest same-execution generation and defeat the CAS. No execution-only CAS, no borrowed
+    identity. The in-memory job still reflects the outcome so the run's own classification
+    (``_finish_completed_run``) sees it. A job dict with NO execution id is a token-free caller
+    (direct helpers, legacy replays) and takes the plain update.
+    """
     new_value = list(unverified_targets) or None
     queued = {target: receipt for target, receipt in
               job.get("_bot_chat_delivery_receipts", {}).items()
@@ -1245,18 +1267,25 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
     if not values:
         return
     job.update(values)
+    cas = {}
+    execution_id = job.get("execution_id")
+    if execution_id:
+        owned_revision = job.get("_delivery_projection_revision")
+        if owned_revision is None:
+            logger.warning(
+                "Job '%s': delivery verification for execution %s not recorded: the invocation "
+                "owns no projection revision token, and an execution id alone does not identify "
+                "a projection generation, so the delivery projection cannot be written safely",
+                job.get("id"), execution_id)
+            return
+        cas["expected_execution_id"] = str(execution_id)
+        cas["expected_projection_revision"] = int(owned_revision)
     try:
         from cron.jobs import update_job
-        from cron.outbox import get_job_delivery_projection
-        projection = get_job_delivery_projection(job["id"]) or {}
-        cas = {}
-        execution_id = job.get("execution_id") or projection.get("execution_id")
-        if execution_id:
-            cas["expected_execution_id"] = execution_id
-        revision = projection.get("revision")
-        if revision is not None:
-            cas["expected_projection_revision"] = revision
-        update_job(job["id"], values, **cas)
+        if update_job(job["id"], values, **cas) is None and cas:
+            logger.debug(
+                "Job '%s': delivery verification not recorded; projection generation for "
+                "execution %s is no longer owned", job.get("id"), execution_id)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Job '%s': could not record delivery verification: %s", job.get("id"), exc)
 
@@ -1859,40 +1888,78 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 
 
 def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False,
+    destination: Optional[dict] = None, outbox_id: Optional[str] = None, delivery_run=None,
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error.
+
+    ``destination``/``outbox_id`` name ONE durable concrete target the outbox published (exact
+    contract): the route is never re-resolved, so later routing edits cannot redirect a replay.
+    ``delivery_run`` is the owning invocation's aggregate (``DeliveryRun``): the outcome is recorded
+    there instead of written directly, so the run publishes once under the generation it admitted.
+    Without a run, the recorder writes with the tokens THIS job dict carries (a queued snapshot
+    keeps its original generation; a token-free legacy caller takes the plain update)."""
+    if delivery_run is not None and str(delivery_run.job_id) != str(job.get("id")):
+        raise ValueError(
+            f"delivery run belongs to job {delivery_run.job_id!r}, not {job.get('id')!r}")
+    if (destination is None) != (outbox_id is None):
+        raise ValueError("exact delivery requires both its concrete destination and outbox id")
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    if destination is not None:
+        targets = [dict(destination)]
+    else:
+        targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
+
+    def _conclude(error: Optional[str], *, status: str, unverified=()) -> Optional[str]:
+        if delivery_run is None:
+            _record_delivery_verification(job, list(unverified))
+        else:
+            delivery_run.record(DestinationDeliveryOutcome(
+                delivery_id=outbox_id, target=dict(destination or {}), status=status,
+                bot_chat_receipts=tuple(
+                    (key, dict(receipt))
+                    for key, receipt in (job.get("_bot_chat_delivery_receipts") or {}).items()),
+                unverified_targets=tuple(unverified), error=error))
+        return error
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
-    # and that nested delivery must not be keyed under the outer execution id.
+    # and that nested delivery must not be keyed under the outer execution id. An exact row hands
+    # over its concrete destination + outbox id so the gateway replays it, never a re-resolved route.
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
     if (external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
             and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
         from cron.delivery_queue import enqueue_and_wait
 
-        _record_delivery_verification(job, [])
-        error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
+        if delivery_run is None:
+            _record_delivery_verification(job, [])
+        # Exact kwargs ride only with an exact row; the legacy handoff keeps its bare signature.
+        exact_kwargs = (
+            {"destination": destination, "outbox_id": outbox_id} if outbox_id is not None else {})
+        error = enqueue_and_wait(
+            external_execution, job, content, for_failure=for_failure, **exact_kwargs)
         from cron.delivery_queue import get_status
-        delivery_status = get_status(external_execution)
-        if delivery_status and delivery_status["status"] == "suppressed":
+        delivery_status = get_status(external_execution, outbox_id=outbox_id)
+        # A durable "suppressed" disposition is a settled non-send (warning policy), not an error
+        # and not a delivery: the gateway sent nothing and the row says so.
+        suppressed = bool(delivery_status and delivery_status["status"] == "suppressed")
+        if suppressed:
             job["_notification_all_targets_suppressed"] = True
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
-        return error
+        return _conclude(
+            error, status="failed" if error else ("suppressed" if suppressed else "queued"))
 
     from gateway.config import load_gateway_config
 
@@ -1991,6 +2058,17 @@ def _deliver_result(
             mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
         if t is None:
             continue
+        if outbox_id is not None and t.opened_thread_id:
+            # Exact contract: a continuation thread opened for this destination becomes the row's
+            # canonical durable destination BEFORE any send (the queue owner applies the update and
+            # re-admits the row), so a crash between open and send cannot open a second thread on
+            # retry. This attempt sends nothing.
+            job.setdefault("_exact_thread_updates", {})[str(outbox_id)] = str(t.opened_thread_id)
+            msg = (f"continuation thread {t.opened_thread_id} opened for {t.where}; canonical "
+                   "destination updated, delivery re-queued")
+            logger.info("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
         target_errors: list = []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
             t, cleaned_delivery_content, media_files,
@@ -2003,12 +2081,25 @@ def _deliver_result(
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.
-    if suppressed_targets == len(targets):
+    all_suppressed = suppressed_targets == len(targets)
+    if all_suppressed:
         job["_notification_all_targets_suppressed"] = True
     else:
         delivery_errors.extend(policy_drop_errors)
-    _record_delivery_verification(job, unverified_targets)
-    return "; ".join(delivery_errors) if delivery_errors else None
+    error = "; ".join(delivery_errors) if delivery_errors else None
+    rerouted = outbox_id is not None and str(outbox_id) in (job.get("_exact_thread_updates") or {})
+    receipts = job.get("_bot_chat_delivery_receipts") or {}
+    if all_suppressed:
+        status = "suppressed"
+    elif rerouted:
+        status = "rerouted"
+    elif error:
+        status = "failed"
+    elif any(r.get("status") in ("queued", "claimed") for r in receipts.values()):
+        status = "queued"
+    else:
+        status = "delivered"
+    return _conclude(error, status=status, unverified=unverified_targets)
 
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully

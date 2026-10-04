@@ -216,13 +216,6 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
-    """Author name stored on comments and events: the active profile, else the OS user."""
-    return current_profile_name() or os.environ.get("USER") or os.environ.get("USERNAME") or "worker"
-    """Bind this process as the dispatcher-spawned worker for ``HERMES_KANBAN_TASK``.
-    Returns False when a newer run already owns the task, so the caller can exit
-    without writing into a reclaimed card. Delegated children must not register:
-    the dispatcher owns the claim.
-    from hermes_cli.kanban_db_dispatch import adopt_worker_pid
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
     session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
@@ -621,7 +614,6 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
     # Advance past everything read (including our own notes) so nothing is re-injected.
     _comment_watermark[tid] = max(c.id for c in rows)
-    own = (os.environ.get("HERMES_PROFILE") or "").strip()
     # Same resolution the write side used, so a worker skips its OWN comments even
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
@@ -934,7 +926,6 @@ def _handle_comment(args: dict, **kw) -> str:
     # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))

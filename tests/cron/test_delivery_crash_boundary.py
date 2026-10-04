@@ -665,6 +665,102 @@ def test_stale_delivery_without_projection_revision_cannot_write_job_fields(
     assert writes == []
 
 
+def test_revisionless_callback_cannot_adopt_newer_same_execution_generation(
+    exact_env, monkeypatch
+):
+    """Execution identity alone is not a generation.
+
+    One execution can begin several projection generations (a re-admitted run, a retried
+    fanout). A callback that carries the execution id but no admitted revision must not read
+    the projection and adopt the newest same-execution revision: that relabels the stale
+    callback as the current generation and defeats the CAS.
+    """
+    from cron import scheduler_delivery as delivery
+
+    _, _, _, outbox = exact_env
+    first = outbox.begin_job_delivery_projection("job-gen", "exec-same")
+    newer = outbox.begin_job_delivery_projection("job-gen", "exec-same")
+    assert newer["revision"] > first["revision"]
+    before = outbox.get_job_delivery_projection("job-gen")
+    writes = []
+    monkeypatch.setattr(
+        "cron.jobs.update_job",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    callback_job = {"id": "job-gen", "execution_id": "exec-same"}
+    run = delivery._begin_delivery_run(callback_job)
+    run.record(
+        delivery.DestinationDeliveryOutcome(
+            "delivery-revisionless",
+            {"platform": "telegram", "chat_id": "chat"},
+            "delivered",
+            unverified_targets=("telegram:chat",),
+        )
+    )
+    run.finalize()
+
+    assert writes == []
+    assert "_delivery_projection_revision" not in callback_job
+    assert outbox.get_job_delivery_projection("job-gen") == before
+
+
+def test_run_finalize_uses_captured_generation_after_job_readmission(
+    exact_env, monkeypatch
+):
+    """A run finalizes under the generation it was opened with, never the job's newest token.
+
+    The shared job dict can be re-admitted (new execution id and revision) while a run that
+    recorded outcomes under the previous generation is still open. Finalization must not publish
+    the old outcome under the newer token: it either submits the captured identity or rejects
+    the mutation outright.
+    """
+    from cron import scheduler_delivery as delivery
+
+    _, _, _, outbox = exact_env
+    first = outbox.begin_job_delivery_projection("job-readmit", "exec-1")
+    job = {
+        "id": "job-readmit",
+        "execution_id": "exec-1",
+        "_delivery_projection_revision": first["revision"],
+    }
+    writes = []
+    monkeypatch.setattr(
+        "cron.jobs.update_job",
+        lambda *args, **kwargs: writes.append((args, kwargs)),
+    )
+
+    run = delivery._begin_delivery_run(job)
+    run.record(
+        delivery.DestinationDeliveryOutcome(
+            "delivery-old",
+            {"platform": "telegram", "chat_id": "chat"},
+            "delivered",
+            bot_chat_receipts=(("telegram:chat", {"status": "queued"}),),
+            unverified_targets=("telegram:chat",),
+        )
+    )
+    newer = outbox.begin_job_delivery_projection("job-readmit", "exec-2")
+    job["execution_id"] = "exec-2"
+    job["_delivery_projection_revision"] = newer["revision"]
+
+    summary = run.finalize()
+
+    assert run.finalized
+    assert summary["execution_id"] == "exec-1"
+    assert summary["projection_revision"] == first["revision"]
+    for _args, kwargs in writes:
+        assert kwargs.get("expected_execution_id") == "exec-1"
+        assert kwargs.get("expected_projection_revision") == first["revision"]
+    # The re-admitted record never inherits the superseded run's outcome.
+    assert "last_delivery_unverified" not in job
+    assert "last_delivery_queued" not in job
+    assert "_bot_chat_delivery_receipts" not in job
+    assert job["execution_id"] == "exec-2"
+    assert job["_delivery_projection_revision"] == newer["revision"]
+    assert run.finalize() is None
+
+
 def test_run_projection_finalizes_once_and_stale_execution_cas_fails(
     exact_env, monkeypatch
 ):
