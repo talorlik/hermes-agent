@@ -420,6 +420,63 @@ class UpstreamSyncOutcome:
     def changed(self) -> bool:
         return self.proof_complete and self.pre_sha != self.post_sha
 
+    @property
+    def locally_integrated(self) -> bool:
+        """Validated upstream code is in place; only the fork publication is unproven.
+
+        The typed form of the Boolean wrapper's "True after a local sync whose push
+        failed": the candidate passed validation before any push and the checkout is
+        proven clean. HEAD need not have moved: a run that follows an unpushed sync
+        re-validates the same commit and fails the same push. A fork the user cannot
+        push to must not fail the update.
+        """
+        return (
+            self.local_integration_completed
+            and self.proof_complete
+            and self.status in {"updated", "failed"}
+        )
+
+    @property
+    def upstream_checked(self) -> bool:
+        return self.status != "not_checked"
+
+    @property
+    def nothing_attempted(self) -> bool:
+        """Declined, or no upstream remote: no mutating command ran.
+
+        There is then no checkout change to prove, so this holds without
+        ``proof_complete``. ``_finish_sync_outcome`` turns any contradicted
+        not-checked result into ``failed``, which keeps this fail-closed. Only the
+        observed sync may report ``not_checked``: it returns before its first mutating
+        command. A Boolean answer cannot, because False is also what a rejected and
+        rolled-back candidate returns.
+        """
+        return self.status == "not_checked" and not self.error
+
+    @property
+    def repair(self) -> dict[str, str | None]:
+        """Structured next step for an outcome the updater refuses; empty when it proceeds.
+
+        ``retry_update``: the candidate was rolled back and the checkout is proven at
+        ``expected_head``. ``verify_checkout_then_retry``: the effect of the sync is
+        unproven, so HEAD must be compared with ``recovery_ref`` before anything else.
+        ``restore_recovery_ref``: the checkout is known not to be restored.
+        """
+        if self.safe_to_continue or self.nothing_attempted or self.locally_integrated:
+            return {}
+        if self.safe_to_restore:
+            action = "retry_update"
+        elif self.status == "outcome_unknown":
+            action = "verify_checkout_then_retry"
+        else:
+            action = "restore_recovery_ref"
+        return {
+            "action": action,
+            "recovery_ref": self.recovery_ref,
+            "expected_head": self.pre_sha,
+            "observed_head": self.post_sha,
+        }
+
 def _capture_checkout_proof(
     git_cmd: list[str], cwd: Path
 ) -> tuple[bool | None, str, str]:
@@ -694,12 +751,90 @@ def _run_fork_sync_tests(cwd: Path) -> tuple[bool, str]:
         return True, ""
     return False, _subprocess_detail(result)
 
+@dataclass(frozen=True)
+class CheckoutIdentity:
+    """The ref HEAD names (literal ``HEAD`` when detached) and the commit it resolves to."""
+
+    ref: str
+    head: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.ref} at {self.head[:10]}"
+
+@dataclass(frozen=True)
+class CandidateRollback:
+    """What a rollback did: ``rolled_back``, ``reset_failed``, or ``refused`` (no command ran)."""
+
+    state: str
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.state == "rolled_back"
+
+    @property
+    def error(self) -> str:
+        if self.state == "refused":
+            return f"rollback refused: {self.detail}"
+        return "" if self.ok else "rollback reset failed"
+
+def _capture_checkout_identity(
+    git_cmd: list[str], cwd: Path
+) -> CheckoutIdentity | None:
+    """Read the checked-out ref and commit; None when either cannot be proven."""
+    from hermes_cli.update_cmd import _git_run
+
+    try:
+        ref = _git_run(git_cmd, ["rev-parse", "--symbolic-full-name", "HEAD"], cwd)
+        head = _git_run(git_cmd, ["rev-parse", "--verify", "HEAD^{commit}"], cwd)
+    except OSError:
+        return None
+    if ref.returncode != 0 or head.returncode != 0:
+        return None
+    ref_name, head_sha = ref.stdout.strip(), head.stdout.strip()
+    if ref_name != "HEAD" and not ref_name.startswith("refs/heads/"):
+        return None
+    if _FULL_SHA_RE.fullmatch(head_sha) is None:
+        return None
+    return CheckoutIdentity(ref=ref_name, head=head_sha)
+
 def _rollback_fork_sync_candidate(
-    git_cmd: list[str], cwd: Path, rollback_ref: str
-) -> bool:
-    """Reset a failed upstream candidate and report whether rollback succeeded."""
+    git_cmd: list[str],
+    cwd: Path,
+    rollback_ref: str,
+    *,
+    expected: CheckoutIdentity | None,
+    abort_merge: bool = False,
+) -> CandidateRollback:
+    """Reset a failed upstream candidate, but only on the checkout the sync itself left.
+
+    ``reset --hard`` and ``merge --abort`` act on whatever is checked out. *expected* is the
+    identity the sync observed; it has no default, and an unknown or different checkout is
+    refused before any command runs, so a branch switched in meanwhile (a hook, another
+    process) is never reset. The check and the reset are separate Git calls: this narrows
+    the window to one spawn, it cannot close it.
+    """
     from hermes_cli.update_cmd import _no_prompt_git_kwargs
 
+    observed = _capture_checkout_identity(git_cmd, cwd)
+    if expected is None or observed != expected:
+        detail = (
+            f"expected {expected.label if expected else 'a checkout this sync could not identify'}, "
+            f"observed {observed.label if observed else 'an unidentifiable checkout'}"
+        )
+        print(f"  ✗ Rollback not attempted: the checkout is not the one this sync left ({detail}).")
+        print(f"    Nothing was reset. The pre-sync commit is {rollback_ref[:10]}.")
+        return CandidateRollback("refused", detail)
+    if abort_merge:
+        with suppress(OSError):
+            subprocess.run(
+                git_cmd + ["merge", "--abort"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+                **_no_prompt_git_kwargs(),
+            )
     try:
         rollback_result = subprocess.run(
             git_cmd + ["reset", "--hard", rollback_ref],
@@ -712,17 +847,17 @@ def _rollback_fork_sync_candidate(
         )
     except OSError as exc:
         print(f"  ✗ Rollback could not start: {exc}")
-        return False
+        return CandidateRollback("reset_failed", str(exc))
     if rollback_result.returncode == 0:
         print(
             f"  ✓ Rolled back to {rollback_ref[:10]} - nothing was pushed to your fork."
         )
-        return True
+        return CandidateRollback("rolled_back")
     print("  ✗ Rollback failed. Recover manually with:")
     print(f"    cd {cwd} && git reset --hard {rollback_ref}")
     if rollback_result.stderr.strip():
         print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
-    return False
+    return CandidateRollback("reset_failed", rollback_result.stderr.strip())
 
 def _validate_fork_sync_candidate(
     git_cmd: list[str],
@@ -730,22 +865,42 @@ def _validate_fork_sync_candidate(
     rollback_ref: str,
     *,
     rollback_on_failure: bool = True,
+    candidate_label: str = "Merged",
 ) -> bool:
-    """Validate merged upstream code and roll it back on any owned failure."""
+    """Validate merged upstream code and roll it back on any owned failure.
+
+    *candidate_label* names how the candidate arrived ("Merged" or "Pulled") so the
+    report matches the operation the user saw.
+    """
     from hermes_cli.update_cmd import _validate_critical_files_syntax
+
+    # Pinned before validation runs anything: the audit and the tests execute candidate code
+    # and hooks, and the rollback must not reset a checkout they switched in.
+    expected = _capture_checkout_identity(git_cmd, cwd) if rollback_on_failure else None
 
     def fail() -> bool:
         if rollback_on_failure:
-            _rollback_fork_sync_candidate(git_cmd, cwd, rollback_ref)
+            _rollback_fork_sync_candidate(git_cmd, cwd, rollback_ref, expected=expected)
         return False
 
     syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(cwd)
     if not syntax_ok:
-        print("\n  ✗ Merged code has a syntax error in a critical file:")
+        print(f"\n  ✗ {candidate_label} code has a syntax error in a critical file:")
         print(f"    {failing_path}")
         if syntax_error:
             for line in str(syntax_error).splitlines()[:6]:
                 print(f"      {line}")
+        return fail()
+
+    # Runs before the fork is pushed: merge damage outside the 9 critical files (scheduler,
+    # worker tools) must be rejected here, not discovered after publication.
+    from hermes_cli.update_cmd_integrity import failure_lines
+
+    findings = failure_lines(cwd, strict=True)  # pre-publication: dependencies are installed
+    if findings is not None:
+        print(f"\n  ✗ {candidate_label} code failed the tree integrity audit (syntax error or broken import):")
+        for line in findings[:12]:
+            print(f"    {line}")
         return fail()
 
     print("→ Running targeted updater tests before syncing the fork...")
@@ -907,18 +1062,38 @@ def _sync_with_upstream_observed_impl(
             local_integration_completed=local_integration_completed,
         )
 
-    if not isinstance(pre_sha, str) or _FULL_SHA_RE.fullmatch(pre_sha) is None:
-        print("  ✗ Could not capture the pre-sync HEAD. Upstream sync failed.")
-        return finish("failed", "missing or invalid pre-sync HEAD SHA")
-    if clean_before is not True or operation_before != "none":
-        return finish("failed", "pre-sync checkout is not clean and operation-free")
+    sha_captured = isinstance(pre_sha, str) and _FULL_SHA_RE.fullmatch(pre_sha) is not None
+    preflight_error = ""
+    if not sha_captured:
+        preflight_error = "missing or invalid pre-sync HEAD SHA"
+    elif clean_before is not True or operation_before != "none":
+        preflight_error = "pre-sync checkout is not clean and operation-free"
+
+    def declined() -> UpstreamSyncOutcome:
+        # No upstream remote and none wanted: no mutating command ran, so a checkout
+        # that cannot be proven is not this sync's failure to report. The Boolean
+        # wrapper has always answered "not checked" here without observing anything.
+        if not preflight_error:
+            return finish("not_checked")
+        return UpstreamSyncOutcome(
+            phase=phase,
+            status="not_checked",
+            pre_sha=pre_sha,
+            post_sha=pre_sha,
+            clean=clean_before,
+            operation_state=operation_before,
+            recovery_ref=_safe_recovery_ref(pre_sha),
+            error="",
+        )
+
+    # A passing preflight keeps the historical command order (proof, then remote probe).
     if not _upstream_available:
         remote = _observe_upstream_remote(git_cmd, cwd)
         if remote.state == "failed":
             return finish("failed", f"upstream remote probe failed: {remote.detail}")
         if remote.state == "absent":
             if _should_skip_upstream_prompt():
-                return finish("not_checked")
+                return declined()
             remote_outcome, remote_error = _offer_upstream_remote_observed(
                 git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn
             )
@@ -927,7 +1102,11 @@ def _sync_with_upstream_observed_impl(
                     "failed", f"upstream remote creation failed: {remote_error}"
                 )
             if remote_outcome != "available":
-                return finish("not_checked")
+                return declined()
+    if preflight_error:
+        if not sha_captured:
+            print("  ✗ Could not capture the pre-sync HEAD. Upstream sync failed.")
+        return finish("failed", preflight_error)
 
     print("\n→ Fetching upstream...")
     try:
@@ -962,6 +1141,16 @@ def _sync_with_upstream_observed_impl(
     if upstream_ahead == 0:
         print("  ✓ Fork is up to date with upstream")
         return finish("noop")
+
+    # merge, pull and the rollback's reset all act on whatever is checked out. Pin the ref and
+    # commit before the first mutation so a rollback can prove it is still this checkout.
+    sync_identity = _capture_checkout_identity(git_cmd, cwd)
+    if sync_identity is None or sync_identity.head != pre_sha:
+        print("  ✗ Could not prove which checkout this sync owns. Upstream sync failed.")
+        return finish(
+            "failed",
+            "checkout identity is unknown or moved before the sync changed anything",
+        )
 
     sync_tag = f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     recovery_ref = f"refs/tags/{sync_tag}"
@@ -1005,31 +1194,29 @@ def _sync_with_upstream_observed_impl(
                 **_no_prompt_git_kwargs(),
             )
         except OSError as exc:
-            rollback_ok = _rollback_fork_sync_candidate(git_cmd, cwd, pre_sha)
-            status = "failed" if rollback_ok else "rollback_failed"
+            rollback = _rollback_fork_sync_candidate(
+                git_cmd, cwd, pre_sha, expected=sync_identity
+            )
+            status = "failed" if rollback.ok else "rollback_failed"
             error = f"upstream merge failed: {exc}"
-            if not rollback_ok:
-                error += "; rollback reset failed"
+            if not rollback.ok:
+                error += f"; {rollback.error}"
             return finish(status, error, recovery_ref)
         if merge_result.returncode != 0:
-            with suppress(OSError):
-                subprocess.run(
-                    git_cmd + ["merge", "--abort"],
-                    cwd=cwd,
-                    capture_output=True,
-                    check=False,
-                    **_no_prompt_git_kwargs(),
-                )
-            rollback_ok = _rollback_fork_sync_candidate(git_cmd, cwd, pre_sha)
+            # A failed merge leaves HEAD where it was, so the pre-mutation identity still
+            # names this checkout; the abort runs behind the same check as the reset.
+            rollback = _rollback_fork_sync_candidate(
+                git_cmd, cwd, pre_sha, expected=sync_identity, abort_merge=True
+            )
             print(
                 "  ✗ Could not merge upstream/main (conflict or dirty tree) - "
-                "sync stopped, nothing was changed."
+                + ("sync stopped, nothing was changed." if rollback.ok else "sync stopped.")
             )
             print(f"  Resolve manually: cd {cwd} && git merge upstream/main")
-            if not rollback_ok:
+            if not rollback.ok:
                 return finish(
                     "rollback_failed",
-                    "upstream merge failed; rollback reset failed",
+                    f"upstream merge failed; {rollback.error}",
                     recovery_ref,
                 )
             return finish("failed", "upstream merge failed", recovery_ref)
@@ -1048,21 +1235,35 @@ def _sync_with_upstream_observed_impl(
             print("  ✗ Failed to pull from upstream. Upstream sync failed.")
             return finish("failed", f"upstream pull failed: {exc}", recovery_ref)
 
+    # The candidate has landed. A rollback is this sync's to run only on the ref it started
+    # on, at the commit validation was handed; otherwise the identity stays unknown and the
+    # rollback refuses.
+    landed = _capture_checkout_identity(git_cmd, cwd)
+    candidate_identity = (
+        landed if landed is not None and landed.ref == sync_identity.ref else None
+    )
+
     validation_error = ""
     try:
         candidate_valid = _validate_fork_sync_candidate(
-            git_cmd, cwd, pre_sha, rollback_on_failure=False
+            git_cmd,
+            cwd,
+            pre_sha,
+            rollback_on_failure=False,
+            candidate_label="Merged" if origin_ahead > 0 else "Pulled",
         )
     except Exception as exc:
         candidate_valid = False
         validation_error = f"candidate validation raised: {exc}"
     if not candidate_valid:
-        rollback_ok = _rollback_fork_sync_candidate(git_cmd, cwd, pre_sha)
+        rollback = _rollback_fork_sync_candidate(
+            git_cmd, cwd, pre_sha, expected=candidate_identity
+        )
         print("  Try the sync again once the candidate passes validation.")
         error = validation_error or "upstream candidate validation failed"
-        if not rollback_ok:
+        if not rollback.ok:
             return finish(
-                "rollback_failed", f"{error}; rollback reset failed", recovery_ref
+                "rollback_failed", f"{error}; {rollback.error}", recovery_ref
             )
         return finish("failed", error, recovery_ref)
 
@@ -1135,6 +1336,53 @@ def _sync_with_upstream_if_needed(
         _upstream_available=True,
     )
     return outcome.status == "noop" or outcome.local_integration_completed
+
+def _observe_legacy_upstream_sync(
+    legacy_sync,
+    git_cmd: list[str],
+    cwd: Path,
+    *,
+    phase: str,
+    assume_yes: bool = False,
+    input_fn=None,
+) -> UpstreamSyncOutcome:
+    """Typed verdict for a Boolean-only sync callable. The updater's call sites do not use it.
+
+    The Boolean contract answers False for a declined sync, for a failed one, and for a
+    candidate that failed validation and was rolled back. With HEAD where it was, those are
+    one and the same observation, so False is never ``not_checked`` or ``noop`` here: it is
+    ``outcome_unknown`` with an error, which is neither ``safe_to_continue`` nor
+    ``nothing_attempted``. True is the callable's own attestation that upstream was checked;
+    the checkout proof in ``_finish_sync_outcome`` still has to hold around it. Only
+    ``_sync_with_upstream_observed`` can attest that no mutating command ran, and
+    ``UpstreamSyncOutcome.repair`` names what a refused outcome needs next. Exceptions
+    propagate: this adds evidence, it does not change how the callable aborts.
+    """
+    from hermes_cli.update_cmd import _capture_head_sha
+
+    pre_sha = _capture_head_sha(git_cmd, cwd)
+    checked = legacy_sync(git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn) is True
+    moved = _capture_head_sha(git_cmd, cwd) != pre_sha
+    if checked:
+        status, error = ("updated" if moved else "noop"), ""
+    else:
+        status = "outcome_unknown"
+        error = (
+            "Boolean upstream sync answered False: declined, failed, and rolled back are "
+            "indistinguishable without the typed outcome"
+        )
+        if moved:
+            error += "; HEAD moved"
+    return _finish_sync_outcome(
+        git_cmd,
+        cwd,
+        phase=phase,
+        status=status,
+        pre_sha=pre_sha,
+        recovery_ref=pre_sha,
+        error=error,
+        local_integration_completed=moved and checked,
+    )
 
 
 def _has_http_code(stderr: str, *codes: str) -> bool:

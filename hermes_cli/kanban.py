@@ -1374,14 +1374,39 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     purge_ids = list(getattr(args, "purge_ids", None) or [])
     if ids and purge_ids:
         return _err("choose either task_ids to archive or --rm archived task_ids")
+    if purge_ids and (getattr(args, "expected_status", None) is not None
+                      or getattr(args, "expected_completed_at", None) is not None):
+        # --rm deletes; silently ignoring a precondition would delete what the caller guarded.
+        return _err("--expected-status/--expected-completed-at cannot be combined with --rm", 2)
     if not ids and not purge_ids:
         return _err("at least one task_id is required")
     with kbc.connect_closing() as conn:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        expected_status = getattr(args, "expected_status", None)
+        expected_completed_at = getattr(args, "expected_completed_at", None)
+        if expected_status is None and expected_completed_at is None and not getattr(args, "json", False):
+            return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+                               lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        if expected_completed_at is not None and len(ids) != 1:
+            return _err("--expected-completed-at requires exactly one task_id")
+        results = [
+            (tid, kb.archive_task_if(conn, tid, expected_status=expected_status,
+                                     expected_completed_at=expected_completed_at))
+            for tid in ids
+        ]
+    rows = [{"task_id": tid, "outcome": r.outcome, "status": r.status, "completed_at": r.completed_at}
+            for tid, r in results]
+    outcomes = {r.outcome for _tid, r in results}
+    if getattr(args, "json", False):
+        print(json.dumps({"results": rows}))
+    else:
+        for row in rows:
+            print(f"{row['outcome']}: {row['task_id']}")
+    if outcomes == {"archived"}:
+        return 0
+    return 3 if outcomes <= {"archived", "precondition_not_met"} else 1
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

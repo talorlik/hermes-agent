@@ -29,7 +29,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Protocol, Union
 
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
@@ -1344,15 +1344,21 @@ def drain_delivery_queue(adapters, loop) -> int:
     # Only restart-safe workers create the queue file.  Every gateway (macOS,
     # Windows, launchd, Docker) runs this housekeeping tick, so skip the sqlite
     # open/create entirely until a worker has actually queued something.
-    if not _path().exists():
+    # Exact (outbox-owned) deliveries live in executions.db, legacy worker results in deliveries.db.
+    from cron import executions as _executions
+
+    ledger = _executions.EXECUTIONS_FILE or (_get_hermes_home().resolve() / "cron" / "executions.db")
+    if not _path().exists() and not Path(ledger).exists():
         return 0
     return drain(
-        lambda queued_job, queued_content, queued_for_failure: _deliver_result(
+        # ``exact``: the concrete destination/outbox id of a queue-owned exact delivery.
+        lambda queued_job, queued_content, queued_for_failure, **exact: _deliver_result(
             queued_job,
             queued_content,
             adapters=adapters,
             loop=loop,
             for_failure=queued_for_failure,
+            **exact,
         )
     )
 
@@ -1513,14 +1519,24 @@ def _run_no_agent_job(
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
     try:
-        ok, output = _run_job_script_with_claim_heartbeat(
+        script_result = _run_job_script_with_claim_heartbeat(
             job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
+        ok, output = script_result
     except Exception as exc:
         logger.exception("Job '%s': script execution raised unexpectedly", job_id)
-        ok, output = False, f"Script execution failed: {exc}"
+        script_result = (False, f"Script execution failed: {exc}")
+        ok, output = script_result
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
+
+    typed = _typed_script_defer(job, script_result)
+    if typed is not None:
+        from cron.outcomes import CronDetachedStart
+
+        if isinstance(typed, CronDetachedStart):
+            return True, f"{header}**Status:** detached run started\n\n{typed}\n", "", typed
+        return False, f"{header}**Status:** deferred (transient)\n\n{typed}\n", "", typed
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
@@ -1545,16 +1561,18 @@ def _run_no_agent_job(
 
 def _apply_monitor_gate(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str],
-) -> tuple[Optional[tuple], Optional[str], Optional[str]]:
+) -> tuple[Optional[tuple], Optional[str], Optional[str], Optional[Any]]:
     """Monitor gate (hash-suppressed change detection). Must run BEFORE any agent machinery so an
     unchanged tick costs no LLM/delivery. Returns ``(early_result | None, extra_prompt,
-    monitor_context)``. Monitor context is runtime data and must remain distinct from a
+    monitor_context, pending_outcome)``. ``pending_outcome`` is the uncommitted ``MonitorOutcome`` of a
+    detected change; the caller commits it after preflight/provider resolution (``commit_monitor_state``),
+    never here. Monitor context is runtime data and must remain distinct from a
     user-authored ``extra_prompt`` so the prompt scanner keeps its strict user-input boundary.
     """
     from cron.monitor import check_monitor, job_has_monitor
 
     if not job_has_monitor(job):
-        return None, extra_prompt, None
+        return None, extra_prompt, None, None
     _mon = check_monitor(job)
     _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, _mon_now, "monitor")
@@ -1569,16 +1587,16 @@ def _apply_monitor_gate(
         )
         return (
             False, f"{header}**Status:** monitor source failed\n\n{_mon.error}\n", _mon_alert, _mon.error,
-        ), extra_prompt, None
+        ), extra_prompt, None, None
     if not _mon.changed:
         # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
         logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
         return (
             True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
-        ), extra_prompt, None
+        ), extra_prompt, None, None
     # Changed (or first run): pass monitor output through the runtime-data seam. Keep any manual
     # per-run prompt separate: it remains user input and is therefore still strict-scanned.
-    return None, extra_prompt, _mon.context_block
+    return None, extra_prompt, _mon.context_block, _mon
 
 
 @dataclass
@@ -2179,12 +2197,89 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_s
 _RunResult = tuple[bool, str, str, Optional[str]]
 
 
+class _CronScriptFailure(str):
+    """Scheduler-owned typed marker for a fail-closed pre-script failure."""
+
+
+FAIL_CLOSED_SCRIPT_FAILURE = _CronScriptFailure(
+    "Pre-run script failed before agent start; agent and model were not invoked."
+)
+
+
+def _typed_script_defer(job: dict, script_result):
+    """The typed marker for a pre-script outcome that is neither success nor failure: a
+    ``CronPreScriptDefer`` (TRANSIENT_DEFER: exit 75 or a JSON directive) or a ``CronDetachedStart``
+    (DETACHED: the script launched a worker that owns finishing the run), else None. Callers return it
+    before the script-failure policy, the prompt build and the agent are reached."""
+    from cron.outcomes import (
+        DETACHED, TRANSIENT_DEFER, CronDetachedStart, CronPreScriptDefer, classify_script_result)
+
+    ok, output = script_result
+    # The logical occurrence is the instant this fire was scheduled for, not whatever next_run_at
+    # the claim has advanced to since.
+    occurrence_key = f"{job.get('id')}:{job.get('_scheduled_instant') or job.get('next_run_at') or ''}"
+    outcome = classify_script_result(
+        bool(ok), str(output or ""), returncode=getattr(script_result, "returncode", None),
+        occurrence_key=occurrence_key)
+    if outcome.kind == TRANSIENT_DEFER:
+        return CronPreScriptDefer(
+            outcome.reason, retry_after_seconds=outcome.retry_after_seconds,
+            occurrence_key=outcome.occurrence_key or occurrence_key)
+    if outcome.kind == DETACHED:
+        return CronDetachedStart(
+            outcome.reason, run_id=outcome.run_id, worker=outcome.worker,
+            lease_seconds=outcome.lease_seconds, occurrence_key=outcome.occurrence_key or occurrence_key)
+    return None
+
+
+def _fail_closed_script_result(
+    job_id: str, job_name: str, script_output: str,
+) -> tuple[bool, str, str, _CronScriptFailure]:
+    """Build a bounded failure document without promoting script text to control data."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        script_error = redact_sensitive_text(
+            str(script_output or "Script failed"),
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        script_error = "[REDACTED - script failure details unavailable]"
+    if len(script_error) > 2000:
+        script_error = script_error[:1997].rstrip() + "..."
+    failure_doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        "**Status:** script failed before agent start\n\n"
+        f"{script_error}\n"
+    )
+    return False, failure_doc, "", FAIL_CLOSED_SCRIPT_FAILURE
+
+
+class _PromptPrep(NamedTuple):
+    """Result of the pre-agent gates: an early result OR the prompt, plus the uncommitted monitor
+    outcome that must be committed once setup succeeds and before the agent runs."""
+
+    early: Optional[_RunResult]
+    prompt: Optional[str]
+    monitor: Optional[Any]
+
+
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
-) -> tuple[Optional[_RunResult], Optional[str]]:
+) -> "_PromptPrep":
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    from cron.jobs import get_job_script_failure_policy
+
+    try:
+        script_failure_policy = get_job_script_failure_policy(job)
+    except ValueError as exc:
+        return _PromptPrep(_block_and_pause_job(job_id, job_name, str(exc)), None, None)
+
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):
@@ -2194,21 +2289,22 @@ def _prepare_job_prompt(
             require_parseable_user_config()
         except InvalidUserConfigError as exc:
             logger.error("Job '%s': refusing to run — %s", job_id, exc)
-            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
+            return _PromptPrep((False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None, None)
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
+        return _PromptPrep(_run_no_agent_job(job, job_id, job_name, cancel_event), None, None)
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
 
     if job_payload_is_empty(job):
-        return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
+        return _PromptPrep(_block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None, None)
 
-    _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
+    _early, extra_prompt, monitor_context, monitor_outcome = _apply_monitor_gate(
+        job, job_id, job_name, extra_prompt)
     if _early is not None:
-        return _early, None
+        return _PromptPrep(_early, None, None)
 
     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
     # _build_job_prompt so the script runs only once.
@@ -2227,6 +2323,21 @@ def _prepare_job_prompt(
             cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
+        typed = _typed_script_defer(job, prerun_script)
+        if typed is not None:
+            from cron.outcomes import CronDetachedStart
+
+            logger.info("Job '%s' (ID: %s): pre-run script outcome: %s", job_name, job_id, typed)
+            return _PromptPrep((
+                isinstance(typed, CronDetachedStart),
+                f"# Cron Job: {job_name}\n\n**Status:** {typed}\n", "", typed), None, None)
+        if not _ran_ok and script_failure_policy == "fail_closed":
+            result = _fail_closed_script_result(job_id, job_name, _script_output)
+            logger.error(
+                "Job '%s' (ID: %s): pre-run script failed closed; agent not started: %s",
+                job_name, job_id, result[3],
+            )
+            return _PromptPrep(result, None, None)
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
@@ -2236,7 +2347,7 @@ def _prepare_job_prompt(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
-            return (True, silent_doc, SILENT_MARKER, None), None
+            return _PromptPrep((True, silent_doc, SILENT_MARKER, None), None, None)
 
     try:
         prompt = _build_job_prompt(
@@ -2261,12 +2372,12 @@ def _prepare_job_prompt(
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
-        return (False, blocked_doc, "", str(block_exc)), None
+        return _PromptPrep((False, blocked_doc, "", str(block_exc)), None, None)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         note_cron_skipped(job)
-        return (True, "", SILENT_MARKER, None), None
-    return None, prompt
+        return _PromptPrep((True, "", SILENT_MARKER, None), None, None)
+    return _PromptPrep(None, prompt, monitor_outcome)
 
 
 _CRON_DELIVERY_VARS = (
@@ -2503,7 +2614,8 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    prep = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt = prep.early, prep.prompt
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2531,6 +2643,13 @@ def run_job(
         if setup.blocked is not None:
             return setup.blocked
         model = setup.model
+
+        if prep.monitor is not None:
+            # Preflight and provider resolution succeeded: only now does a detected change become the
+            # dedup baseline. A failure here fails the run visibly and leaves the change re-detectable.
+            from cron.monitor import commit_monitor_state
+
+            commit_monitor_state(job_id, prep.monitor)
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)
@@ -2771,7 +2890,8 @@ def run_one_job(
                 # row, no ping — while executions.db keeps piling up failed rows.
                 if not post_handoff:
                     delivery_error, delivery_outcome = _deliver_crash_failure(
-                        job, error, adapters=adapters, loop=loop)
+                        job, error, str(job.get("execution_id") or ""),
+                        adapters=adapters, loop=loop)
                 mark_job_run(
                     job["id"],
                     False,
@@ -2873,11 +2993,27 @@ def _compose_run_delivery(
     agent's own ``[CRON_FAILURE]`` evidence, delivered verbatim."""
     err = str(error) if error else ""
     # Failed jobs always deliver, except blocked-config runs, which alert exactly ONCE.
-    blocked_config_silent = BLOCKED_CONFIG_SILENT_MARKER in err
-    blocked_config = blocked_config_silent or BLOCKED_CONFIG_MARKER in err
+    script_failure = isinstance(error, _CronScriptFailure)
+    blocked_config_silent = not script_failure and BLOCKED_CONFIG_SILENT_MARKER in err
+    blocked_config = blocked_config_silent or (
+        not script_failure and BLOCKED_CONFIG_MARKER in err
+    )
     incident_acked = False
     failure_incident_id = None
-    if blocked_config and not success:
+    if script_failure and not success:
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(
+            job, error, output_file=output_file
+        )
+        if incident_acked:
+            deliver_content = ""
+        else:
+            deliver_content = (
+                f"⚠️ Cron '{job.get('name') or job['id']}' fail-closed "
+                "pre-run script failed. The agent and model were not invoked. "
+                "Full details saved in cron output."
+                + _failure_streak_nudge(job)
+            )
+    elif blocked_config and not success:
         # Bypass the generic failure summarizer (its auth/timeout heuristics would mislabel this).
         _pf_text = re.sub(r"\[blocked_config[^\]]*\]\s*", "", err).strip()
         from cron.scheduler_failure_copy import blocked_config_notice
@@ -2989,6 +3125,183 @@ class _RunDelivery:
     side_effect_ownership_lost: bool = False
 
 
+def _warning_suppressed_for(destination: dict) -> bool:
+    """True when the failure-notice policy hides warnings for this concrete destination."""
+    from cron.scheduler_delivery import BOT_CHAT_PLATFORM
+
+    if str(destination.get("platform")) == BOT_CHAT_PLATFORM:
+        return False
+    try:
+        from gateway.warning_notifications import warning_notifications_enabled
+
+        return not warning_notifications_enabled(str(destination["platform"]), load_config())
+    except Exception:
+        return False
+
+
+def _book_suppressed_disposition(job: dict, entries: list, destinations: list, errors: list) -> None:
+    """The queue drain applied the warning-notification policy to its own copy of the job, so the run
+    books the same disposition from the same policy: a failure notice every destination suppressed is
+    recorded ``suppressed`` and never ``delivered``."""
+    if not errors and entries and all(
+            entry.get("for_failure") and _warning_suppressed_for(dest)
+            for entry, dest in zip(entries, destinations)):
+        job["_notification_all_targets_suppressed"] = True
+
+
+def _attempt_concrete_deliveries(
+    job: dict,
+    content: str,
+    entries: list[dict],
+    destinations: list[dict],
+    *,
+    adapters,
+    loop,
+) -> Optional[str]:
+    """Publish every exact target before sending any through the queue owner."""
+    if len(entries) != len(destinations):
+        raise ValueError(
+            "delivery entries and destinations must have equal cardinality"
+        )
+    from cron import delivery_queue
+    from cron.scheduler_delivery import _begin_delivery_run, _finalize_delivery_run
+
+    errors: list[str] = []
+    delivery_run = _begin_delivery_run(job)
+    try:
+        for entry, destination in zip(entries, destinations):
+            delivery_queue.enqueue(
+                str(job.get("execution_id") or entry["id"]),
+                job,
+                content,
+                for_failure=bool(entry.get("for_failure")),
+                destination=destination,
+                outbox_id=str(entry["id"]),
+            )
+        job["_exact_delivery_accounted"] = True
+        external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
+        if external_execution == str(job.get("execution_id") or ""):
+            for entry, destination in zip(entries, destinations):
+                error = delivery_queue.enqueue_and_wait(
+                    external_execution,
+                    job,
+                    content,
+                    for_failure=bool(entry.get("for_failure")),
+                    destination=destination,
+                    outbox_id=str(entry["id"]),
+                )
+                if error:
+                    errors.append(error)
+            _book_suppressed_disposition(job, entries, destinations, errors)
+            return "; ".join(errors) if errors else None
+
+        def send_exact(queued_job, queued_content, queued_for_failure, **exact):
+            return _deliver_result(
+                queued_job,
+                queued_content,
+                adapters=adapters,
+                loop=loop,
+                for_failure=queued_for_failure,
+                delivery_run=delivery_run,
+                **exact,
+            )
+
+        delivery_queue.drain(
+            send_exact,
+            limit=len(entries),
+            exact_outbox_ids=[str(entry["id"]) for entry in entries],
+        )
+        for entry, destination in zip(entries, destinations):
+            try:
+                settled = delivery_queue.get_exact_state(str(entry["id"]))
+            except Exception:
+                logger.debug(
+                    "Exact delivery state lookup failed after queue drain for %s",
+                    entry.get("id"),
+                    exc_info=True,
+                )
+                continue
+            if settled is not None and settled["state"] in {
+                "RETRYABLE_FAILED",
+                "DEAD",
+                "UNKNOWN",
+            }:
+                errors.append(str(settled.get("error") or "delivery failed"))
+        _book_suppressed_disposition(job, entries, destinations, errors)
+    finally:
+        _finalize_delivery_run(delivery_run)
+    return "; ".join(errors) if errors else None
+
+
+def _retry_pending_deliveries(adapters=None, loop=None, max_rows: int = 10) -> int:
+    """Retry pending deliveries before dispatching new cron work."""
+    try:
+        from cron.jobs import get_job
+        from cron.outbox import pending_outbox, record_attempt
+
+        backlog = pending_outbox(limit=max_rows)
+    except Exception:
+        logger.debug("Outbox backlog scan failed", exc_info=True)
+        return 0
+    delivered = 0
+    for entry in backlog:
+        try:
+            if int(entry.get("delivery_contract", 0)) == 1:
+                from cron.delivery_queue import get_exact_state, reactivate_exact
+
+                queued = get_exact_state(str(entry["id"]))
+                if queued is None:
+                    logger.error(
+                        "Exact outbox row %s has no valid exact state; refusing direct replay",
+                        entry.get("id"),
+                    )
+                    continue
+                queue_state = str(queued.get("state") or "")
+                if queue_state == "RETRYABLE_FAILED":
+                    reactivate_exact(str(entry["id"]))
+                # Every exact send is queue-owned. READY and IN_FLIGHT await the
+                # queue; terminal rows need no reconciliation because their
+                # accounting committed in the same executions.db transaction.
+                continue
+            job = get_job(str(entry["job_id"]))
+            if job is None:
+                record_attempt(
+                    entry["id"],
+                    status="failed",
+                    error="job no longer exists",
+                    abandon=True,
+                )
+                continue
+            try:
+                # Only positively identified legacy rows may re-resolve a route.
+                for_failure = bool(entry.get("for_failure"))
+                replay_job = dict(job)
+                replay_job["failure_deliver" if for_failure else "deliver"] = entry[
+                    "target"
+                ]
+                send_error = _deliver_result(
+                    replay_job,
+                    entry["content"],
+                    adapters=adapters,
+                    loop=loop,
+                    for_failure=for_failure,
+                )
+            except Exception as exc:
+                send_error = str(exc) or type(exc).__name__
+            record_attempt(
+                entry["id"],
+                status="failed" if send_error else "delivered",
+                error=send_error,
+            )
+            if not send_error:
+                delivered += 1
+        except Exception:
+            logger.debug(
+                "Outbox retry failed for entry %r", entry.get("id"), exc_info=True
+            )
+    return delivered
+
+
 def _save_compose_deliver(
     d: _RunDelivery, fence: _FireOwnership, final_response: str, output: str, *,
     adapters, loop, verbose: bool, execution_token,
@@ -3047,24 +3360,43 @@ def _save_compose_deliver(
 
     if not d.should_deliver:
         return
-    d.unresolved_origin = (
-        _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
-        and not _resolve_delivery_targets(job, for_failure=not d.success)
-    )
+    for_failure = not d.success
+    route_expression = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
+    destinations = _resolve_delivery_targets(job, for_failure=for_failure)
+    d.unresolved_origin = route_expression == "origin" and not destinations
+    outbox_entries: list = []
+    if destinations:
+        # Publish every concrete destination (immutable target + payload) durably BEFORE any send:
+        # a crash after transport accept redelivers at-least-once, and an enqueue failure sends nothing.
+        try:
+            from cron.outbox import enqueue_deliveries_with_intent
+
+            outbox_entries = enqueue_deliveries_with_intent(
+                execution_id=job.get("execution_id"), job_id=job["id"], target=route_expression,
+                destinations=destinations, content=deliver_content, intent_success=d.success,
+                intent_error=d.error, job=job)
+        except Exception as exc:
+            from cron.outbox import write_enqueue_failure_fallback
+
+            d.delivery_error = write_enqueue_failure_fallback(
+                execution_id=job.get("execution_id"), job_id=job["id"], target=route_expression,
+                content=deliver_content, error=exc)
+            logger.error("Outbox enqueue failed for job %s", job["id"], exc_info=True)
+            return
     try:
         with fence.side_effect_fence() as owns_delivery:
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
-            d.delivery_error = _deliver_result(
-                job,
-                deliver_content,
-                adapters=adapters,
-                loop=loop,
-                # Failure summaries (and drift/blocked-config alerts composed into deliver_content
-                # on the failure path) honor the job's failure_deliver override (NS-788).
-                for_failure=not d.success,
-            )
+            if outbox_entries:
+                d.delivery_error = _attempt_concrete_deliveries(
+                    job, deliver_content, outbox_entries, destinations, adapters=adapters, loop=loop)
+            else:
+                d.delivery_error = _deliver_result(
+                    job, deliver_content, adapters=adapters, loop=loop,
+                    # Failure summaries (and drift/blocked-config alerts composed into deliver_content
+                    # on the failure path) honor the job's failure_deliver override (NS-788).
+                    for_failure=for_failure, resolved_targets=destinations)
     except Exception as de:
         if isinstance(de, _FireClaimLostDuringSideEffect):
             raise
@@ -3090,6 +3422,61 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
     finish_execution(
         execution_id, success=False,
         error="Interrupted by gateway shutdown before terminal completion.")
+
+
+def _register_detached_start(
+    job: dict, started, fire_owner: Optional[str], execution_id: str,
+) -> bool:
+    """Lease the execution to its detached worker and release the job's claims. The execution
+    stays ``running`` until the worker's authorized terminal report is reconciled; the job books
+    ``detached`` (no failure streak, no incident, no delivery). False when the lease could not be
+    registered (execution already terminal): the caller then fails the run visibly."""
+    from cron.executions import register_detached_run
+
+    registered = register_detached_run(
+        execution_id, run_id=started.run_id, lease_seconds=started.lease_seconds,
+        worker=started.worker, occurrence_key=started.occurrence_key)
+    if registered is None:
+        return False
+    mark_kwargs: dict = {"status": "detached"}
+    if fire_owner is not None:
+        mark_kwargs["expected_fire_owner"] = fire_owner
+    if not mark_job_run(job["id"], True, None, **mark_kwargs):
+        logger.warning("Job '%s': fire claim lost while registering detached run %s",
+                       job["id"], started.run_id)
+    return True
+
+
+def _persist_pre_script_defer(
+    job: dict, defer, fire_owner: Optional[str], execution_id: str,
+) -> bool:
+    """Persist the durable retry obligation for a transient pre-script defer and hand the job
+    back to the scheduler WITHOUT consuming the logical occurrence (no ``last_run_at``, no failure
+    streak, no incident, no delivery). Returns False when the retry budget is spent: the caller
+    then books the occurrence through the normal permanent-failure path."""
+    from cron import deferrals
+    from cron.executions import defer_execution
+    from cron.jobs import mark_job_deferred
+
+    obligation = deferrals.record_defer(
+        job["id"], defer.occurrence_key, reason=defer.reason,
+        retry_after_seconds=defer.retry_after_seconds)
+    if obligation["state"] == "exhausted":
+        return False
+    retry_at = obligation["retry_at"]
+    handed_off = mark_job_deferred(
+        job["id"], retry_at, reason=defer.reason, occurrence_key=defer.occurrence_key,
+        attempts=int(obligation.get("attempts") or 0), expected_fire_owner=fire_owner)
+    if not handed_off:
+        # The fenced handoff failed after the obligation persisted: undo exactly that write.
+        deferrals.rollback_defer(obligation)
+        finish_execution(
+            execution_id, success=False,
+            error="Fire claim ownership lost before the deferral handoff; stale defer discarded.")
+        return True
+    defer_execution(
+        execution_id, reason=defer.reason, occurrence_key=defer.occurrence_key, retry_at=retry_at)
+    return True
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -3123,6 +3510,20 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    try:
+        # A real terminal outcome settles any pending deferral for this job.
+        from cron.deferrals import resolve_pending
+
+        resolve_pending(job["id"], "completed" if d.success else "permanent")
+    except Exception:
+        logger.debug("Job '%s': could not resolve pending deferral", job["id"], exc_info=True)
+    if d.success:
+        try:
+            from cron.incidents import record_recovery
+
+            record_recovery(job["id"])
+        except Exception:
+            logger.debug("Failed recording incident recovery for job %s", job["id"], exc_info=True)
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -3134,16 +3535,29 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         incident_acked=d.incident_acked,
         success=d.success,
     )
-    if delivery_outcome in ("delivered", "not_configured") and not d.success:
-        # Failure ping left the process (or had a configured target): mark the incident alerted.
+    if delivery_outcome == "delivered" and not d.success:
+        # Failure ping actually left the process: mark the incident alerted. A "not_configured"
+        # outcome delivered nothing, so the alert is still owed.
         _mark_incident_alerted(d.failure_incident_id)
-    finish_execution(
+    execution = finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success))
+    # Exact (outbox) deliveries account their receipts in the executions.db transaction themselves.
+    if (execution is not None and normalized_deliver != "local"
+            and not job.pop("_exact_delivery_accounted", False)):
+        try:
+            from cron.executions import record_delivery
+
+            record_delivery(
+                execution_id, target=normalized_deliver, status=delivery_outcome,
+                error=d.delivery_error)
+        except Exception:
+            logger.debug("Job '%s': could not record delivery status", job["id"], exc_info=True)
     return True
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, execution_id: str, *, adapters, loop,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
@@ -3151,35 +3565,56 @@ def _deliver_crash_failure(
     incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
-    delivery_error = None
+    # Same text as the normal failure delivery: this run also counts toward failure_streak, so
+    # the nudge must leave through here too.
+    alert_content = _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job)
+    destinations = _resolve_delivery_targets(job, for_failure=True)
+    unresolved_origin = normalized_deliver == "origin" and not destinations
+    outbox_entries: list = []
+    if destinations:
+        try:
+            from cron.outbox import enqueue_deliveries_with_intent
+
+            outbox_entries = enqueue_deliveries_with_intent(
+                execution_id=execution_id, job_id=job["id"], target=normalized_deliver,
+                destinations=destinations, content=alert_content, intent_success=False,
+                intent_error=err_text, job={**job, "execution_id": execution_id})
+        except Exception as exc:
+            from cron.outbox import write_enqueue_failure_fallback
+
+            delivery_error = write_enqueue_failure_fallback(
+                execution_id=execution_id, job_id=job["id"], target=normalized_deliver,
+                content=alert_content, error=exc)
+            logger.error("Outbox enqueue failed for job %s", job["id"], exc_info=True)
+            return delivery_error, "failed"
     try:
-        delivery_error = _deliver_result(
-            job,
-            # Same text as the normal failure delivery: this run also counts toward
-            # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
-            adapters=adapters,
-            loop=loop,
-            for_failure=True,
-        )
-    except Exception as delivery_exc:
-        delivery_error = str(delivery_exc)
-        logger.error("Delivery failed for job %s: %s", job["id"], delivery_exc)
-    unresolved_origin = bool(
-        not delivery_error
-        and normalized_deliver == "origin"
-        and not _resolve_delivery_targets(job, for_failure=True)
-    )
+        if outbox_entries:
+            delivery_error = _attempt_concrete_deliveries(
+                job, alert_content, outbox_entries, destinations, adapters=adapters, loop=loop)
+        else:
+            delivery_error = _deliver_result(
+                job, alert_content, adapters=adapters, loop=loop, for_failure=True,
+                resolved_targets=destinations)
+    except Exception as exc:
+        delivery_error = str(exc) or type(exc).__name__
+        logger.error("Failure-alert delivery failed for job %s: %s", job["id"], delivery_error,
+                     exc_info=True)
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
-    if delivery_outcome in ("delivered", "not_configured"):
+    if delivery_outcome == "delivered":
         _mark_incident_alerted(failure_incident_id)
+    if normalized_deliver != "local" and not job.pop("_exact_delivery_accounted", False):
+        try:
+            from cron.executions import record_delivery
+
+            record_delivery(
+                execution_id, target=normalized_deliver, status=delivery_outcome, error=delivery_error)
+        except Exception:
+            logger.debug("Execution delivery record failed for job %s", job["id"], exc_info=True)
     return delivery_error, delivery_outcome
-
-
 
 def _install_fire_secret_scope() -> "tuple[contextvars.Token, Optional[contextvars.Token]]":
     """Install the firing profile's secret scope for the span ``_run_one_job_body`` runs, delivery
@@ -3322,6 +3757,21 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
             return True
 
+        from cron.outcomes import CronDetachedStart, CronPreScriptDefer
+
+        if isinstance(error, CronDetachedStart):
+            if _register_detached_start(job, error, fire_owner, execution_id):
+                _teardown_deferred()
+                return True
+            success, error = False, f"Detached run could not be registered: {error.run_id}"
+
+        if not success and isinstance(error, CronPreScriptDefer):
+            if _persist_pre_script_defer(job, error, fire_owner, execution_id):
+                _teardown_deferred()
+                return True
+            # Retry budget spent: the occurrence fails permanently through the normal machinery.
+            error = f"Deferral retry budget exhausted: {error.reason or 'transient pre-script defer'}"
+
         # An agent can finish its own turn after a delegated child has failed. Let it explicitly
         # declare that semantic failure so the existing failure path updates status, streaks,
         # ledger, and notification routing instead of recording a false healthy result.
@@ -3409,7 +3859,7 @@ def _run_one_job_body(
             and not _fire_claim_ownership_lost()
         ):
             delivery_error, delivery_outcome = _deliver_crash_failure(
-                job, _err_text, adapters=adapters, loop=loop)
+                job, _err_text, execution_id, adapters=adapters, loop=loop)
         try:
             if (
                 not _consume_interrupted_flag(job["id"], execution_token)
@@ -4106,6 +4556,14 @@ def _maybe_reap_dead_owners() -> None:
                 _reclaimed)
     except Exception as _reap_exc:
         logger.debug("Dead-owner execution reclaim failed: %s", _reap_exc)
+    try:
+        # Reported or lease-expired detached runs become terminal executions (failures mint incidents
+        # in the same transaction); an incident-store failure leaves them for the next sweep.
+        from cron.executions import reconcile_detached_runs
+
+        reconcile_detached_runs()
+    except Exception as _detached_exc:
+        logger.warning("Detached-run reconciliation failed: %s", _detached_exc)
 
 
 def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:

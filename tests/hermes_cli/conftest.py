@@ -154,3 +154,41 @@ def probe_root(tmp_path):
     """
     (tmp_path / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _tests_never_retarget_into_the_owning_install(request, monkeypatch):
+    """Keep every ``hermes_cli`` test inside its own process and fixture tree.
+
+    ``hermes update`` re-execs ``python -m hermes_cli.main <argv>`` with the *owning install* (the
+    checkout whose venv this interpreter is) as cwd whenever ``PROJECT_ROOT`` differs from it. A test
+    that points ``PROJECT_ROOT`` at a ``tmp_path`` therefore launches the REAL install's CLI with
+    pytest's argv. The owner lookup is the seam: with it answering ``None`` the re-exec branch cannot
+    be reached. ``test_update_owning_install.py`` exercises that lookup itself and opts out; a test
+    that needs a specific owner patches the lookup itself. Production behaviour is untouched.
+    """
+    if request.module.__name__.endswith("test_update_owning_install"):
+        return
+    from hermes_cli import update_owning_install
+
+    monkeypatch.setattr(update_owning_install, "owning_install_root", lambda project_root: None)
+
+
+@pytest.fixture
+def python_less_fixture_tree_passes_audit(monkeypatch):
+    """Named opt-in: let a POSITIVE updater flow run over a fixture tree that holds no Python.
+
+    The real tree-integrity audit (``update_cmd_integrity.failure_lines``) is the default for every
+    test, and it correctly rejects a tree with no Python files. A minimal Git fixture such as
+    ``content.txt`` plus ``.gitignore`` is about refs, stashes and branch movement, not tree integrity,
+    so a positive flow over it requests this fixture by name
+    (``@pytest.mark.usefixtures("python_less_fixture_tree_passes_audit")``).
+
+    Never request it from a test whose subject is rejecting code, and never make it autouse: a stubbed
+    audit there turns a rejected candidate into a pass. The audit's own behaviour is covered against
+    real trees in ``test_update_cmd_integrity``, ``test_update_integrity_gate`` and
+    ``test_update_upstream_sync_enforcement``.
+    """
+    from hermes_cli import update_cmd_integrity
+
+    monkeypatch.setattr(update_cmd_integrity, "failure_lines", lambda *a, **k: None)

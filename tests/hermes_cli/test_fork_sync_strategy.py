@@ -7,7 +7,20 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli import update_cmd
+from hermes_cli import update_cmd, update_cmd_git
+
+CHECKOUT_IDENTITY = update_cmd_git.CheckoutIdentity(ref="refs/heads/main", head="a" * 40)
+
+
+@pytest.fixture(autouse=True)
+def _scripted_checkout_identity():
+    """Every Git call here is scripted against a fake ``/repo``, so the checkout identity the
+    sync pins before mutating is data too. The real read and the rollback guard are tested
+    against real Git in test_update_upstream_sync_enforcement.py."""
+    with patch.object(
+        update_cmd_git, "_capture_checkout_identity", return_value=CHECKOUT_IDENTITY
+    ):
+        yield
 
 
 def _git_observation(
@@ -36,6 +49,14 @@ def _patch_managed_uv():
         "hermes_cli.managed_uv.ensure_uv",
         side_effect=lambda **_kwargs: shutil.which("uv"),
     ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tree_integrity_audit():
+    """These tests drive the gate against a fake ``/repo``; the tree audit has its own real
+    tests (test_update_integrity_gate.py, test_update_cmd_integrity.py)."""
+    with patch("hermes_cli.update_cmd_integrity.failure_lines", return_value=None):
         yield
 
 
@@ -562,7 +583,10 @@ def test_validate_fork_sync_candidate_direct_failure_rolls_back_once(tmp_path) -
             is False
         )
 
-    rollback.assert_called_once_with(["git"], tmp_path, rollback_ref)
+    # The identity handed to the rollback is the one read before validation started.
+    rollback.assert_called_once_with(
+        ["git"], tmp_path, rollback_ref, expected=CHECKOUT_IDENTITY
+    )
 
 
 def test_push_success_requires_exact_origin_main_readback() -> None:
@@ -942,6 +966,14 @@ class TestForkSyncStrategy:
             patch(
                 "hermes_cli.update_cmd._validate_critical_files_syntax",
                 return_value=syntax,
+            ),
+            # The scripted checkout is on main at the scripted HEAD; an unreadable HEAD is an
+            # unreadable identity.
+            patch.object(
+                update_cmd_git,
+                "_capture_checkout_identity",
+                return_value=head_sha
+                and update_cmd_git.CheckoutIdentity(ref="refs/heads/main", head=head_sha),
             ),
         ):
             update_cmd._sync_with_upstream_observed(

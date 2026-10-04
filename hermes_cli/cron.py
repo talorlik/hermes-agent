@@ -198,7 +198,9 @@ def cron_list(show_all: bool = False):
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {color(*badge)}")
         for label, value in _job_rows(job):
-            print(f"    {label + ':':<11}{value}")
+            key = label + ":"
+            # A label longer than the column must still be separated from its value.
+            print(f"    {key.ljust(11) if len(key) < 11 else key + ' '}{value}")
         for line in _job_warnings(job):
             print(f"    {line}")
         print()
@@ -239,6 +241,8 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
+        ("Script failure policy", "fail_closed"
+         if job.get("script") and job.get("script_failure_policy") == "fail_closed" else ""),
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
@@ -334,6 +338,18 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
               f"{record.get('claimed_at', '?')}")
         if record.get("error"):
             print(f"    {record['error']}")
+        # Typed outcome, delivery receipt and detached lease (the ledger stores delivery errors
+        # already force-redacted).
+        if record.get("outcome") or record.get("occurrence_key") or record.get("retry_at"):
+            print(f"    outcome={record.get('outcome') or '-'}  occurrence={record.get('occurrence_key') or '-'}"
+                  + (f"  retry_at={record['retry_at']}" if record.get("retry_at") else ""))
+        if record.get("delivery_target") or record.get("delivery_status"):
+            print(f"    delivery={record.get('delivery_target') or '-'}  status={record.get('delivery_status') or '-'}  "
+                  f"attempts={record.get('delivery_attempts') or 0}"
+                  + (f"  error={record['delivery_error']}" if record.get("delivery_error") else ""))
+        if record.get("detached_run_id"):
+            print(f"    detached run_id={record['detached_run_id']}  status={record.get('detached_status') or '-'}  "
+                  f"worker={record.get('detached_worker') or '-'}  lease_expires_at={record.get('lease_expires_at') or '-'}")
 
 
 _INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "resolved": Colors.GREEN,
@@ -705,7 +721,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"))
+                   ("interpreter", "interpreter"), ("script_failure_policy", "script_failure_policy"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
@@ -728,6 +744,9 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
     for key, template in _JOB_DETAIL_LINES:
         if job_data.get(key):
             print(template.format(job_data[key]))
+    # Only the non-default policy is worth a line: ``continue`` is what every script job did before.
+    if job_data.get("script") and job_data.get("script_failure_policy") == "fail_closed":
+        print("  Script failure policy: fail_closed (a failing script fails the run before the agent starts)")
 
 
 def cron_create(args):

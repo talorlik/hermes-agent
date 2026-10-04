@@ -13,14 +13,26 @@ import urllib.request
 
 import pytest
 
-from hermes_cli import main as cli_main, update_cmd, update_receipt
+from hermes_cli import main as cli_main, update_cmd, update_cmd_git, update_receipt
 from hermes_cli.update_inventory import UpdatePlan
-from hermes_cli.update_cmd import _sync_with_upstream_if_needed
 
 
 def git(root, *args):
     return subprocess.run(['git', *args], cwd=root, check=True, capture_output=True,
                           text=True, encoding='utf-8').stdout.strip()
+
+
+def stub_candidate_test_gate(monkeypatch):
+    """Positive-fixture seam for the fork-sync candidate test gate.
+
+    Structural limitation: these fixture repositories hold ``content.txt`` and ``.gitignore``
+    only. The gate's last step runs the checkout's own updater tests with pytest inside the
+    candidate tree, so here it has nothing to run and correctly rejects every candidate. Only
+    that step is replaced; the critical-file syntax check stays real. The gate is exercised
+    against real trees in ``test_update_integrity_gate.py`` and ``test_fork_sync_strategy.py``.
+    Tests whose subject is rejecting bad code must not use this seam.
+    """
+    monkeypatch.setattr(update_cmd_git, '_run_fork_sync_tests', lambda _cwd: (True, ''))
 
 
 @pytest.fixture
@@ -72,7 +84,8 @@ def update_tree(tmp_path, monkeypatch):
         return plan
 
     monkeypatch.setattr('hermes_cli.update_inventory.collect_runtime_inventory', inventory)
-    monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed',
+    # The typed owner is what both updater call sites run; the Boolean facade name is not consulted.
+    monkeypatch.setattr(update_cmd, '_sync_with_upstream_observed',
                         lambda *_a, **_k: pytest.fail('stable update reached upstream branch sync'))
 
     requests = []
@@ -94,13 +107,14 @@ def update_tree(tmp_path, monkeypatch):
                                 'fork-late', 'fork-late-push-ok', 'fork-late-wrong-branch',
                                 'fork-late-reverted', 'check-main',
                                 'check-explicit', 'check-missing', 'check-upstream'])
+@pytest.mark.usefixtures('python_less_fixture_tree_passes_audit')
 def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkeypatch, case, capsys):
     t = update_tree
     git(t.clone, 'checkout', '-q', 'main')
     t.args.channel = 'main'
     t.args.gateway = True
     t.args.check = case.startswith('check-')
-    monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed', _sync_with_upstream_if_needed)
+    monkeypatch.setattr(update_cmd, '_sync_with_upstream_observed', update_cmd_git._sync_with_upstream_observed)
     if case in {'explicit', 'check-explicit'}:
         git(t.origin, 'branch', 'chosen', t.wanted)
         t.args.branch = 'chosen'
@@ -114,6 +128,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
             git(t.origin.parent, 'clone', '-q', str(t.origin), str(upstream))
             git(upstream, 'reset', '--hard', t.newer)
             git(t.clone, 'remote', 'add', 'upstream', str(upstream))
+            stub_candidate_test_gate(monkeypatch)
             if case.endswith('push-ok'):
                 git(t.origin, 'config', 'receive.denyCurrentBranch', 'updateInstead')
     local = t.clone / '.gitignore'
@@ -190,6 +205,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
 
 
 @pytest.mark.parametrize('server', ['sha', 'fetch-refused', 'at-release', 'ahead-release', 'explicit-branch'])
+@pytest.mark.usefixtures('python_less_fixture_tree_passes_audit')
 def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, monkeypatch, server):
     """A stable update is pinned to the channel's exact commit: no tag lookup on
     origin, the stale local ``v1.1.0`` never moves, and an explicit --branch
@@ -267,6 +283,7 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
 
 @pytest.mark.platforms('windows')
 @pytest.mark.parametrize('transport', ['gitless', 'no-git', 'git-error', 'dirty'])
+@pytest.mark.usefixtures('python_less_fixture_tree_passes_audit')
 def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, monkeypatch, tmp_path, transport):
     from hermes_cli import source_releases
     from hermes_cli.release_channels import ChannelResolution
@@ -382,7 +399,8 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
     t = update_tree
     git(t.clone, 'checkout', '-q', 'main')
     t.args.channel = 'main'
-    monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed', _sync_with_upstream_if_needed)
+    real_sync = update_cmd_git._sync_with_upstream_observed
+    monkeypatch.setattr(update_cmd, '_sync_with_upstream_observed', real_sync)
     if sync_phase != 'origin':
         upstream = t.origin.parent / 'upstream'
         git(t.origin.parent, 'clone', '-q', str(t.origin), str(upstream))
@@ -401,11 +419,15 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
     unexpected_head = git(remote, 'rev-parse', 'HEAD')
     if sync_phase == 'late-other-branch':
         def switch_after_sync(*args, **kwargs):
-            result = _sync_with_upstream_if_needed(*args, **kwargs)
-            git(t.clone, 'checkout', '-qb', 'unexpected')
-            return result
+            # The real typed owner fetches, pulls, rejects and rolls back the candidate. Then a
+            # concurrent actor checks the rejected commit out on its own branch before the
+            # updater acts on the outcome: that branch is not the updater's to reset.
+            outcome = real_sync(*args, **kwargs)
+            assert outcome.status == 'failed' and outcome.safe_to_restore, outcome
+            git(t.clone, 'checkout', '-qb', 'unexpected', unexpected_head)
+            return outcome
 
-        monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed', switch_after_sync)
+        monkeypatch.setattr(update_cmd, '_sync_with_upstream_observed', switch_after_sync)
     local = t.clone / '.gitignore'
     staged = local.read_bytes() + b'# staged local work\n'
     unstaged = staged + b'# unstaged local work\n'

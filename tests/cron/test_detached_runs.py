@@ -670,7 +670,7 @@ def test_no_agent_detached_directive_end_to_end(tmp_path, monkeypatch):
     assert cron_finalize_detached(unknown) == 2
 
     # Next sweep reconciles the reported success into the terminal state.
-    monkeypatch.setattr(S, "_last_dead_owner_reap_at", None)
+    monkeypatch.setattr(S, "_last_dead_owner_reap_at", {})  # {} forces a reap next tick
     S.tick(verbose=False, sync=True)
     final = E.latest_execution(job["id"])
     assert final["status"] == "completed"

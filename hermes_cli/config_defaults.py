@@ -1843,6 +1843,15 @@ DEFAULT_CONFIG = {
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,
+        # Ledger-wide ceiling on TERMINAL attempts (completed/failed/unknown) in this profile's
+        # cron/executions.db. Integer or null. null (default) = no ceiling: every job keeps its
+        # newest 1000 terminal attempts plus everything that finished in the last 30 days, so the
+        # ledger grows with job count and run frequency. A non-negative integer caps the whole
+        # ledger at that many terminal attempts and OVERRIDES the 30-day floor (recent history
+        # past the cap is deleted, taken fairly from the busiest jobs first); 0 keeps none. Any
+        # other value (bool, float, string, negative) is ignored with a warning and nothing is
+        # capped. Claimed, running, detached and deferred attempts are never pruned.
+        "max_terminal_executions": None,
         # Timeout (seconds) for a no-agent cron script. Env: HERMES_CRON_SCRIPT_TIMEOUT. Keep in
         # sync with cron.scheduler._DEFAULT_SCRIPT_TIMEOUT.
         "script_timeout_seconds": 3600,

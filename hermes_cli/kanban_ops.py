@@ -93,6 +93,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if getattr(args, "json", False):
         _print_json({
+            "skipped_paused": res.skipped_paused,
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
                          "reaped_terminal_workers")},
@@ -214,6 +215,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     def _on_tick(res):
+        if res.skipped_paused:
+            return  # ESTOP engaged: an idle queue is expected, not a stuck dispatcher
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         if ready_pending and not res.spawned:
             health_state["bad_ticks"] += 1

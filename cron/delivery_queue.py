@@ -428,7 +428,10 @@ def _finish(
     permanent: bool = False,
     transport_status: Optional[str] = None,
     receipt_id: Optional[str] = None,
+    suppressed: bool = False,
 ) -> bool:
+    """Settle one claimed row. ``suppressed``: every target's notification policy suppressed the
+    send, so nothing left the process: a legacy row books ``suppressed``, never ``delivered``."""
     if generation is not None or owner_token is not None:
         if generation is None or owner_token is None:
             return False
@@ -454,7 +457,7 @@ def _finish(
                WHERE execution_id=? AND status='delivering'
                  AND owner_process_id=? AND owner_pid=? AND delivery_contract=0""",
             (
-                "failed" if error else "delivered",
+                "failed" if error else "suppressed" if suppressed else "delivered",
                 _hermes_now().isoformat(),
                 safe_error,
                 str(execution_id),
@@ -681,6 +684,7 @@ def drain(
                 ),
                 transport_status=transport_status,
                 receipt_id=receipt_id,
+                suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
             ):
                 raise RuntimeError("delivery outcome was not persisted")
             if error and int(row.get("delivery_contract") or 0) == 1:
@@ -737,7 +741,7 @@ def _terminalize_wait_timeout(
                 _prune_terminal_unlocked(conn)
             return message
         return "timed out observing gateway delivery; queue attempt remains in flight"
-    if row["status"] == "delivered":
+    if row["status"] in {"delivered", "suppressed"}:
         return ""
     return str(row.get("error") or f"delivery {row['status']}")
 
@@ -765,7 +769,7 @@ def enqueue_and_wait(
     if queued["status"] in _TERMINAL:
         return (
             None
-            if queued["status"] == "delivered"
+            if queued["status"] in {"delivered", "suppressed"}
             else str(queued.get("error") or f"delivery {queued['status']}")
         )
     wait_timeout = (
@@ -781,7 +785,7 @@ def enqueue_and_wait(
         ):
             return (
                 None
-                if row["status"] == "delivered"
+                if row["status"] in {"delivered", "suppressed"}
                 else str(row.get("error") or f"delivery {row['status']}")
             )
         time.sleep(1.0)

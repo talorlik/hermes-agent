@@ -48,6 +48,25 @@ def pull(plan, **kwargs):
     )
 
 
+def observed_sync(root, mutate=None):
+    """Typed-owner stand-in: run *mutate* with real Git, then return the owner's own evidence.
+
+    The status comes from whether HEAD moved and the proof from ``_finish_sync_outcome``, which is
+    what the observed sync itself returns. Nothing here asserts a verdict the checkout does not show.
+    """
+
+    def sync(git_cmd, cwd, *, phase, assume_yes, input_fn):
+        pre = git(root, "rev-parse", "HEAD")
+        if mutate is not None:
+            mutate()
+        moved = git(root, "rev-parse", "HEAD") != pre
+        return update_cmd._finish_sync_outcome(
+            git_cmd, cwd, phase=phase, status="updated" if moved else "noop", pre_sha=pre,
+            recovery_ref=pre, local_integration_completed=moved)
+
+    return sync
+
+
 def complete(plan, movement_baseline, monkeypatch):
     """Finish a pulled update and return the completion request it handed off."""
     completed = []
@@ -233,7 +252,7 @@ def test_fork_sync_after_stale_branch_repair(checkout, monkeypatch, upstream_res
     git(root, "branch", "-f", "main", old)
     plan = prepare(root)
 
-    def sync(*args, **kwargs):
+    def mutate():
         assert git(root, "rev-parse", "HEAD") == tip
         if upstream_result == "original":
             git(root, "merge", "--ff-only", upstream_tip)
@@ -241,9 +260,8 @@ def test_fork_sync_after_stale_branch_repair(checkout, monkeypatch, upstream_res
             git(root, "checkout", "-qb", "wrong")
         elif upstream_result == "reverted":
             git(root, "reset", "--hard", old)
-        return True
 
-    monkeypatch.setattr(update_cmd._m(), "_sync_with_upstream_if_needed", sync)
+    monkeypatch.setattr(update_cmd, "_sync_with_upstream_observed", observed_sync(root, mutate))
     if upstream_result in {"wrong-branch", "reverted"}:
         with pytest.raises(SystemExit) as exc:
             pull(plan, sync_upstream=True)
@@ -263,12 +281,10 @@ def test_early_fork_sync_without_push_still_completes(checkout, monkeypatch):
     git(root, "checkout", "-q", "--detach", tip)
     git(root, "branch", "-f", "main", tip)
 
-    def sync(*args, **kwargs):
-        git(root, "merge", "--ff-only", upstream_tip)
-        # Successful local sync need not push the new SHA to origin.
-        return True
-
-    monkeypatch.setattr(update_cmd._m(), "_sync_with_upstream_if_needed", sync)
+    # Successful local sync need not push the new SHA to origin.
+    monkeypatch.setattr(
+        update_cmd, "_sync_with_upstream_observed",
+        observed_sync(root, lambda: git(root, "merge", "--ff-only", upstream_tip)))
     plan = prepare(root, is_fork=True)
     assert plan.upstream_checked
     assert git(root, "rev-parse", "HEAD") == upstream_tip
@@ -277,6 +293,7 @@ def test_early_fork_sync_without_push_still_completes(checkout, monkeypatch):
     assert request["expected_sha"] == upstream_tip
 
 
+@pytest.mark.usefixtures("python_less_fixture_tree_passes_audit")
 def test_command_hands_off_after_existing_main_switch(update_tree, monkeypatch, capsys):
     t = update_tree
     monkeypatch.setattr("hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
@@ -292,13 +309,14 @@ def test_command_hands_off_after_existing_main_switch(update_tree, monkeypatch, 
     git(t.clone, "branch", "-f", "main", "origin/main")
     git(t.clone, "checkout", "-q", "--detach", t.base)
     t.args.channel = "main"
-    monkeypatch.setattr(update_cmd._m(), "_sync_with_upstream_if_needed", lambda *a, **k: True)
+    monkeypatch.setattr(update_cmd, "_sync_with_upstream_observed", observed_sync(t.clone))
     update_cmd._m().cmd_update(t.args)
     assert git(t.clone, "rev-parse", "HEAD") == t.newer
     assert len(t.requests) == 1
     assert "Already up to date" not in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("python_less_fixture_tree_passes_audit")
 def test_fork_sync_round_trip_is_not_misclassified_as_noop(tmp_path, monkeypatch):
     """origin/main moves first, then the upstream sync returns HEAD to the SHA that was
     running before the update: still a successful branch repair, not a no-op."""
@@ -322,11 +340,9 @@ def test_fork_sync_round_trip_is_not_misclassified_as_noop(tmp_path, monkeypatch
     assert plan.pre_sync_sha == upstream_tip
     assert git(root, "rev-parse", "HEAD") == old
 
-    def sync_upstream(*_args, **_kwargs):
-        git(root, "merge", "--ff-only", "refs/remotes/upstream/main")
-        return True
-
-    monkeypatch.setattr(update_cmd._m(), "_sync_with_upstream_if_needed", sync_upstream)
+    monkeypatch.setattr(
+        update_cmd, "_sync_with_upstream_observed",
+        observed_sync(root, lambda: git(root, "merge", "--ff-only", "refs/remotes/upstream/main")))
     pull(plan, sync_upstream=True)
 
     assert git(root, "rev-parse", "HEAD") == upstream_tip

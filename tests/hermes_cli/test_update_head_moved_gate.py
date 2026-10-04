@@ -155,6 +155,14 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
 
 
+@pytest.fixture(autouse=True)
+def _never_retarget_to_the_live_install(monkeypatch):
+    """``cmd_update`` re-execs into the owning install; with pytest's argv that would launch the
+    LIVE install's updater. Stub the seam before any test in this module runs."""
+    monkeypatch.setattr("hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
+    monkeypatch.setattr("hermes_cli.update_cmd_integrity.failure_lines", lambda *a, **k: None)
+
+
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)

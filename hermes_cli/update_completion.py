@@ -251,6 +251,15 @@ def _finish(request: dict, result_path: Path) -> int:
     update_receipt.record_stage("deps", "success")  # only a completed PM preparation reaches --prepared
     code, reason = 0, "source update completion"
     try:
+        # Common Git/ZIP boundary after dependency preparation and before success is recorded:
+        # the pre-dependency audit tolerated missing third-party modules, this one must not.
+        from hermes_cli.update_cmd_integrity import failure_lines
+        findings = failure_lines(Path(__file__).resolve().parents[1], strict=True)
+        if findings is not None:
+            print("✗ Updated tree failed the strict integrity audit:")
+            for line in findings[:12]:
+                print(f"  {line}")
+            raise SystemExit(1)
         _complete_selected(request)
     except SystemExit as exc:
         code = _exit_status(exc.code) if isinstance(exc.code, int) else 1

@@ -59,6 +59,9 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
+        # Pending (retryable) deliveries go out before new work, so a backlog never starves.
+        _sched._retry_pending_deliveries(adapters=adapters, loop=loop)
+        _sched.drain_delivery_queue(adapters, loop)
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
 

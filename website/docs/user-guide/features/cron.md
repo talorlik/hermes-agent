@@ -392,8 +392,51 @@ when the original PID and process-start fingerprint prove that its owner is
 gone. Unknown attempts are audit records and are never automatically rerun.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
-`history`). Terminal history is bounded; active attempts are never pruned. The
-ledger is included in quick backups.
+`history`). Active attempts (claimed, running, detached and deferred) are never
+pruned. The ledger is included in quick backups.
+
+Terminal history is retained per job. Each job keeps its newest 1000 terminal
+attempts, and no attempt that finished within the last 30 days is pruned, so a
+high-frequency job cannot evict another job's evidence. Ordering uses the
+instant an attempt finished (compared as instants across UTC offsets and DST
+changes), not when it was claimed. By default there is no ledger-wide limit:
+the ledger grows with the number of jobs and how often they run.
+
+Two kinds of attempt have no usable finish time, and they are treated
+differently:
+
+- An attempt recorded before finish times existed has none at all. It is aged
+  from the time it was claimed, the only time it has.
+- An attempt whose finish time is present but unreadable (a damaged value, or
+  one without a calendar date) is never pruned by the per-job policy. A
+  long-running attempt claimed months ago may have finished today, so its claim
+  time does not prove that it is old, and it does not take a slot in the job's
+  newest 1000 either.
+
+To bound the whole ledger, set `cron.max_terminal_executions` in that profile's
+`config.yaml`. The value is an integer or `null`:
+
+```yaml
+cron:
+  max_terminal_executions: null   # default: no ledger-wide ceiling
+  # max_terminal_executions: 5000 # keep at most 5000 terminal attempts in total
+```
+
+- `null` (default) disables the ceiling and keeps the per-job policy above.
+- A non-negative integer caps terminal attempts across all jobs and **overrides
+  the 30-day floor**: recent history beyond the cap is deleted. Eviction is fair
+  across jobs: the job holding the most rows gives up its oldest first, so a
+  quiet job keeps its latest attempt while a busy one still holds more.
+  Attempts with an unreadable finish time are not protected from the cap: they
+  are evicted before dated attempts of the same rank, in a fixed order. `0`
+  keeps no terminal history.
+- Anything else (a boolean, a decimal, a quoted number, a negative number) is
+  ignored with a warning in the log, and no ceiling is applied.
+
+A ceiling trades evidence for a size bound. Pruned attempts no longer appear in
+`hermes cron runs`, and a pruned completed occurrence can no longer block a
+replay from an old `jobs.json` snapshot (see below). Each profile reads its own
+setting; one profile's ceiling never applies to another profile's ledger.
 
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence

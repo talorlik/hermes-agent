@@ -10,8 +10,14 @@ import pytest
 
 @pytest.mark.parametrize("manual", [False, True])
 @pytest.mark.parametrize(
-    "death", ["hard_exit", "payload_exception", "concurrent_recovery",
-              "timeout_hard_exit", "timeout_payload_exception"]
+    "death",
+    [
+        "hard_exit",
+        "payload_exception",
+        "concurrent_recovery",
+        "timeout_hard_exit",
+        "timeout_payload_exception",
+    ],
 )
 def test_adopted_worker_failure_is_visible(tmp_path, monkeypatch, manual, death):
     import cron.executions as executions
@@ -50,7 +56,9 @@ def test_adopted_worker_failure_is_visible(tmp_path, monkeypatch, manual, death)
             monkeypatch.setattr(process, "wait", race_wait)
             return wait_body(process, **kwargs)
 
-        monkeypatch.setattr(scheduler, "_wait_for_external_cron_worker_body", timeout_after_recovery)
+        monkeypatch.setattr(
+            scheduler, "_wait_for_external_cron_worker_body", timeout_after_recovery
+        )
     delivered = []
     monkeypatch.setattr(
         scheduler, "_deliver_result", lambda *a, **k: delivered.append(True)
@@ -93,6 +101,21 @@ else:
     )
     with use_cron_store(home):
         # A lost worker must obey the same bounded history as normal finishes.
+        # That bound is the ledger-wide ceiling. Upstream carried it in the module constant
+        # MAX_TERMINAL_EXECUTIONS; here it is the opt-in ``cron.max_terminal_executions`` setting
+        # (default null: per-job quota plus the 30-day floor, no ledger-wide bound), so the cap of
+        # 2 is written to this profile's real config.yaml, the one seam the worker subprocess
+        # shares with this process. It is resolved while the production fallback constant still
+        # holds its shipped None, so only the configured key can yield 2: a config seam that did
+        # not reach the ledger fails the fixture instead of passing unbounded. The constant is the
+        # ceiling a profile takes when its file does not carry the key; it is then set to the
+        # configured number so the assertions inherited from upstream keep reading it. It is a
+        # real module attribute, patched without ``raising=False``.
+        (home / "config.yaml").write_text(
+            "cron:\n  max_terminal_executions: 2\n", encoding="utf-8"
+        )
+        assert executions.MAX_TERMINAL_EXECUTIONS is None
+        assert executions.terminal_execution_ceiling() == 2
         monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 2)
         for index in range(executions.MAX_TERMINAL_EXECUTIONS):
             old = executions.create_execution(f"old-{index}", source="direct")

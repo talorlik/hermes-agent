@@ -696,7 +696,8 @@ class TestStatusSurfacesDeadScheduler:
         cron_command(Namespace(cron_command="list", all=False, json=False))
         list_out = capsys.readouterr().out
 
-        assert "Gateway is not running" in status_out
+        # The scheduler is profile-aware (not gateway-only): the diagnostic names the profile.
+        assert "No scheduler is serving profile" in status_out and "will NOT fire" in status_out
         assert "Scheduler last ticked" in status_out
         assert "OVERDUE" in status_out and "7h ago" in status_out
         # The stale timestamp must no longer read as an upcoming run on either surface.

@@ -24,7 +24,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 from toolsets import get_toolset_names
 
@@ -2704,8 +2704,10 @@ def release_stale_claims(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                # A worker that registered its own pid since the SELECT keeps its claim.
+                "AND worker_pid IS ?",
+                (retry_status, row["id"], row["claim_lock"], now, row["worker_pid"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -4232,9 +4234,39 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
-    """Archive a task; a *running* task's host-local worker is terminated.
+ArchiveOutcome = Literal["archived", "precondition_not_met", "not_found", "already_archived"]
 
+
+@dataclass(frozen=True)
+class ArchiveResult:
+    """Typed outcome of :func:`archive_task_if`.
+
+    ``outcome`` is ``archived``, ``precondition_not_met`` (status or completion time
+    differed; nothing changed, no event), ``not_found`` or ``already_archived``.
+    ``status`` / ``completed_at`` are the card's values after the call.
+    """
+
+    outcome: ArchiveOutcome
+    status: Optional[str] = None
+    completed_at: Optional[int] = None
+
+
+def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+    """Archive a task unconditionally (legacy contract); see :func:`archive_task_if`."""
+    return archive_task_if(conn, task_id, signal_fn=signal_fn).outcome == "archived"
+
+
+def archive_task_if(
+    conn: sqlite3.Connection, task_id: str, *, expected_status: Optional[str] = None,
+    expected_completed_at: Optional[int] = None, signal_fn=None,
+) -> ArchiveResult:
+    """Archive a task, optionally only while it still matches what the caller observed.
+
+    The expectations are checked inside the same write transaction as the status flip, so a
+    card reopened after the caller listed it is skipped (``precondition_not_met``) with no
+    archive and no ``archived`` event. With no expectations this is the legacy archive.
+
+    A *running* task's host-local worker is terminated.
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
     own archive — it kept executing (and pushing work) against a task nothing
     tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
@@ -4248,11 +4280,17 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, completed_at, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
-            return False
+            return ArchiveResult("not_found")
+        current = ArchiveResult("not_found", row["status"], _opt_int(row["completed_at"]))
+        if row["status"] == "archived":
+            return ArchiveResult("already_archived", current.status, current.completed_at)
+        if (expected_status is not None and row["status"] != expected_status) or (
+                expected_completed_at is not None and current.completed_at != int(expected_completed_at)):
+            return ArchiveResult("precondition_not_met", current.status, current.completed_at)
         was_running = row["status"] == "running"
         prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
         cur = conn.execute(
@@ -4261,7 +4299,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             "WHERE id = ? AND status != 'archived'", (task_id,),
         )
         if cur.rowcount != 1:
-            return False
+            return ArchiveResult("already_archived", "archived", current.completed_at)
         # Archived mid-run (dashboard): close the run so history isn't orphaned.
         run_id = _end_run(
             conn, task_id, outcome="reclaimed", status="reclaimed",
@@ -4276,7 +4314,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     recompute_ready(conn)
     # Reap the workspace on archive too (never-completed tasks kept it forever).
     _cleanup_workspace(conn, task_id)
-    return True
+    return ArchiveResult("archived", "archived", current.completed_at)
 
 
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:

@@ -216,13 +216,6 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
-    """Author name stored on comments and events: the active profile, else the OS user."""
-    return current_profile_name() or os.environ.get("USER") or os.environ.get("USERNAME") or "worker"
-    """Bind this process as the dispatcher-spawned worker for ``HERMES_KANBAN_TASK``.
-    Returns False when a newer run already owns the task, so the caller can exit
-    without writing into a reclaimed card. Delegated children must not register:
-    the dispatcher owns the claim.
-    from hermes_cli.kanban_db_dispatch import adopt_worker_pid
 def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
     session_id = _own_task_env(task_id, "HERMES_SESSION_ID")
@@ -621,7 +614,6 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
     # Advance past everything read (including our own notes) so nothing is re-injected.
     _comment_watermark[tid] = max(c.id for c in rows)
-    own = (os.environ.get("HERMES_PROFILE") or "").strip()
     # Same resolution the write side used, so a worker skips its OWN comments even
     # when the dispatcher did not pin HERMES_PROFILE (echoed notes would otherwise
     # re-enter the live turn as fake operator steering).
@@ -647,21 +639,22 @@ def _handle_show(args: dict, **kw) -> str:
     """Full task state: row, parents, children, comments, runs, last 50 events."""
     tid = _require_task_id(args)
     with _board(args.get("board")) as (kb, conn):
-        task = _existing_task(kb, conn, tid)
-        return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
-            "parents": kb.parent_ids(conn, tid),
+        # One read snapshot: the versioned envelope every other read surface serves, so the
+        # task row, its collections and the worker context cannot straddle a lifecycle write.
+        with kb.read_txn(conn):
+            task = _existing_task(kb, conn, tid)
+            snapshot = kb.build_task_snapshot(conn, tid)
+            payload = snapshot.to_dict()
+            payload["task"] = {**payload["task"], **_fields(task, _TASK_FIELDS)}
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
-            "unsatisfied_parents": [
-                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
-            "children": kb.child_ids(conn, tid),
-            "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
-            "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+            payload["unsatisfied_parents"] = [
+                {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)]
+            # Consumer cap only; the canonical snapshot and the CLI keep the full log.
+            payload["events"] = payload["events"][-50:]
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            payload["worker_context"] = kb.build_worker_context(conn, tid)
+        return json.dumps(payload)
 
 
 @_kanban_handler("kanban_list")
@@ -934,7 +927,6 @@ def _handle_comment(args: dict, **kw) -> str:
     # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
     author = _persisted_identity()
     with _board(args.get("board")) as (kb, conn):
         cid = kb.add_comment(conn, tid, author=author, body=str(body))

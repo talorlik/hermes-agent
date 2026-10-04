@@ -28,7 +28,7 @@ def record_unknown_worker_outcome(
         delivery_error = None
         try:
             delivery_error, _ = scheduler._deliver_crash_failure(
-                job, error, adapters=adapters, loop=loop
+                job, error, str(job["execution_id"]), adapters=adapters, loop=loop
             )
         finally:
             scheduler._reset_fire_secret_scope(scope_tokens)

@@ -857,14 +857,31 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
     file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
     syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
     if syntax_ok:
-        return
-    print()
-    print("✗ Pulled code has a syntax error in a critical file:")
-    print(f"  {failing_path}")
-    # py_compile errors can be multi-line; show enough for the SyntaxError text.
-    for line in str(syntax_error).splitlines()[:6] if syntax_error else ():
-        print(f"    {line}")
-    print()
+        # The critical list is 9 files; merge damage elsewhere (scheduler, worker tools) must
+        # not ship either. Compile every tracked file and import the scheduler/tool modules.
+        from hermes_cli.update_cmd_integrity import failure_lines
+        findings = failure_lines(_m().PROJECT_ROOT)
+        if findings is None:
+            return
+        print()
+        print("✗ Pulled code failed the tree integrity audit (syntax error or broken import):")
+        for line in findings[:12]:
+            print(f"  {line}")
+        print()
+    else:
+        print()
+        print("✗ Pulled code has a syntax error in a critical file:")
+        print(f"  {failing_path}")
+        # py_compile errors can be multi-line; show enough for the SyntaxError text.
+        for line in str(syntax_error).splitlines()[:6] if syntax_error else ():
+            print(f"    {line}")
+        print()
+    _roll_back_checkout(git_cmd, pre_pull_sha, rollback_branch=rollback_branch)
+    sys.exit(1)
+
+
+def _roll_back_checkout(git_cmd, pre_pull_sha, *, rollback_branch=None) -> None:
+    """Put the checkout the update left back in place; print the manual recovery when it cannot."""
     if pre_pull_sha:
         # Restore the checkout the update left, never reset the update branch onto commits from
         # a parked feature branch or a detached checkout.
@@ -894,7 +911,6 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
     else:
         print("  Could not capture pre-pull SHA — recover manually with:")
         print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
-    sys.exit(1)
 
 
 def _update_movement_baseline(git_cmd, pre_pull_sha, pre_sync_sha, rollback_branch, target_sha):
@@ -977,8 +993,15 @@ def _pull_updates(
             _verify_head_after_pull(
                 git_cmd, branch, movement_baseline, in_place_update=in_place_update,
                 _windows_gateway_resume=_windows_gateway_resume)
-            _m()._sync_with_upstream_if_needed(
-                git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
+            # A rejected candidate ends the whole update: the origin half already moved
+            # the tree, so the enforcer puts the pre-update checkout back before exiting.
+            _enforce_upstream_sync_outcome(
+                _sync_with_upstream_observed(
+                    git_cmd, _m().PROJECT_ROOT, phase="post_origin_pull", assume_yes=assume_yes,
+                    input_fn=gw_input_fn),
+                git_cmd, rollback_sha=pre_sync_sha or pre_pull_sha, rollback_branch=rollback_branch,
+                expected_branch=None if in_place_update else branch,
+                windows_gateway_resume=_windows_gateway_resume)
         # Refuse an unexpected branch before syntax rollback can reset its ref.
         _verify_head_after_pull(
             git_cmd, branch, movement_baseline, in_place_update=in_place_update,
@@ -1021,6 +1044,9 @@ class _CheckoutPlan:
     rollback_branch: str | None = None
     # The switch changed the running code with no new commits to count (commit_count == -1).
     switched_without_new_commits: bool = False
+    # The fork-upstream sync already ran in this update. A second pass seconds later can only
+    # repeat the validation and the push, and its recovery tag collides with the first one.
+    upstream_synced: bool = False
 
 
 def _apply_parked_branch_guard(
@@ -1156,24 +1182,33 @@ def _prepare_checkout_for_update(
     # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
+    upstream_synced = False
     if commit_count == 0 and is_fork and branch == "main" and not release_tag:
-        pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        upstream_checked = _m()._sync_with_upstream_if_needed(
-            git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
-        post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+        # A failed sync used to read as "not checked" and finish as "Already up to date".
+        # The typed outcome separates declined from failed; the local stash stays parked
+        # on failure and the pending-autostash boundary names it.
+        sync_outcome = _enforce_upstream_sync_outcome(
+            _sync_with_upstream_observed(
+                git_cmd, _m().PROJECT_ROOT, phase="prepare", assume_yes=assume_yes,
+                input_fn=gw_input_fn),
+            git_cmd, rollback_sha=moved_from_sha, rollback_branch=rollback_branch,
+            expected_branch=None if in_place_update else branch,
+            windows_gateway_resume=_windows_gateway_resume)
+        upstream_checked = sync_outcome.upstream_checked
+        upstream_synced = True
+        if sync_outcome.changed:
             synced_count = _count_commits_between(
-                git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
+                git_cmd, _m().PROJECT_ROOT, sync_outcome.pre_sha, sync_outcome.post_sha)
             # HEAD moving is proof of an update even if the count can't be read.
             commit_count = max(1, synced_count)
-            moved_from_sha = moved_from_sha or pre_sync_sha
+            moved_from_sha = moved_from_sha or sync_outcome.pre_sha
 
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
         parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
         switch_block_reason=switch_block_reason, upstream_checked=upstream_checked,
         pre_sync_sha=moved_from_sha, rollback_branch=rollback_branch,
-        switched_without_new_commits=switched_without_new_commits)
+        switched_without_new_commits=switched_without_new_commits, upstream_synced=upstream_synced)
 
 
 @dataclass
@@ -1624,7 +1659,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=(
+                is_fork and branch == "main" and not release_sha and not _plan.upstream_synced),
+            assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume)
         _apply_pulled_update(
             git_cmd, branch, movement_baseline, _plan,
@@ -1661,20 +1698,42 @@ def _refuse_existing_sync_quarantine() -> None:
         marker = "(unresolvable)"
     print("✗ Hermes update is quarantined after an unsafe upstream synchronization.")
     print(f"  Quarantine marker: {marker}")
+    repair = evidence.get("repair")
+    if isinstance(repair, dict) and repair.get("action"):
+        print(f"  Required repair: {repair['action']} (recovery ref: {repair.get('recovery_ref')}, "
+              f"expected HEAD: {repair.get('expected_head')}, observed: {repair.get('observed_head')})")
     print("  Inspect the marker, repair the checkout, and remove the marker before updating.")
     sys.exit(1)
 
 def _enforce_upstream_sync_outcome(
-    outcome, git_cmd, auto_stash_ref, *, prompt_for_restore, input_fn, windows_gateway_resume,
+    outcome, git_cmd, *, rollback_sha, rollback_branch, windows_gateway_resume, expected_branch=None,
 ):
-    """Stop the update unless the observed sync proved the checkout is safe to keep.
+    """Return *outcome* when the update may proceed; otherwise stop with exit 1.
 
-    Uses upstream's stash restore and Windows gateway resume. A not-restored or
-    rollback-failed outcome writes the quarantine marker before either runs.
+    *outcome* is the typed owner's (``_sync_with_upstream_observed``), never a Boolean: a
+    Boolean False cannot tell a declined sync from a rejected, rolled-back candidate.
+    Proceeds on a proven no-op or updated sync, on a declined sync (nothing attempted),
+    and on a validated local sync whose fork publication failed. A rolled-back candidate restores the pre-update
+    checkout (*rollback_sha* / *rollback_branch*), because the origin half of the update
+    may already have moved the tree and nothing downstream will complete it. An outcome
+    that cannot be proven restored writes the quarantine marker and is left untouched for
+    inspection. Parked local changes stay in the stash in every failure case.
     """
-    if outcome.safe_to_continue:
+    if outcome.safe_to_continue or outcome.nothing_attempted:
         return outcome
-    if not outcome.safe_to_restore or outcome.status in {"rollback_failed", "outcome_unknown"}:
+    if outcome.locally_integrated:
+        print(f"  ⚠ Fork publication was not confirmed: {outcome.error}")
+        return outcome
+    # Read the checkout before anything below writes. The outcome proves only the checkout
+    # the sync left; a rollback acts on whatever is checked out NOW, so a branch switched in
+    # since (another process, a hook) is not this update's to reset. *expected_branch* is
+    # None for an in-place update, where any branch is legitimate and only the commit counts.
+    current_branch = _current_branch_name(git_cmd)
+    current_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    moved_since_sync = current_sha != outcome.post_sha or (
+        expected_branch is not None and current_branch not in {expected_branch, "HEAD"})
+    quarantined = not outcome.safe_to_restore
+    if quarantined:
         evidence = {
             "status": outcome.status,
             "phase": outcome.phase,
@@ -1683,6 +1742,7 @@ def _enforce_upstream_sync_outcome(
             "error": outcome.error,
             "recovery_ref": outcome.recovery_ref,
             "operation_state": outcome.operation_state,
+            "repair": outcome.repair,
         }
         try:
             from hermes_cli.update_receipt import write_sync_quarantine
@@ -1694,12 +1754,13 @@ def _enforce_upstream_sync_outcome(
     print(f"✗ Upstream sync stopped ({outcome.status}).")
     if outcome.error:
         print(f"  {outcome.error}")
-    if auto_stash_ref and outcome.safe_to_restore:
-        try:
-            _m()._restore_stashed_changes(
-                git_cmd, _m().PROJECT_ROOT, auto_stash_ref,
-                prompt_user=prompt_for_restore, input_fn=input_fn)
-        except Exception as exc:
-            print(f"  ⚠ Could not restore stashed local changes: {exc}")
+    if moved_since_sync:
+        print(f"  The checkout is on '{current_branch}' at {(current_sha or 'an unknown commit')[:10]}, "
+              "not where the sync left it.")
+        print("  That branch and any parked stash are left untouched; no rollback was attempted.")
+    # Same commit on a parked branch still needs the branch back, hence the branch test.
+    elif not quarantined and rollback_sha and (
+            rollback_branch is not None or rollback_sha != outcome.post_sha):
+        _roll_back_checkout(git_cmd, rollback_sha, rollback_branch=rollback_branch)
     _m()._resume_windows_gateways_after_update(windows_gateway_resume)
     sys.exit(1)

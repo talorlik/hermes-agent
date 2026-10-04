@@ -148,6 +148,9 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    skipped_paused: bool = False
+    """True when the global emergency stop (``hermes pause``) was engaged: this tick
+    claimed, wrote and spawned nothing."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -1950,6 +1953,25 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+class DispatchGuardUnavailable(RuntimeError):
+    """The ESTOP guard could not be evaluated, so dispatch is refused (fail closed)."""
+
+
+def _dispatch_paused() -> bool:
+    """True while ``hermes pause`` is engaged. ESTOP is a maintenance stop, not a recovery
+    mechanism: when its module is unimportable the answer is unknown, and unknown is not
+    permission to claim cards or spawn workers."""
+    import logging
+
+    try:
+        from agent.estop import check_paused
+        return bool(check_paused("kanban", logging.getLogger(__name__)))
+    except Exception as exc:  # noqa: BLE001 - any failure to evaluate the guard is a refusal
+        raise DispatchGuardUnavailable(
+            f"ESTOP guard could not be evaluated ({type(exc).__name__}: {exc}); "
+            "refusing to dispatch") from exc
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1972,7 +1994,14 @@ def dispatch_once(
     frames. The loser returns an empty ``DispatchResult`` with
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
+
+    The global emergency stop is checked first, before any board write, claim or spawn, so
+    every entry point (gateway, ``kanban dispatch``, a forced ``daemon``) honors it. A guard
+    that cannot be evaluated raises :class:`DispatchGuardUnavailable` rather than dispatching.
     """
+    if _dispatch_paused():
+        return DispatchResult(skipped_paused=True)
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -3024,6 +3053,9 @@ def run_daemon(
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
+        except DispatchGuardUnavailable:
+            # An unevaluable ESTOP guard is a refusal to run, not a tick to retry silently.
+            raise
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback

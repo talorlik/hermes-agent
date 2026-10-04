@@ -7,6 +7,10 @@ classifier must call out rate limiting / outages explicitly, and the raw
 stderr line must always be printed alongside the diagnosis.
 """
 
+import os
+
+import pytest
+
 from hermes_cli import update_cmd
 
 
@@ -123,10 +127,41 @@ def test_update_network_git_calls_never_prompt_for_credentials():
     assert "GIT_CONFIG_COUNT" not in kw["env"] or kw["env"]["GIT_CONFIG_COUNT"] == os.environ.get("GIT_CONFIG_COUNT")
 
 
+@pytest.mark.usefixtures("python_less_fixture_tree_passes_audit")
 def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch, tmp_path):
-    """Exercise origin fetch and fork fetch/pull/push, not their source spelling."""
+    """Exercise origin fetch and fork fetch/pull/push, not their source spelling.
+
+    Real Git over a bare origin, a bare upstream one commit ahead, and a clone: the sync has to
+    capture a real HEAD and prove a clean checkout before it reaches the network commands, so a
+    mocked Git that answers every command with empty output never gets there. The tree holds one
+    text file, hence the named audit opt-in and the candidate-test seam; the subject is the
+    environment of the network spawns.
+    """
     import subprocess
     from hermes_cli import update_cmd_git
+
+    real_run = subprocess.run
+
+    def git(cwd, *args):
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        return real_run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "-c", "commit.gpgsign=false", *args], cwd=cwd, check=True,
+                        capture_output=True, text=True, env=env).stdout.strip()
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    git(seed, "init", "-q", "-b", "main")
+    (seed / "content.txt").write_text("base\n", encoding="utf-8")
+    git(seed, "add", "content.txt")
+    git(seed, "commit", "-qm", "base")
+    git(tmp_path, "clone", "-q", "--bare", str(seed), "origin.git")
+    (seed / "content.txt").write_text("upstream\n", encoding="utf-8")
+    git(seed, "commit", "-qam", "upstream")
+    upstream_tip = git(seed, "rev-parse", "HEAD")
+    git(tmp_path, "clone", "-q", "--bare", str(seed), "upstream.git")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(tmp_path / "origin.git"), str(clone))
+    git(clone, "remote", "add", "upstream", str(tmp_path / "upstream.git"))
 
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
     monkeypatch.setenv("GCM_INTERACTIVE", "Always")
@@ -134,19 +169,24 @@ def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch,
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "credential.helper")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "fixture-helper")
-    monkeypatch.setattr(update_cmd, "_has_upstream_remote", lambda *a: True)
-    monkeypatch.setattr(update_cmd, "_count_commits_between",
-                        lambda git, cwd, base, head: 2 if head == "upstream/main" else 0)
+    # The candidate gate runs the checkout's own updater tests, which this tree does not have.
+    monkeypatch.setattr(update_cmd_git, "_run_fork_sync_tests", lambda _cwd: (True, ""))
+    network = {"fetch", "pull", "push", "ls-remote"}
     calls = []
 
     def run(cmd, **kwargs):
-        calls.append((cmd[1:], kwargs))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[1] in network:
+            calls.append((cmd[1:], kwargs))
+        return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", run)
-    update_cmd._git_run(["git"], ["fetch", "origin", "main"], cwd=tmp_path, network=True, check=True)
-    assert update_cmd_git._sync_with_upstream_if_needed(["git"], tmp_path, assume_yes=True)
-    assert [args[0] for args, _ in calls] == ["fetch", "fetch", "pull", "push"]
+    update_cmd._git_run(["git"], ["fetch", "origin", "main"], cwd=clone, network=True, check=True)
+    assert update_cmd_git._sync_with_upstream_if_needed(["git"], clone, assume_yes=True)
+    # The sync really landed and published: HEAD and the fork both hold the upstream commit.
+    assert git(clone, "rev-parse", "HEAD") == upstream_tip
+    assert git(tmp_path / "origin.git", "rev-parse", "main") == upstream_tip
+    # ls-remote is the origin/main postcondition read-back: a network spawn like the others.
+    assert [args[0] for args, _ in calls] == ["fetch", "fetch", "pull", "push", "ls-remote"]
     for args, kwargs in calls:
         assert kwargs["stdin"] is subprocess.DEVNULL, args
         env = kwargs["env"]

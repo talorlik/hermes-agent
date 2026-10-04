@@ -417,6 +417,10 @@ kanban:
 #   - Gateway/messaging/cron: Uses terminal.cwd here; legacy .env cwd values are deprecated
 cron:
   catch_up_missed: true  # False skips past-grace recurring misses after planned downtime.
+  # Ledger-wide ceiling on terminal cron attempts (cron/executions.db). Integer or null.
+  # null = no ceiling: each job keeps its newest 1000 attempts plus the last 30 days.
+  # An integer caps the whole ledger and overrides the 30-day floor (recent history is deleted).
+  max_terminal_executions: null
 
 terminal:
   backend: "local"

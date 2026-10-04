@@ -144,21 +144,22 @@ def test_scheduler_imports_compat_on_missing_upstream():
     assert model == "gpt-4"
 
 
-def test_scheduler_import_fallback_behavior(monkeypatch):
-    """Verify scheduler import fallback behaves correctly when upstream function is missing.
-    
-    This test simulates the import path by patching the hermes_cli.config import to raise
-    ImportError for resolve_cron_model_drift_defaults, then verifying the scheduler can still
-    import successfully via the compat module.
+def test_scheduler_import_fallback_behavior():
+    """The scheduler must still import when ``hermes_cli.config`` lacks the drift helper.
+
+    Runs in a fresh interpreter: the experiment replaces ``hermes_cli.config`` and evicts
+    ``cron.scheduler`` from ``sys.modules``, which in-process leaves the package attribute, collected
+    function globals and the split modules' ``_sched`` references pointing at a different module
+    object and silently breaks every later scheduler test (module-identity poisoning).
     """
+    import subprocess
     import sys
-    from importlib import reload
+    import textwrap
 
-    # Save the original hermes_cli.config module state
-    original_config = sys.modules.get("hermes_cli.config")
+    probe = textwrap.dedent(
+        """
+        import sys
 
-    try:
-        # Create a mock hermes_cli.config module that has load_config but not resolve_cron_model_drift_defaults
         class MockConfigModule:
             def load_config(*args, **kwargs):
                 return {}
@@ -166,40 +167,20 @@ def test_scheduler_import_fallback_behavior(monkeypatch):
             def load_config_readonly(*args, **kwargs):
                 return {}
 
-        # Replace hermes_cli.config with our mock
-        mock_config = MockConfigModule()
-        sys.modules["hermes_cli.config"] = mock_config
-
-        # Force scheduler to reimport (this would happen naturally in the real import path)
-        if "cron.scheduler" in sys.modules:
-            del sys.modules["cron.scheduler"]
-
-        # Import scheduler - it should fall back to compat and not raise ImportError
+        sys.modules["hermes_cli.config"] = MockConfigModule()
+        sys.modules.pop("cron.scheduler", None)
         from cron import scheduler
 
-        # Verify the scheduler has access to resolve_cron_model_drift_defaults
         assert hasattr(scheduler, "resolve_cron_model_drift_defaults")
-
-        # Verify it's the compat version by checking the flag
         assert scheduler._USING_MODEL_DRIFT_COMPAT is True
-
-        # Verify it works
-        config = {"model": "gpt-4"}
-        provider, model = scheduler.resolve_cron_model_drift_defaults(
-            config, environ={}
-        )
+        provider, model = scheduler.resolve_cron_model_drift_defaults({"model": "gpt-4"}, environ={})
         assert model == "gpt-4"
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120)
 
-    finally:
-        # Restore original state
-        if original_config is not None:
-            sys.modules["hermes_cli.config"] = original_config
-        elif "hermes_cli.config" in sys.modules:
-            del sys.modules["hermes_cli.config"]
-
-        # Clean up scheduler module so subsequent tests get fresh imports
-        if "cron.scheduler" in sys.modules:
-            del sys.modules["cron.scheduler"]
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 def test_model_assignment_text_helper():

@@ -794,6 +794,10 @@ class TestRequestReviewReceipts:
     def test_refused_handoff_emits_no_receipt(self, tmp_path: Path) -> None:
         home = _home(tmp_path)
         tid, _run_id = _running_task(home)
+        # Upstream's live-claim guard protects a run whose worker process exists; a bare CLI
+        # claim spawned no worker, so register a live one (this test process) for the claim.
+        with sqlite3.connect(home / "kanban.db") as conn:
+            conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (os.getpid(), tid))
         before = _dump_db(home)
         # Live-claim guard: no ownership proof and no --force.
         result = _run_hermes(

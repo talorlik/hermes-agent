@@ -77,3 +77,27 @@ def _reset_session_context_vars():
     _reset_all()
     yield
     _reset_all()
+
+
+@pytest.fixture(autouse=True)
+def _bind_media_owner_roots_to_the_test_home(_isolate_hermes_home, monkeypatch):
+    """The media owner (``gateway.platforms.base``) reads its home/root and the static allow roots
+    at import. A module imported by an earlier test keeps that test's (or the launch) home, so a later
+    test enumerates the stale tree and trips the home I/O guard before reaching the contract it is
+    about. Rebind the owner's constants to THIS test's isolated home. Path authorization, the
+    credential denylist and the home guard themselves are untouched."""
+    import sys
+
+    base = sys.modules.get("gateway.platforms.base")
+    if base is None or not hasattr(base, "_HERMES_ROOT"):
+        return
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    home = get_hermes_home()
+    monkeypatch.setattr(base, "_HERMES_HOME", home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", get_default_hermes_root())
+    legacy = ("image_cache", "audio_cache", "video_cache", "document_cache", "browser_screenshots")
+    monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", (
+        *(home / "cache" / d for d in ("images", "audio", "videos", "documents", "screenshots")),
+        *(home / d for d in legacy),
+        *(home / "cache" / d for d in base._MEDIA_DELIVERY_CACHE_SUBDIRS)))

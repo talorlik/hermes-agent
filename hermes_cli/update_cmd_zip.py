@@ -341,6 +341,13 @@ def _download_and_swap_zip(branch: str, zip_url: str) -> None:
         entries = [i for i in os.listdir(extracted) if i not in _ZIP_PRESERVED_TOP_LEVEL]
         project_root = str(_m().PROJECT_ROOT)
         _require_staging_space(extracted, entries, project_root)
+        # Compile the downloaded tree before anything is staged or swapped: a damaged release
+        # must leave the existing install untouched. Imports are not probed here (the tree is
+        # not the install yet and its dependencies are not installed).
+        from hermes_cli.update_cmd_integrity import failure_lines
+        findings = failure_lines(extracted, check_imports=False)
+        if findings is not None:
+            raise RuntimeError("downloaded source failed the integrity audit: " + "; ".join(findings[:5]))
         staged = _stage_entries(extracted, entries, project_root)
         try:
             # TOCTOU re-check right before the swap: download + extract + staging can take minutes and

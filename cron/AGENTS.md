@@ -28,6 +28,14 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
+- **Execution-ledger retention is per job by default; the ledger-wide bound is opt-in config.**
+  `cron/executions.py::_prune_unlocked` keeps each job's newest `PER_JOB_TERMINAL_EXECUTIONS`
+  terminal rows plus everything finished inside `TERMINAL_RETENTION_FLOOR_DAYS`, ranked by finish
+  instant. `cron.max_terminal_executions` (default null) adds a fair ledger-wide ceiling that
+  overrides the floor, read from the `config.yaml` beside the ledger being written, never from
+  the launch profile. There is no `MAX_TERMINAL_EXECUTIONS` constant on purpose: an upstream sync
+  that restores one global number silently deletes recent evidence across jobs. Claimed, running
+  (including detached leases) and deferred rows are never retention candidates.
 - **The ticker binds each served profile's scope for the whole tick, including pre-loop code.**
   `scheduler_provider.py::_start_multiplex` is ONE ticker iterating `profiles_to_serve()`
   sequentially under `_profile_cron_scope(home)` (home + secret scope + terminal scope) — never N

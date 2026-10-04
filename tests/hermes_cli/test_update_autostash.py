@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from hermes_cli import main as hermes_main, update_cmd
+from hermes_cli import main as hermes_main, update_cmd, update_cmd_git
 from tests.hermes_cli.test_update_target_identity import git, update_tree  # noqa: F401
 
 
@@ -16,6 +16,7 @@ from tests.hermes_cli.test_update_target_identity import git, update_tree  # noq
     ('orphan', None, False), ('orphan', 'reset', False),
     ('orphan', 'ref', False), ('orphan', 'head', False),
 ])
+@pytest.mark.usefixtures('python_less_fixture_tree_passes_audit')
 def test_update_preserves_local_work_and_rescues_orphan_before_reset(
     update_tree, monkeypatch, capsys, history, failure, keep,
 ):
@@ -31,7 +32,8 @@ def test_update_preserves_local_work_and_rescues_orphan_before_reset(
     before = git(t.clone, 'rev-parse', 'HEAD')
     (t.clone / 'untracked.txt').write_text('local edit\n', encoding='utf-8')
     t.args.channel, t.args.keep_stash = 'main', keep
-    monkeypatch.setattr(hermes_main, '_sync_with_upstream_if_needed', update_cmd._sync_with_upstream_if_needed)
+    # The real typed owner: this fork has no upstream remote, so it declines without mutating.
+    monkeypatch.setattr(update_cmd, '_sync_with_upstream_observed', update_cmd_git._sync_with_upstream_observed)
     monkeypatch.setattr(update_cmd, '_UPDATE_CRITICAL_MODULES', ())
     original = subprocess.run
     resets = []

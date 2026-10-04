@@ -17,12 +17,9 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from hermes_cli._subprocess_compat import windows_hide_flags
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -34,6 +31,11 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao"})
+
+# Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response
+# only, ``send()`` is a stub) — a cron report can never reach them, so they are never a
+# deliver=origin destination.
+_NON_PUSH_ORIGIN_PLATFORMS = frozenset({"api_server"})
 
 # Platforms supporting a cron/notification home target -> env var used by gateway config.
 _HOME_TARGET_ENV_VARS = {
@@ -89,6 +91,11 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     """
     origin = job.get("origin")
     if isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
+        # Jobs stamped before non-push origins stopped being captured (#69304): the api_server
+        # adapter's send() is a stub, so honouring this origin fails every fire with
+        # last_status=ok. Treat it as missing so deliver=origin takes the home-channel fallback.
+        if str(origin["platform"]).lower() in _NON_PUSH_ORIGIN_PLATFORMS:
+            return None
         return origin
     return None
 
@@ -692,52 +699,46 @@ def _get_bot_chat_delivery_timeout() -> int:
         return 600
 
 
+def _get_standalone_send_timeout() -> int:
+    """Wall-clock bound for one standalone-lane send (#115469).
+
+    ``_send_to_platform``'s gateway-loop dispatch deliberately awaits its future with no
+    timeout ("the adapter and outer _run_async bound the wait") — but on this lane the
+    outer runner is a bare ``asyncio.run``, not ``model_tools._run_async``, so without a
+    bound here a reconnecting transport pins the run (and the restart drain behind it)
+    indefinitely. Mirrors the sibling lanes: live dispatch ``future.result(timeout=60)``,
+    thread fallback ``result(timeout=30)``. ``cron.standalone_send_timeout_seconds``;
+    default 60."""
+    try:
+        cfg = _sched.load_config()
+        value = int(cfg.get("cron", {}).get("standalone_send_timeout_seconds", 60))
+        return value if value > 0 else 60
+    except Exception:
+        return 60
+
+
 _BOT_CHAT_STDERR_TAIL = 500
 # stdout is the model's answer; only a short tail is persisted (jobs.json / ledger).
 _BOT_CHAT_STDOUT_TAIL = 200
 _BOT_CHAT_BANNER_PREFIXES = ("Resumed session", "session_id:")
-# After the child reports its turn, a child with nothing to linger for exits at once; give it
-# that long so its real exit code and stream tails are booked instead of the report's summary.
-_BOT_CHAT_EXIT_GRACE_SECONDS = 2.0
 
 
 def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) -> subprocess.CompletedProcess:
-    """Run one ``hermes chat -Q`` delivery child; the cap bounds the TURN, not the process.
+    """Run one ``hermes chat -Q`` delivery child; the cap bounds the TURN, not the process (#113608).
 
-    The child records its turn outcome at *report_path* (``hermes_cli.quiet_single_query``)
-    the moment the turn ends, then runs the one-shot exit linger for nested
-    ``notify_on_complete`` replies — bounded by ``terminal.oneshot_completion_wait_seconds``,
-    whose default equals this lane's cap, so waiting for process exit booked every delivered
-    turn that left a reply pending as a timeout and killed the linger (#113608). Once the
-    report exists the delivery is booked from it and the still-lingering child is left
-    running (a daemon thread drains and reaps it); only a turn that never ends is killed.
+    The booking policy lives with the report contract (``quiet_single_query.run_reported_turn``):
+    this lane needs only the outcome, so a child that reported its turn gets the exit grace and is
+    then left to its linger; only a turn that never ends is killed.
     """
-    from hermes_cli.quiet_single_query import read_turn_report
+    from hermes_cli.quiet_single_query import run_reported_turn
 
-    proc = subprocess.Popen(
-        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env=env, creationflags=windows_hide_flags())
-    streams: dict = {}
-
-    def _drain() -> None:
-        streams["out"], streams["err"] = proc.communicate()
-
-    drain = threading.Thread(target=_drain, name=f"bot-chat-delivery-{proc.pid}", daemon=True)
-    drain.start()
-    deadline = time.monotonic() + timeout
-    report = None
-    while True:
-        drain.join(timeout=0.25 if report is None else _BOT_CHAT_EXIT_GRACE_SECONDS)
-        if not drain.is_alive():
-            return subprocess.CompletedProcess(argv, proc.returncode, streams.get("out", ""), streams.get("err", ""))
-        if report is not None:
-            # Turn over, child still lingering for a nested reply: not this lane's wait.
-            return subprocess.CompletedProcess(argv, int(report["exit_code"]), "", report.get("error") or "")
-        report = read_turn_report(report_path, proc.pid)
-        if report is None and time.monotonic() >= deadline:
-            proc.kill()
-            drain.join(timeout=5.0)
-            raise subprocess.TimeoutExpired(argv, timeout)
+    # The scheduler may sit in a directory that no longer exists (a kanban worker whose
+    # scratch workspace was reaped): a child inheriting that cwd dies at CLI startup
+    # (#102941). The target home is the one directory this lane has already verified.
+    # Decoding is the runner's platform policy: lossy everywhere (#105582), UTF-8 only on
+    # win32 (#115894), the locale codec on POSIX (#66566).
+    return run_reported_turn(argv, env=env, report_path=report_path, timeout=timeout,
+                             cwd=env.get("HERMES_HOME") or None)
 
 
 def _format_failure_streams(result) -> str:
@@ -795,8 +796,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
     # fail-closed scrub as the chat message and the session mirror. Rebind ``content`` itself so
     # the durable deferred record below also carries the scrubbed copy, not the raw output.
     content = _redact_cron_payload(content, "bot-chat payload")
+    job_name = _redact_cron_payload(job.get("name", job_id), "job name")
     message = (
-        f'[Cronjob "{_redact_cron_payload(job.get("name", job_id), "job name")}" output — '
+        f'[Cronjob "{job_name}" output — '
         f"scheduled job, not the user. Review it, act on anything that needs action, and "
         f"summarize for the chat.]\n\n{content}"
     )
@@ -893,15 +895,29 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         return msg
 
     from agent.delegation_context import delegated_child_subprocess_env
-    from tools.environments.local import strip_launch_profile_env
-    env = strip_launch_profile_env(delegated_child_subprocess_env(os.environ))
+    from tools.environments.local import served_profile_child_env
     if not home.is_dir():
         return _fail(f"bot-chat delivery target no longer exists: {home}; do not resend")
-    # Discovery (or deferred admission) owns the destination, not HOME or a
-    # subsequently changed active_profile. Do not resolve the name a second time.
-    env["HERMES_HOME"] = str(home)
+    # Built for ``home``, the DELIVERY TARGET — the only cron child that acts for a profile other
+    # than the one whose tick spawned it, so the launch residue cannot be resolved from the ambient
+    # override the way every other lane resolves it. Discovery (or deferred admission) owns the
+    # destination, not HOME or a subsequently changed active_profile: do not resolve it again.
+    # ``inherit_credentials``: the child runs a full agent turn as that profile, on its own secrets.
+    try:
+        env = served_profile_child_env(
+            delegated_child_subprocess_env(os.environ), target_home=home, inherit_credentials=True)
+    except Exception as exc:  # unreadable target home / secret source: refuse, never fall back
+        return _fail(f"bot-chat delivery to profile '{profile_label}' could not build the target "
+                     f"profile's environment ({type(exc).__name__}: {exc}); do not resend")
     if home.parent.name != "profiles":
         argv += ["-p", "default"]
+    if argv[1:3] == ["-m", "hermes_cli.main"]:
+        # served_profile_child_env strips Hermes-owned PYTHONPATH entries; under a store-python
+        # shim the bare interpreter then cannot import the package find_spec just proved (#122487).
+        from pathlib import Path
+
+        from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+        pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
 
     query_file = None
     try:
@@ -918,7 +934,8 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV
         report_file = f"{query_file}.turn.json"
         env[TURN_REPORT_FILE_ENV] = report_file
-        result = _run_bot_chat_turn(argv, env, report_file, _get_bot_chat_delivery_timeout())
+        timeout_s = _get_bot_chat_delivery_timeout()
+        result = _run_bot_chat_turn(argv, env, report_file, timeout_s)
         if result.returncode != 0:
             tail = _format_failure_streams(result)
             logger.warning(
@@ -931,11 +948,41 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
     except subprocess.TimeoutExpired:
+        # Replaying the full payload risks a duplicate (the killed turn may already have
+        # persisted it); staying silent loses the alert entirely (2026-09-19 docgen-deadman
+        # case). So queue a SHORT marker that points at the saved output, once per execution
+        # (stable key); the re-mark guard reads the record's ``degraded`` flag, never the text.
+        marker_queued = False
+        if not (deferred or {}).get("degraded"):
+            marker = (
+                f"DELIVERY DEGRADED: this alert's bot-chat turn timed out after "
+                f"{timeout_s}s, so the full output could NOT be posted here. Read the "
+                f"complete saved output with `hermes cron runs` (job '{job_id}'). "
+                f"Excerpt: {content.strip()[:280]}"
+            )
+            try:
+                from cron.bot_chat_delivery import defer as _defer_marker
+                # Deferred ids double as live-owner delivery ids, which must be 32-64 hex
+                # chars (tools.bot_live_delivery._delivery_id) — so the marker's id is a
+                # fresh digest derived from the execution key, not a suffixed one.
+                marker_key = hashlib.sha256(f"{key}:degraded".encode("utf-8")).hexdigest()
+                _defer_marker(marker_key, dict(job), marker, profile, home,
+                              for_failure=for_failure, degraded=True)
+                marker_queued = True
+            except Exception as defer_exc:
+                logger.warning(
+                    "Job '%s': degraded-delivery marker could not be queued: %s",
+                    job_id, defer_exc)
+        hint = (
+            "a short degraded-delivery notice was queued to Bot Chat — posted once the "
+            f"session frees; full output stays saved, run `hermes cron runs` for job '{job_id}'"
+            if marker_queued else
+            "the result is saved; run `hermes cron runs` to see it, or `hermes doctor` "
+            "if this keeps happening")
         return _fail(
             f"bot-chat delivery to profile '{profile_label}' timed out "
-            f"after {_get_bot_chat_delivery_timeout()}s (the bot's turn may "
-            "still complete; raise cron.bot_chat_delivery_timeout_seconds if "
-            "this recurs)")
+            f"after {timeout_s}s ({hint}; raise "
+            "cron.bot_chat_delivery_timeout_seconds if this recurs)")
     except Exception as e:
         logger.warning(
             "Job '%s': bot-chat delivery to profile '%s' failed: %s", job_id, profile_label,
@@ -1050,7 +1097,11 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
             target = _resolve_single_delivery_target(job, part, from_broadcast=from_broadcast)
             if not target:
                 continue
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            # An integer thread id and its string alias are the same destination.
+            thread_key = target.get("thread_id")
+            if thread_key is not None:
+                target["thread_id"] = thread_key = str(thread_key)
+            key = (target["platform"].lower(), str(target["chat_id"]), thread_key)
             kept = seen.get(key)
             if kept is None:
                 seen[key] = target
@@ -1232,7 +1283,7 @@ def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
 
 
 def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
-    """Persist ``last_delivery_unverified``: list of ``platform:chat_id`` targets acked with no
+    """Persist ``last_delivery_unverified``: list of ``platform:chat_id[:thread_id]`` targets acked with no
     evidence, or None, alongside queued Bot Chat receipts. Never raises (bookkeeping must not fail a
     delivery)."""
     new_value = list(unverified_targets) or None
@@ -1247,15 +1298,17 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
     job.update(values)
     try:
         from cron.jobs import update_job
-        from cron.outbox import get_job_delivery_projection
-        projection = get_job_delivery_projection(job["id"]) or {}
-        cas = {}
-        execution_id = job.get("execution_id") or projection.get("execution_id")
+
+        cas: dict = {}
+        execution_id = job.get("execution_id")
         if execution_id:
-            cas["expected_execution_id"] = execution_id
-        revision = projection.get("revision")
-        if revision is not None:
-            cas["expected_projection_revision"] = revision
+            # A run with an execution id may write job fields only under the projection revision
+            # that run was stamped with (``_begin_delivery_run``); a writer without that proof is a
+            # stale run and must not overwrite the current one's status.
+            revision = job.get("_delivery_projection_revision")
+            if revision is None:
+                return
+            cas = {"expected_execution_id": execution_id, "expected_projection_revision": revision}
         update_job(job["id"], values, **cas)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Job '%s': could not record delivery verification: %s", job.get("id"), exc)
@@ -1287,6 +1340,7 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
 
     @property
     def is_relay(self) -> bool:
@@ -1294,7 +1348,9 @@ class _TargetDelivery:
 
     @property
     def where(self) -> str:
-        return f"{self.platform_name}:{self.chat_id}"
+        # A topic-routed target without its thread id names the wrong lane in failure reports.
+        base = f"{self.platform_name}:{self.chat_id}"
+        return f"{base}:{self.thread_id}" if self.thread_id else base
 
 
 def _note_target_error(job: dict, msg: str, errors: list) -> None:
@@ -1444,8 +1500,12 @@ def _live_send_text(
         platform=t.platform, chat_id=str(t.chat_id), thread_id=route_thread_id, is_explicit=True)
     # Thread routing goes via the target, not a bare metadata "thread_id": the router only applies
     # its Telegram DM-topic detection when thread_id/message_thread_id are absent from metadata.
+    # Send through the already-authorized transport: re-resolving from the plain target_adapters
+    # dict cannot re-derive the SharedRouteAdapters satellite grant (the satellite owned
+    # platforms.<p> block is disabled), yields None, and drops the delivery (#115656).
     future = safe_schedule_threadsafe(
-        router._deliver_to_platform(route_target, text_to_send, route_metadata), t.loop)
+        router._deliver_to_platform(
+            route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
     if future is None:
         target_errors.append("live adapter event loop scheduling failed")
         return False, False, None
@@ -1468,7 +1528,9 @@ def _live_send_text(
             job["id"], t.platform_name, t.chat_id)
         return True, True, None
     except Exception as ex:
-        # Real send error (not a slow confirmation): fall through to standalone.
+        # Real send error (not a slow confirmation): fall through to standalone. The router raises
+        # a failed SendResult's error string, so this is where send_path_degraded arrives.
+        t.live_error = str(ex)
         target_errors.append(f"live adapter send failed: {ex}")
         raise
 
@@ -1491,6 +1553,7 @@ def _live_send_text(
         else:
             err, shape = getattr(send_result, "error", None), type(send_result).__name__
         msg = f"live adapter send to {t.where} returned unconfirmed result ({shape}, error={err})"
+        t.live_error = str(err) if err else None
         _warn_live_lane_failure(job, msg, t.is_relay)
         target_errors.append(msg)
         return False, False, None
@@ -1647,10 +1710,14 @@ def _standalone_send(
     job = t.job
     shutdown_msg = f"delivery to {t.where} skipped — interpreter is shutting down"
 
-    def _send():
-        return _send_to_platform(
+    send_timeout = _get_standalone_send_timeout()
+
+    async def _send():
+        # The bound lives inside the coroutine: the running-loop fallback below closes ``coro``
+        # unstarted, and a wait_for wrapper created out here would be left never awaited.
+        return await asyncio.wait_for(_send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files)
+            media_files=media_files), timeout=send_timeout)
 
     def _warned(msg: str) -> tuple[None, str]:
         logger.warning("Job '%s': %s", job["id"], msg)
@@ -1672,6 +1739,13 @@ def _standalone_send(
     coro = _send()
     try:
         return asyncio.run(coro), None
+    except TimeoutError:
+        # The send may still complete on the gateway loop (the dispatch shield keeps an in-flight
+        # send un-cancelled); the run is released instead of waiting on it unbounded (#115469).
+        msg = (f"standalone send to {t.where} timed out after {send_timeout}s "
+               "(the send may still be in flight)")
+        logger.error("Job '%s': %s", job["id"], msg)
+        return None, msg
     except RuntimeError as run_err:
         # asyncio.run() refuses inside a running loop; close the unstarted coro, retry in a thread.
         coro.close()
@@ -1683,8 +1757,15 @@ def _standalone_send(
             try:
                 # A fresh thread does NOT inherit the profile ContextVars (home override + secret
                 # scope); run in the active context or the sender reads the default bot token.
-                return pool.submit(contextvars.copy_context().run, asyncio.run, _send()).result(
-                    timeout=30), None
+                fallback = _send()
+                try:
+                    future = pool.submit(contextvars.copy_context().run, asyncio.run, fallback)
+                except BaseException:
+                    # Nothing owns the coroutine if the pool refused it; close this locally owned,
+                    # never-started object so it is not left un-awaited.
+                    fallback.close()
+                    raise
+                return future.result(timeout=30), None
             finally:
                 pool.shutdown(wait=False)
         except Exception as e:
@@ -1693,6 +1774,35 @@ def _standalone_send(
             return _failed(e)
     except Exception as e:
         return _failed(e)
+
+
+def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: list, delivery_errors: list) -> None:
+    """Hand a payload the live lane rejected as reconnect-only (``send_path_degraded``) and the
+    standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
+    owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
+    reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
+    carries text only; dropped attachments are reported."""
+    try:
+        from gateway.delivery_ledger import (
+            compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
+        if not is_reconnect_only(t.live_error) or not ledger_enabled():
+            return
+        session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
+        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
+        record_obligation(
+            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
+            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
+            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
+        mark_failed(obligation_id, str(t.live_error))
+    except Exception:
+        logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
+                       t.job.get("id"), t.where, exc_info=True)
+        return
+    note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
+    if media_files:
+        note += f" ({len(media_files)} attachment(s) not queued)"
+    logger.warning("Job '%s': %s", t.job.get("id"), note)
+    delivery_errors.append(note)
 
 
 def _deliver_standalone(
@@ -1714,6 +1824,9 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
+        # A satellite profile's worker has no platform token, so standalone cannot stand in for a
+        # live adapter that is only waiting to reconnect: keep the payload for that adapter.
+        _queue_for_live_reconnect(t, content, media_files, delivery_errors)
         return
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
@@ -1858,40 +1971,161 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
-def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
-) -> Optional[str]:
-    """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
-    running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
-    standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
-    ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
-    job.pop("_bot_chat_delivery_receipts", None)
-    job.pop("_notification_all_targets_suppressed", None)
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
-    if not targets:
-        _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
+@dataclass(frozen=True)
+class DestinationDeliveryOutcome:
+    """One concrete destination's contribution to a scheduler delivery run."""
 
+    delivery_id: str
+    target: dict
+    status: str
+    bot_chat_receipts: tuple[tuple[str, dict], ...] = ()
+    unverified_targets: tuple[str, ...] = ()
+    error: Optional[str] = None
+
+
+@dataclass
+class DeliveryRunAccumulator:
+    """Destination-keyed aggregate state owned by one scheduler delivery run."""
+
+    job: dict
+    outcomes: dict[str, DestinationDeliveryOutcome]
+    finalized: bool = False
+
+    def record(self, outcome: DestinationDeliveryOutcome) -> None:
+        if self.finalized:
+            raise RuntimeError("delivery run is already finalized")
+        self.outcomes[str(outcome.delivery_id)] = outcome
+
+    def validate_job(self, job: dict) -> None:
+        """Reject records from a different job or execution."""
+        if str(job.get("id") or "") != str(self.job.get("id") or ""):
+            raise ValueError("delivery run belongs to a different job")
+        expected_execution = self.job.get("execution_id")
+        if expected_execution is not None and str(job.get("execution_id") or "") != str(
+            expected_execution
+        ):
+            raise ValueError("delivery run belongs to a different execution")
+
+    def finalize(self) -> None:
+        if self.finalized:
+            return
+        receipts_by_id: dict[str, tuple[str, dict]] = {}
+        receipt_order = {"queued": 0, "claimed": 1, "settled": 2}
+        unverified: list[str] = []
+        for outcome in self.outcomes.values():
+            unverified.extend(outcome.unverified_targets)
+            for target_key, receipt in outcome.bot_chat_receipts:
+                receipt_id = str(receipt.get("delivery_id") or "")
+                dedupe_key = (
+                    receipt_id or f"{outcome.delivery_id}:{receipt.get('status')}"
+                )
+                previous = receipts_by_id.get(dedupe_key)
+                if previous is None or receipt_order.get(
+                    str(receipt.get("status")), -1
+                ) > receipt_order.get(str(previous[1].get("status")), -1):
+                    receipts_by_id[dedupe_key] = (target_key, dict(receipt))
+        self.job["_bot_chat_delivery_receipts"] = {
+            target_key: receipt for target_key, receipt in receipts_by_id.values()
+        }
+        _record_delivery_verification(self.job, unverified)
+        self.job.setdefault("last_delivery_unverified", None)
+        self.job.setdefault("last_delivery_queued", None)
+        self.finalized = True
+
+
+def _begin_delivery_run(job: dict) -> DeliveryRunAccumulator:
+    job.pop("_bot_chat_delivery_receipts", None)
+    execution_id = job.get("execution_id")
+    if execution_id is not None:
+        try:
+            from cron.outbox import get_job_delivery_projection
+
+            projection = get_job_delivery_projection(str(job["id"]))
+            if projection is not None and str(projection.get("execution_id")) == str(
+                execution_id
+            ):
+                job["_delivery_projection_revision"] = int(projection["revision"])
+        except Exception:
+            logger.debug(
+                "Job '%s': delivery projection lookup failed",
+                job.get("id"),
+                exc_info=True,
+            )
+    return DeliveryRunAccumulator(job=job, outcomes={})
+
+
+def _finalize_delivery_run(run: DeliveryRunAccumulator) -> None:
+    run.finalize()
+
+
+def _deliver_exact_target(
+    job: dict,
+    content: str,
+    destination: dict,
+    adapters=None,
+    loop=None,
+    *,
+    outbox_id: Optional[str] = None,
+    for_failure: bool = False,
+    delivery_run: DeliveryRunAccumulator,
+) -> Optional[str]:
+    """Deliver one already-resolved destination without consulting route configuration.
+    ``for_failure`` keeps the failure-notice notification policy in force for queue-owned sends."""
+    target = {
+        "platform": str(destination["platform"]),
+        "chat_id": str(destination["chat_id"]),
+        "thread_id": (
+            str(destination["thread_id"])
+            if destination.get("thread_id") is not None
+            else None
+        ),
+        "_resolved_from": destination.get("_resolved_from"),
+    }
+    return _deliver_resolved_targets(
+        job,
+        content,
+        [target],
+        adapters=adapters,
+        loop=loop,
+        for_failure=for_failure,
+        allow_worker_queue=True,
+        outbox_id=outbox_id,
+        delivery_run=delivery_run,
+    )
+
+
+def _deliver_resolved_targets(
+    job: dict, content: str, targets: list, *, adapters=None, loop=None, for_failure: bool,
+    allow_worker_queue: bool, outbox_id: Optional[str] = None,
+    delivery_run: "DeliveryRunAccumulator",
+) -> Optional[str]:
+    """Deliver concrete targets through the current adapter and credential stack, recording one
+    ``DestinationDeliveryOutcome`` per target into the caller-owned run."""
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
     # and that nested delivery must not be keyed under the outer execution id.
     external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
-    if (external_execution and adapters is None
+    if (allow_worker_queue and external_execution and adapters is None
             and external_execution == str(job.get("execution_id") or "")
             and any(target["platform"] != BOT_CHAT_PLATFORM for target in targets)):
         from cron.delivery_queue import enqueue_and_wait
 
-        _record_delivery_verification(job, [])
-        error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
+        exact = {}
+        if outbox_id is not None:
+            exact = {"destination": targets[0], "outbox_id": outbox_id}
+        error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure, **exact)
         from cron.delivery_queue import get_status
-        delivery_status = get_status(external_execution)
+        delivery_status = get_status(str(outbox_id or external_execution))
         if delivery_status and delivery_status["status"] == "suppressed":
             job["_notification_all_targets_suppressed"] = True
         from cron.jobs import get_job
         refreshed = get_job(job["id"]) or {}
         job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+        delivery_run.record(DestinationDeliveryOutcome(
+            delivery_id=str(outbox_id or external_execution), target=targets[0],
+            status="failed" if error else "queued", error=error))
         return error
 
     from gateway.config import load_gateway_config
@@ -1964,42 +2198,82 @@ def _deliver_result(
 
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
-    for target in targets:
-        # A failure notice for a platform that hides warning notifications is a suppressed
-        # disposition, not a send; requested (non-failure) results are never gated.
-        from gateway.warning_notifications import warning_notifications_enabled
-        if (for_failure and target["platform"] != BOT_CHAT_PLATFORM
-                and not warning_notifications_enabled(target["platform"], user_cfg)):
-            suppressed_targets += 1
-            continue
-        # Bot Chat owns admission; never concurrently resume a live owner's transcript.
-        if target["platform"] == BOT_CHAT_PLATFORM:
-            bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
-            suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
-            if bot_chat_error:
+    for target_index, target in enumerate(targets):
+        delivery_id = str(outbox_id or f"legacy:{target_index}:{target.get('platform')}:{target.get('chat_id')}")
+        target_error_start = len(delivery_errors)
+        target_unverified: list = []
+        try:
+            # A failure notice for a platform that hides warning notifications is a suppressed
+            # disposition, not a send; requested (non-failure) results are never gated.
+            from gateway.warning_notifications import warning_notifications_enabled
+            if (for_failure and target["platform"] != BOT_CHAT_PLATFORM
+                    and not warning_notifications_enabled(target["platform"], user_cfg)):
+                suppressed_targets += 1
+                continue
+            # Bot Chat owns admission; never concurrently resume a live owner's transcript.
+            if target["platform"] == BOT_CHAT_PLATFORM:
+                bot_chat_error = _deliver_to_bot_chat(job, content, target["chat_id"], for_failure=for_failure)
+                suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
+                if bot_chat_error:
+                    receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
+                    receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
+                    if not receipt or receipt["status"] not in ("queued", "claimed"):
+                        delivery_errors.append(bot_chat_error)
+                    if receipt and receipt["status"] == "ambiguous":
+                        unverified_targets.append(bot_chat_error)
+                continue
+
+            t = _prepare_target_delivery(
+                job, target, adapters=adapters, loop=loop, config=config,
+                notify_delivery=notify_delivery,
+                mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
+            if t is None:
+                continue
+            if t.opened_thread_id and outbox_id is not None:
+                # A continuation thread opened for an exact destination is persisted into the immutable
+                # target BEFORE the send; while the row is claimed that write is refused, so the failure
+                # leaves the update pending for the queue to apply and reactivate on the canonical thread.
+                thread_updates = job.setdefault("_exact_thread_updates", {})
+                thread_updates[str(outbox_id)] = str(t.opened_thread_id)
+                try:
+                    from cron.outbox import update_destination_thread
+
+                    if update_destination_thread(outbox_id, t.opened_thread_id) is None:
+                        raise RuntimeError("concrete outbox destination is unavailable")
+                    thread_updates.pop(str(outbox_id), None)
+                    if not thread_updates:
+                        job.pop("_exact_thread_updates", None)
+                except Exception as exc:
+                    _note_target_error(
+                        job, f"could not persist continuation thread for {t.where}: {exc}",
+                        delivery_errors)
+                    continue
+            target_errors: list = []
+            delivered = t.live_adapter_ready and _deliver_via_live_adapter(
+                t, cleaned_delivery_content, media_files,
+                target_errors=target_errors, delivery_errors=delivery_errors,
+                unverified_targets=target_unverified,
+            )
+            if not delivered:
+                _deliver_standalone(
+                    t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+        finally:
+            target_errors = delivery_errors[target_error_start:]
+            unverified_targets.extend(target_unverified)
+            receipt_items: tuple = ()
+            receipt = None
+            if target["platform"] == BOT_CHAT_PLATFORM:
                 receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
                 receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
-                    delivery_errors.append(bot_chat_error)
-                if receipt and receipt["status"] == "ambiguous":
-                    unverified_targets.append(bot_chat_error)
-            continue
-
-        t = _prepare_target_delivery(
-            job, target, adapters=adapters, loop=loop, config=config,
-            notify_delivery=notify_delivery,
-            mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
-        if t is None:
-            continue
-        target_errors: list = []
-        delivered = t.live_adapter_ready and _deliver_via_live_adapter(
-            t, cleaned_delivery_content, media_files,
-            target_errors=target_errors, delivery_errors=delivery_errors,
-            unverified_targets=unverified_targets,
-        )
-        if not delivered:
-            _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+                if receipt is not None:
+                    receipt_items = ((receipt_target, dict(receipt)),)
+            delivery_run.record(DestinationDeliveryOutcome(
+                delivery_id=delivery_id, target=target,
+                status=(str(receipt.get("status")) if receipt is not None
+                        else "failed" if target_errors
+                        else "unverified" if target_unverified else "delivered"),
+                bot_chat_receipts=receipt_items, unverified_targets=tuple(target_unverified),
+                error="; ".join(target_errors) if target_errors else None))
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.
@@ -2007,8 +2281,41 @@ def _deliver_result(
         job["_notification_all_targets_suppressed"] = True
     else:
         delivery_errors.extend(policy_drop_errors)
-    _record_delivery_verification(job, unverified_targets)
     return "; ".join(delivery_errors) if delivery_errors else None
+
+
+def _deliver_result(
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False,
+    destination: Optional[dict] = None, outbox_id: Optional[str] = None,
+    resolved_targets: Optional[list] = None,
+    delivery_run: "Optional[DeliveryRunAccumulator]" = None,
+) -> Optional[str]:
+    """Deliver job output to the configured target(s), or to one already-resolved concrete
+    ``destination`` (queue-owned exact delivery, never re-routed). With ``adapters``/``loop``
+    (gateway running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP
+    path), then standalone fallback. ``for_failure=True`` routes failure-category notices through
+    the job's ``failure_deliver`` override when present (NS-788). Finalizes the run only when this
+    call owns it. Returns None on success, else an error."""
+    job.pop("_notification_all_targets_suppressed", None)
+    owns_run = delivery_run is None
+    run = delivery_run or _begin_delivery_run(job)
+    run.validate_job(job)
+    if destination is not None:
+        error = _deliver_exact_target(
+            job, content, destination, adapters=adapters, loop=loop, outbox_id=outbox_id,
+            for_failure=for_failure, delivery_run=run)
+    else:
+        targets = (resolved_targets if resolved_targets is not None
+                   else _resolve_delivery_targets(job, for_failure=for_failure))
+        if not targets:
+            error = _unresolved_delivery_outcome(job, for_failure)
+        else:
+            error = _deliver_resolved_targets(
+                job, content, targets, adapters=adapters, loop=loop, for_failure=for_failure,
+                allow_worker_queue=True, delivery_run=run)
+    if owns_run:
+        _finalize_delivery_run(run)
+    return error
 
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully

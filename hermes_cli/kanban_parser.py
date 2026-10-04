@@ -393,6 +393,13 @@ _SPECS = [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
+        _arg("--expected-status", dest="expected_status",
+             help="Archive only if the task's status is exactly this (atomic compare-and-archive); "
+                  "otherwise skip with outcome precondition_not_met and exit 3"),
+        _arg("--expected-completed-at", dest="expected_completed_at", type=int,
+             help="Archive only if completed_at equals this integer Unix epoch seconds "
+                  "(requires exactly one task id)"),
+        _json_flag(),
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [

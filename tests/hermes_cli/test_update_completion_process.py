@@ -113,6 +113,10 @@ def transition(tmp_path):
     shutil.copy2(Path(update_completion.__file__).with_name("_subprocess_compat.py"),
                  package / "_subprocess_compat.py")
     (package / "main.py").write_text("")
+    # The completion child runs the strict tree audit before recording success; this minimal tree has
+    # no critical modules to audit, so it supplies the collaborator the way it supplies the others.
+    # The real audit is exercised against real trees in test_update_cmd_integrity.py.
+    (package / "update_cmd_integrity.py").write_text("failure_lines = lambda root, *, strict=False: None\n")
     (package / "update_cmd_config.py").write_text("_LAST_SIBLING_SNAPSHOTS = {}\n")
     (package / "update_inventory.py").write_text(
         "from types import SimpleNamespace\nRuntimeRecord = UpdatePlan = SimpleNamespace\n"
