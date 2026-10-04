@@ -38,10 +38,17 @@ def test_real_run_ledger_and_incident_match_actual_presentation(tmp_path, monkey
         monkeypatch.setenv("_HERMES_CRON_EXTERNAL_WORKER", execution["id"])
         original_wait = delivery_queue.enqueue_and_wait
 
-        def drain_before_wait(execution_id, job, content, *, for_failure=False):
-            delivery_queue.enqueue(execution_id, job, content, for_failure=for_failure)
+        def drain_before_wait(
+            execution_id, job, content, *, for_failure=False, destination=None, outbox_id=None,
+        ):
+            # Exact handoff contract: the immutable admitted target rides the queue row.
+            delivery_queue.enqueue(
+                execution_id, job, content, for_failure=for_failure,
+                destination=destination, outbox_id=outbox_id)
             assert scheduler.drain_delivery_queue({}, None) == 1
-            return original_wait(execution_id, job, content, for_failure=for_failure)
+            return original_wait(
+                execution_id, job, content, for_failure=for_failure,
+                destination=destination, outbox_id=outbox_id)
 
         monkeypatch.setattr(delivery_queue, "enqueue_and_wait", drain_before_wait)
     scheduler.run_one_job(job)

@@ -393,6 +393,9 @@ def _serialize_destination(destination: Dict[str, Any]) -> str:
         ),
         "_resolved_from": destination.get("_resolved_from"),
     }
+    if destination.get("_opened_thread"):
+        # The thread was opened by cron for this row (continuable surface): replays seed it.
+        payload["_opened_thread"] = True
     return json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
@@ -472,7 +475,7 @@ def configure_exact_delivery(
                    SET job_json=?, generation=generation+1, updated_at=?
                    WHERE id=? AND exact_state IN ('READY','RETRYABLE_FAILED')""",
                 (
-                    json.dumps(job, ensure_ascii=False, sort_keys=True),
+                    json.dumps(job, ensure_ascii=False, sort_keys=True, default=str),
                     _hermes_now().isoformat(),
                     str(outbox_id),
                 ),
@@ -598,7 +601,17 @@ def _finalize_projection_if_settled_in(
         )
         or None
     )
-    delivery_status = "failed" if failures else "delivered"
+    # The aggregate is "delivered" only when at least one row was genuinely sent; an
+    # execution whose every settled row carries the "suppressed" marker was never sent.
+    sent = conn.execute(
+        """SELECT 1 FROM cron_outbox
+           WHERE execution_id=? AND delivery_contract=? AND exact_state='DELIVERED'
+             AND COALESCE(transport_status, '') <> 'suppressed' LIMIT 1""",
+        (str(execution_id), EXACT_QUEUE),
+    ).fetchone()
+    delivery_status = (
+        "failed" if failures else ("delivered" if sent is not None else "suppressed")
+    )
     now_iso = _hermes_now().isoformat()
     if execution_table is not None:
         conn.execute(
@@ -622,10 +635,13 @@ def _finalize_projection_if_settled_in(
         if failures
         else ("failed" if bool(row["for_failure"]) else "completed")
     )
+    # Settling finalizes the generation WITHOUT rotating its revision: the owning invocation
+    # publishes its aggregate (``update_job`` CAS on this same token, see
+    # ``scheduler_delivery._record_delivery_verification``) after the last row settles, and late
+    # callbacks carry this token too. Only a new generation (``begin``) retires it.
     conn.execute(
         """UPDATE cron_job_delivery_projection
-           SET last_status=?, last_delivery_error=?, finalized=1,
-               revision=revision+1, updated_at=?
+           SET last_status=?, last_delivery_error=?, finalized=1, updated_at=?
            WHERE job_id=? AND execution_id=? AND revision=? AND finalized=0""",
         (
             job_status,
@@ -694,15 +710,21 @@ def finish_exact(
             "retryable_failed": "RETRYABLE_FAILED",
             "dead": "DEAD",
         }[outcome]
+        # A settled non-send under the warning policy keeps its honest marker on the row
+        # ("suppressed"); other terminal outcomes leave any admission marker untouched.
         cur = conn.execute(
             """UPDATE cron_outbox
-               SET exact_state=?, outcome_error=?, lease_expires_at=NULL, updated_at=?
+               SET exact_state=?, outcome_error=?, lease_expires_at=NULL, updated_at=?,
+                   transport_status=COALESCE(?, transport_status)
                WHERE id=? AND delivery_contract=? AND exact_state='IN_FLIGHT'
                  AND generation=? AND owner_token=?""",
             (
                 desired,
                 clean_error,
                 now_iso,
+                "suppressed"
+                if transport_status == "suppressed" and not clean_error
+                else None,
                 str(outbox_id),
                 EXACT_QUEUE,
                 int(generation),
@@ -776,6 +798,55 @@ def release_exact_claim(outbox_id: str, *, generation: int, owner_token: str) ->
             generation=int(generation),
             owner_token=str(owner_token),
         )
+
+
+def readmit_exact_claim_with_thread(
+    outbox_id: str,
+    *,
+    generation: int,
+    owner_token: str,
+    thread_id: str,
+) -> bool:
+    """Attach an opened thread and release this claim in one transaction.
+
+    A separate release leaves the row READY with its old threadless
+    destination. Another drainer can claim that row before the thread
+    update, the update then rejects IN_FLIGHT, and the opened thread is
+    lost. The generation and owner token guard the write. The generation
+    still advances so a stale claim of the old destination cannot send.
+    """
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT destination_json FROM cron_outbox
+               WHERE id=? AND delivery_contract=? AND exact_state='IN_FLIGHT'
+                 AND generation=? AND owner_token=? AND state='pending'""",
+            (str(outbox_id), EXACT_QUEUE, int(generation), str(owner_token)),
+        ).fetchone()
+        if row is None or row["destination_json"] is None:
+            return False
+        destination = decode_persisted_destination(row["destination_json"])
+        destination["thread_id"] = str(thread_id)
+        destination["_opened_thread"] = True
+        destination_json = canonical_destination_json(destination)
+        cur = conn.execute(
+            """UPDATE cron_outbox
+               SET destination_json=?, destination_hash=?, generation=generation+1,
+                   exact_state='READY', owner_token=NULL, owner_process_id=NULL,
+                   owner_pid=NULL, owner_started_at=NULL, lease_expires_at=NULL,
+                   transport_status=NULL, receipt_id=NULL, updated_at=?
+               WHERE id=? AND delivery_contract=? AND exact_state='IN_FLIGHT'
+                 AND generation=? AND owner_token=? AND state='pending'""",
+            (
+                destination_json,
+                hashlib.sha256(destination_json.encode()).hexdigest(),
+                _hermes_now().isoformat(),
+                str(outbox_id),
+                EXACT_QUEUE,
+                int(generation),
+                str(owner_token),
+            ),
+        )
+        return cur.rowcount == 1
 
 
 def recover_exact_abandoned(
@@ -981,10 +1052,15 @@ def record_exact_queue_outcome_in(
     if row is None:
         return False
     attempt_no = int(row["attempts"]) + (0 if account_existing_attempt else 1)
+    # A settled non-send keeps its "suppressed" marker on the row; its attempt and
+    # ledger receipts say the same, never "delivered".
+    suppressed = (
+        outcome == "succeeded" and str(row["transport_status"] or "") == "suppressed"
+    )
     if outcome == "succeeded":
         state = "delivered"
         next_attempt_at = None
-        attempt_status = "delivered"
+        attempt_status = "suppressed" if suppressed else "delivered"
     elif outcome == "unknown":
         state = "abandoned"
         next_attempt_at = None
@@ -1054,22 +1130,51 @@ def record_exact_queue_outcome_in(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'"
         ).fetchone()
         if execution_table is not None:
-            conn.execute(
-                """UPDATE executions
-                   SET delivery_target=?, delivery_status=?, delivery_error=?,
-                       delivery_attempts=(SELECT COALESCE(SUM(attempts), 0)
-                         FROM cron_outbox
-                         WHERE execution_id=? AND delivery_contract=?)
-                   WHERE id=?""",
-                (
-                    str(row["target"]),
-                    attempt_status,
-                    clean_error,
-                    str(row["execution_id"]),
-                    EXACT_QUEUE,
-                    str(row["execution_id"]),
-                ),
+            # A sibling row that is still failed/dead/unknown owns the execution's
+            # status and error; a later success or non-send must not overwrite it.
+            # A failed sibling the backlog pass has reactivated (READY) or a drain
+            # has claimed (IN_FLIGHT) is still unresolved: its last settlement left
+            # ``outcome_error`` set, and only its own next terminal settlement
+            # clears that marker, so it keeps precedence until then.
+            worse_sibling = (
+                conn.execute(
+                    f"""SELECT 1 FROM {outbox_table}
+                        WHERE execution_id=? AND delivery_contract=? AND id<>?
+                          AND (exact_state IN ('RETRYABLE_FAILED','DEAD','UNKNOWN')
+                               OR (exact_state IN ('READY','IN_FLIGHT')
+                                   AND outcome_error IS NOT NULL))
+                        LIMIT 1""",
+                    (str(row["execution_id"]), EXACT_QUEUE, str(outbox_id)),
+                ).fetchone()
+                if outcome == "succeeded"
+                else None
             )
+            if worse_sibling is not None:
+                conn.execute(
+                    """UPDATE executions
+                       SET delivery_attempts=(SELECT COALESCE(SUM(attempts), 0)
+                             FROM cron_outbox
+                             WHERE execution_id=? AND delivery_contract=?)
+                       WHERE id=?""",
+                    (str(row["execution_id"]), EXACT_QUEUE, str(row["execution_id"])),
+                )
+            else:
+                conn.execute(
+                    """UPDATE executions
+                       SET delivery_target=?, delivery_status=?, delivery_error=?,
+                           delivery_attempts=(SELECT COALESCE(SUM(attempts), 0)
+                             FROM cron_outbox
+                             WHERE execution_id=? AND delivery_contract=?)
+                       WHERE id=?""",
+                    (
+                        str(row["target"]),
+                        attempt_status,
+                        clean_error,
+                        str(row["execution_id"]),
+                        EXACT_QUEUE,
+                        str(row["execution_id"]),
+                    ),
+                )
     if outcome != "succeeded":
         from cron.incidents import _error_signature, _incident_id, _redact_error
 
@@ -1106,7 +1211,9 @@ def record_exact_queue_outcome_in(
                     WHERE id=?""",
                 (now_iso, stored_error, incident_id),
             )
-    else:
+    elif not suppressed:
+        # Only a genuine send is evidence that transport recovered; a settled
+        # non-send leaves an existing delivery incident exactly where it was.
         unsettled = conn.execute(
             f"""SELECT 1 FROM {outbox_table}
                 WHERE job_id=? AND state IN ('pending','abandoned') LIMIT 1""",
@@ -1221,6 +1328,102 @@ def get_job_delivery_projection(job_id: str) -> Optional[Dict[str, Any]]:
     return result
 
 
+def publish_job_delivery_projection_status(
+    job_id: str,
+    *,
+    execution_id: str,
+    expected_revision: int,
+    last_status: Optional[str],
+    last_delivery_error: Optional[str],
+) -> bool:
+    """The owning run publishes the status it recorded in the job store onto its own projection
+    generation (finalized or not), without rotating the revision.
+
+    Settlement (``_finalize_projection_if_settled_in``) can finalize a generation while the run
+    that admitted it is still alive and about to write ``jobs.json``; the read-side overlay in
+    ``cron.jobs.get_job`` must then show what that run recorded, not the outbox's own status
+    vocabulary. A generation that has since been retired (``begin`` for a newer execution) is left
+    alone: the CAS fails and nothing is written.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE cron_job_delivery_projection
+               SET last_status=?, last_delivery_error=?, updated_at=?
+               WHERE job_id=? AND execution_id=? AND revision=?""",
+            (
+                last_status,
+                _sanitize_error(last_delivery_error),
+                _hermes_now().isoformat(),
+                str(job_id),
+                str(execution_id),
+                int(expected_revision),
+            ),
+        )
+    return cur.rowcount == 1
+def projection_generation_matches(
+    projection: Optional[Dict[str, Any]],
+    *,
+    execution_id: str,
+    revision: Optional[int] = None,
+) -> bool:
+    """True when *projection* is exactly the generation the caller owns.
+
+    A generation is the ``(execution_id, revision)`` pair. A missing projection never matches: with
+    no row there is no generation to own, so a guarded publication against an absent projection is
+    rejected explicitly rather than written blind. A missing ``revision`` never matches either: an
+    execution id alone cannot tell a same-execution rotation (``begin`` twice for one execution)
+    from the generation the caller actually owns, so a partial token is rejected rather than
+    treated as "whatever revision is current".
+    """
+    if projection is None or revision is None:
+        return False
+    if str(projection.get("execution_id")) != str(execution_id):
+        return False
+    if int(projection.get("revision") or -1) != int(revision):
+        return False
+    return True
+
+
+@contextmanager
+def reserve_job_delivery_projection(job_id: str) -> Iterator[Optional[Dict[str, Any]]]:
+    """Hold the projection write reservation while the caller publishes dependent state.
+
+    Takes the module RLock, then a SQLite ``BEGIN IMMEDIATE`` on the shared cron DB, and yields the
+    current projection row for *job_id* (``None`` when absent) *without releasing either*. Every
+    projection writer (``begin_job_delivery_projection``, ``finalize_job_delivery_projection``,
+    the fanout intent writers) in this or any other process blocks on that reservation until the
+    ``with`` block exits, so a caller that validates the yielded generation and then writes its
+    own store inside the block cannot be overtaken by a rotation. Nothing is written here; the
+    transaction is rolled back on exit (success or exception) so the reservation is always
+    released.
+
+    Lock order is ``cron.jobs._jobs_lock()`` -> this reservation; callers must already hold the
+    jobs lock when they use it for jobs.json publication and must never call outbox helpers that
+    open their own connection (``get_job_delivery_projection`` etc.) or perform network work
+    inside the block. This is exclusion between two stores, not a crash-atomic dual commit.
+    """
+    with _lock:
+        conn = _connect()
+        try:
+            _initialize_schema(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM cron_job_delivery_projection WHERE job_id=?",
+                    (str(job_id),),
+                ).fetchone()
+                projection = _record(row)
+                if projection is not None:
+                    for key in ("last_delivery_unverified", "last_delivery_queued"):
+                        if projection[key] is not None:
+                            projection[key] = json.loads(projection[key])
+                yield projection
+            finally:
+                conn.rollback()
+        finally:
+            conn.close()
+
+
 def finalize_job_delivery_projection(
     job_id: str,
     *,
@@ -1292,7 +1495,6 @@ def enqueue_deliveries_with_intent(
     queued_job.setdefault("id", str(job_id))
     if execution_id is not None:
         queued_job.setdefault("execution_id", str(execution_id))
-    job_json = json.dumps(queued_job, ensure_ascii=False, sort_keys=True)
 
     def existing_publication(
         conn: sqlite3.Connection,
@@ -1342,6 +1544,12 @@ def enqueue_deliveries_with_intent(
                     "revision"
                 ]
             )
+            # The durable snapshot carries the generation it was admitted under, so a late
+            # replay/callback publishes with the ORIGINAL token (and is rejected once rotated).
+            queued_job["_delivery_projection_revision"] = projection_revision
+        # ``default=str``: the live job record may carry non-JSON scalars (datetimes from a
+        # provider payload); the snapshot must never make the durable enqueue fail.
+        job_json = json.dumps(queued_job, ensure_ascii=False, sort_keys=True, default=str)
         for outbox_id, destination_json in pending:
             destination_hash = hashlib.sha256(destination_json.encode()).hexdigest()
             conn.execute(
@@ -1446,6 +1654,7 @@ def update_destination_thread(
             return None
         destination = decode_persisted_destination(row["destination_json"])
         destination["thread_id"] = str(thread_id)
+        destination["_opened_thread"] = True
         destination_json = canonical_destination_json(destination)
         cur = conn.execute(
             """UPDATE cron_outbox

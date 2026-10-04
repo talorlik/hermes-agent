@@ -475,3 +475,56 @@ def test_cronjob_tool_update_clears_monitor_script(hermes_env):
     )
     assert result.get("success") is True
     assert get_job(created["job_id"]).get("monitor_script") is None
+
+
+def test_monitor_source_forwards_the_validated_interpreter_to_the_script_runner(
+    hermes_env, monkeypatch
+):
+    """The documented create_job contract (absolute/~ Python ``interpreter``) must reach the REAL
+    monitor path: ``_run_monitor_source`` hands the job's interpreter to the shared shell-free script
+    runner, and the configured executable (not the scheduler's own) runs the monitor script."""
+    import stat
+
+    import cron.monitor as monitor
+    import cron.scheduler_script as sched_script
+    from cron.jobs import create_job
+
+    wrapper = hermes_env / "venv" / "bin" / "python3"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "env = os.environ.copy()\n"
+        'env["CRON_MONITOR_WRAPPER_USED"] = "1"\n'
+        "os.execve(sys.executable, [sys.executable, *sys.argv[1:]], env)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    _write_script(
+        hermes_env,
+        "mon.py",
+        'import os\nprint(os.environ.get("CRON_MONITOR_WRAPPER_USED", "0"))\n',
+    )
+    job = create_job(
+        prompt="React to the change",
+        schedule="every 5m",
+        monitor_script="mon.py",
+        interpreter=str(wrapper),
+        deliver="local",
+    )
+    seen: list = []
+    real_runner = sched_script._run_job_script
+
+    def spy(script_path, workdir=None, cancel_event=None, interpreter=None):
+        seen.append({"script": script_path, "interpreter": interpreter})
+        return real_runner(
+            script_path, workdir=workdir, cancel_event=cancel_event, interpreter=interpreter
+        )
+
+    monkeypatch.setattr(sched_script, "_run_job_script", spy)
+
+    ok, output = monitor._run_monitor_source(job)
+
+    assert ok is True, output
+    assert output.strip() == "1"
+    assert seen == [{"script": "mon.py", "interpreter": str(wrapper)}]

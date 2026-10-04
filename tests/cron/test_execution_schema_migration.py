@@ -219,7 +219,7 @@ def test_delivery_metadata_recorded_per_execution(monkeypatch, tmp_path):
 
 def test_retention_is_per_job_with_30_day_floor(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 5)
+    monkeypatch.setattr(executions, "PER_JOB_TERMINAL_EXECUTIONS", 5)
 
     now = _now()
     recent = (now - timedelta(days=1)).isoformat()

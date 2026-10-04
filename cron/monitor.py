@@ -135,10 +135,16 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
     """Run the job's monitor source (script or URL). Returns (ok, output)."""
     monitor_script = _field(job, "monitor_script")
     if monitor_script:
-        # Same containment + interpreter rules as the existing `script` field.
+        # Same containment + interpreter rules as the existing `script` field: the job's
+        # documented absolute/~ Python ``interpreter`` is validated at run time by the shared
+        # shell-free runner (never a shell string, never a PATH search).
         from cron.scheduler_script import _run_job_script
 
-        return _run_job_script(monitor_script, workdir=_field(job, "workdir") or None)
+        return _run_job_script(
+            monitor_script,
+            workdir=_field(job, "workdir") or None,
+            interpreter=_field(job, "interpreter") or None,
+        )
     monitor_url = _field(job, "monitor_url")
     if monitor_url:
         return _fetch_monitor_url(monitor_url)

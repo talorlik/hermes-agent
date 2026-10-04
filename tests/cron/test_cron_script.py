@@ -342,10 +342,15 @@ class TestRunJobScript:
         workspace snapshot, keeps ``python script.py`` path and ``__main__`` semantics, and
         leaves no ``PYTHONPATH`` for its own children to inherit."""
         from cron import scheduler_script
-        from pm.environments import site_packages
+        from pm.environments import install_state_dir, runtime_facts_path, site_packages
 
-        venv = tmp_path / "selected-venv"
+        repo = Path(scheduler_script.__file__).resolve().parents[1]
+        state = install_state_dir(repo)
+        assert state.resolve().is_relative_to(cron_env.resolve())
+        generation = state / "environments" / "script-selected"
+        venv = generation / "venv"
         (venv / "bin").mkdir(parents=True)
+        (generation / ".lease-managed").touch()
         (venv / "bin" / "python").symlink_to(sys.executable)
         (venv / "pyvenv.cfg").write_text(
             f"home = {Path(sys.base_prefix) / 'bin'}\ninclude-system-site-packages = false\n",
@@ -359,10 +364,15 @@ class TestRunJobScript:
         (snapshot / "hermes_constants.py").write_text("STALE = True\n", encoding="utf-8")
         (deps / "snapshot.pth").write_text(f"{snapshot}\n", encoding="utf-8")
 
+        # The child selects and leases its own environment from committed facts;
+        # a monkeypatch of the parent's selector cannot cross the process boundary.
+        runtime_facts_path(repo).write_text(
+            json.dumps({"packages": {"venv": {"environment": str(venv)}}}),
+            encoding="utf-8",
+        )
         monkeypatch.setattr(
             "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
         )
-        monkeypatch.setattr("pm.environments.selected_venv", lambda repo: venv)
         monkeypatch.delenv("PYTHONPATH", raising=False)
 
         script = cron_env / "scripts" / "probe.py"

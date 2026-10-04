@@ -26,6 +26,23 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def test_is_retry_fire_matches_only_the_parked_instant():
+    """The due-scan exception is the parked instant, not every job with retry state."""
+    parked = "2026-10-04T01:00:00+00:00"
+    job = {
+        "schedule": {"kind": "cron", "expr": "0 3 * * *"},
+        "next_run_at": parked,
+        "unreachable_retry": {"attempt": 1},
+    }
+    assert ur.is_retry_fire(job, parked) is True
+    assert ur.is_retry_fire(job, "2026-10-04T03:00:00+00:00") is False
+    job["unreachable_retry"] = {}
+    assert ur.is_retry_fire(job, parked) is False
+    job["schedule"] = {"kind": "interval", "expr": "every 24h"}
+    job["unreachable_retry"] = {"attempt": 1}
+    assert ur.is_retry_fire(job, parked) is False
+
+
 def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(tmp_cron_home):
     """Failed-unreachable runs re-fire on the 5/15/30-minute ladder instead of waiting a
     full period, and the ladder stops after its last rung (falls back to the schedule)."""

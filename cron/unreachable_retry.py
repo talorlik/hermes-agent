@@ -137,3 +137,20 @@ def will_retry(job: Dict[str, Any]) -> bool:
     if natural_next is not None and natural_next <= retry_dt:
         return False
     return True
+
+
+def is_retry_fire(job: Dict[str, Any], next_run: str) -> bool:
+    """True when ``next_run`` is the parked unreachable-model retry instant.
+
+    The due scan treats an off-lattice cron instant as a direct expression edit
+    and re-anchors without firing. ``plan_retry`` parks the next fire earlier
+    than that lattice on purpose. Without this predicate the scan raises
+    ``ImportError``, logs the job as malformed, and drops the retry.
+    """
+    schedule = job.get("schedule") or {}
+    state = job.get(STATE_KEY) or {}
+    return (
+        schedule.get("kind") == "cron"
+        and bool(state.get("attempt"))
+        and job.get("next_run_at") == next_run
+    )

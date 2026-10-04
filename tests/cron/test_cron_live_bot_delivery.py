@@ -94,21 +94,31 @@ def test_result_records_pending_until_terminal_receipt(tmp_path, monkeypatch):
     monkeypatch.setattr(delivery, "_run_bot_chat_turn", Mock(side_effect=AssertionError("CLI")))
     updates = []
     monkeypatch.setattr(
-        "cron.outbox.get_job_delivery_projection",
-        lambda _job_id: {"execution_id": "run", "revision": 3},
-    )
-    monkeypatch.setattr(
         jobs,
         "update_job",
         lambda key, values, **kwargs: updates.append((values, kwargs)),
     )
-    job = dict(id="digest", execution_id="run", deliver="bot-chat")
+    # The invocation carries the generation the producer actually admitted for ITS execution
+    # (real projection row), never a borrowed "latest" projection identity.
+    from cron import outbox
+
+    admitted = outbox.begin_job_delivery_projection("digest", "run")
+    job = dict(
+        id="digest",
+        execution_id="run",
+        deliver="bot-chat",
+        _delivery_projection_revision=admitted["revision"],
+    )
+    # A callback without an owned revision token must not write the modern projection: the
+    # admission is queued (not an error) but no guarded update is attempted.
+    assert delivery._deliver_result(dict(id="digest", execution_id="run", deliver="bot-chat"), "payload") is None
+    assert updates == []
     error = delivery._deliver_result(job, "payload")
     assert error is None
     queued = updates[-1][0]["last_delivery_queued"]
     assert updates[-1][1] == {
         "expected_execution_id": "run",
-        "expected_projection_revision": 3,
+        "expected_projection_revision": admitted["revision"],
     }
     assert queued and next(iter(queued.values()))["status"] == "queued"
     assert (

@@ -129,16 +129,26 @@ def _adapters(relay=False):
 
 RECORDED_VERIFICATION = []
 
+# Transport identity/authority capture (#115656): the ``DeliveryRouter`` the live lane builds
+# (``config``/``adapters`` it was handed) and the ``(transport, pconfig)`` the lane itself resolved
+# and authorized per target, so a test can assert the router receives the ORIGINAL gateway config
+# and the EXACT authorized transport object rather than a re-derived or re-configured one.
+ROUTER_CONSTRUCTIONS = []
+RESOLVED_TRANSPORTS = []
+
 
 def _record_verification(job, unverified_targets):
     RECORDED_VERIFICATION.append((job["id"], list(unverified_targets)))
 
 
-def _run(job, content, send_result, relay=False, standalone_result=None, cron_cfg=None):
+def _run(job, content, send_result, relay=False, standalone_result=None, cron_cfg=None, *,
+         adapters=None, gateway_config=None):
     """Drive ``_deliver_result`` over the live lane with a stubbed router.
 
     Returns ``(error, router_calls, standalone_calls)``. ``cron_cfg`` extends
     the ``cron:`` section handed to the scheduler (default: unwrapped output).
+    ``adapters``/``gateway_config`` override the default ``relay``-shaped
+    fixtures (satellite grant / disabled-block scenarios).
     """
     loop = MagicMock()
     loop.is_running.return_value = True
@@ -154,27 +164,51 @@ def _run(job, content, send_result, relay=False, standalone_result=None, cron_cf
     router_calls = []
     standalone_calls = []
     RECORDED_VERIFICATION.clear()
+    ROUTER_CONSTRUCTIONS.clear()
+    RESOLVED_TRANSPORTS.clear()
 
     router = MagicMock()
 
-    async def _deliver_to_platform(target, text, metadata):
-        router_calls.append({"target": target, "text": text, "metadata": metadata})
+    # Mirrors the production ``DeliveryRouter._deliver_to_platform(target, content, metadata,
+    # transport=None)`` signature (gateway/delivery.py): ``transport`` is the already-authorized
+    # transport the cron lane hands past resolution; ``None`` means "resolve as usual".
+    async def _deliver_to_platform(target, text, metadata, transport=None):
+        router_calls.append({
+            "target": target, "text": text, "metadata": metadata, "transport": transport,
+        })
         return send_result
 
     router._deliver_to_platform = _deliver_to_platform
+
+    def _build_router(config, adapters_arg):
+        ROUTER_CONSTRUCTIONS.append({"config": config, "adapters": adapters_arg})
+        return router
+
+    real_resolve = sched_delivery._resolve_target_transport
+
+    def _recording_resolve(*args, **kwargs):
+        resolved, err = real_resolve(*args, **kwargs)
+        RESOLVED_TRANSPORTS.append({"resolved": resolved, "error": err})
+        return resolved, err
 
     async def _fake_send_to_platform(platform, pconfig, chat_id, text, **kwargs):
         standalone_calls.append({"chat_id": chat_id, "text": text, "kwargs": kwargs})
         return standalone_result if standalone_result is not None else {}
 
-    with patch("gateway.config.load_gateway_config", return_value=_gateway_config(relay)), \
+    if gateway_config is None:
+        gateway_config = _gateway_config(relay)
+    if adapters is None:
+        adapters = _adapters(relay)
+
+    with patch("gateway.config.load_gateway_config", return_value=gateway_config), \
          patch("cron.scheduler.load_config",
                return_value={"cron": {"wrap_response": False, **(cron_cfg or {})}}), \
          patch("cron.scheduler_delivery._record_delivery_verification", side_effect=_record_verification), \
-         patch("gateway.delivery.DeliveryRouter", return_value=router), \
+         patch("cron.scheduler_delivery._resolve_target_transport", side_effect=_recording_resolve), \
+         patch("gateway.delivery.DeliveryRouter", side_effect=_build_router), \
          patch("tools.send_message_tool._send_to_platform", _fake_send_to_platform), \
          patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-        error = _deliver_result(job, content, adapters=_adapters(relay), loop=loop)
+        error = _deliver_result(job, content, adapters=adapters, loop=loop)
     return error, router_calls, standalone_calls
 
 
@@ -423,6 +457,172 @@ class TestUnverifiedDeliveryIsRecordedOnTheJob:
 
         assert _format_job({"id": "j1", "name": "n", "prompt": "p",
                             "last_delivery_unverified": ["slack:C1"]})["last_delivery_unverified"] == ["slack:C1"]
+
+
+class _Route:
+    """Target-exact primary route as ``SharedRouteAdapters.get`` consumes it (``platform``,
+    ``chat_id``/``thread_id`` discriminators, ``guild_id`` echoed, ``matches(...)``)."""
+
+    def __init__(self, platform, chat_id, thread_id=None):
+        self.platform = platform
+        self.chat_id = chat_id
+        self.thread_id = thread_id
+        self.guild_id = None
+
+    def matches(self, platform, *, guild_id=None, chat_id=None, thread_id=None):
+        return (
+            str(platform).lower() == str(self.platform).lower()
+            and chat_id == self.chat_id
+            and (self.thread_id is None or thread_id == self.thread_id)
+        )
+
+
+def _satellite_adapters(granted=True):
+    """Credentialless satellite view over the PRIMARY's telegram adapter (#101113)."""
+    from cron.scheduler_preflight import SharedRouteAdapters
+
+    primary = {Platform.TELEGRAM: MagicMock(name="primary_telegram_adapter")}
+    routes = [_Route("telegram", CHAT_ID if granted else "-1009999999999")]
+    return SharedRouteAdapters(primary, routes), primary[Platform.TELEGRAM]
+
+
+def _satellite_config():
+    """The satellite's own ``platforms.telegram`` block: present but disabled (no credential)."""
+    config = _gateway_config()
+    config.platforms[Platform.TELEGRAM] = PlatformConfig(enabled=False)
+    return config
+
+
+class TestLiveLaneTransportIdentity:
+    """The cron live lane resolves and authorizes ONE transport per target (#115656), then hands
+    that exact object to ``DeliveryRouter._deliver_to_platform(..., transport=...)``.
+
+    The router must receive the ORIGINAL gateway config (no per-target config rewrite) and the
+    IDENTICAL transport the lane authorized — never a re-resolution against the plain adapter
+    dict (which cannot re-derive the satellite grant) and never a freshly built adapter grant.
+    """
+
+    @staticmethod
+    def _authorized_transport():
+        assert len(RESOLVED_TRANSPORTS) == 1
+        resolved = RESOLVED_TRANSPORTS[0]["resolved"]
+        assert resolved is not None, RESOLVED_TRANSPORTS[0]["error"]
+        transport, pconfig, runtime_adapter, _target_adapters = resolved
+        return transport, pconfig, runtime_adapter
+
+    def test_ordinary_native_target_forwards_the_exact_authorized_transport(self):
+        from gateway.delivery import DeliveryTransport
+
+        gateway_config = _gateway_config()
+        adapters = _adapters()
+        error, router_calls, standalone_calls = _run(
+            _job(), "Nightly report.", _SendResult(message_id=1234),
+            adapters=adapters, gateway_config=gateway_config,
+        )
+
+        assert error is None
+        assert standalone_calls == []
+        assert len(router_calls) == 1
+        transport, _pconfig, runtime_adapter = self._authorized_transport()
+        assert isinstance(transport, DeliveryTransport)
+        assert not transport.is_relay
+        assert transport.adapter is adapters[Platform.TELEGRAM]
+        assert runtime_adapter is adapters[Platform.TELEGRAM]
+        # Exact object identity: the authorized transport, not a re-resolution or a copy.
+        assert router_calls[0]["transport"] is transport
+        # The router keeps the original config and adapter map: no per-target replacement.
+        assert ROUTER_CONSTRUCTIONS == [{"config": gateway_config, "adapters": adapters}]
+        assert ROUTER_CONSTRUCTIONS[0]["config"] is gateway_config
+        assert ROUTER_CONSTRUCTIONS[0]["adapters"] is adapters
+
+    def test_relay_fronted_target_forwards_the_relay_transport_binding(self):
+        gateway_config = _gateway_config(relay=True)
+        adapters = _adapters(relay=True)
+        error, router_calls, standalone_calls = _run(
+            _job(), "Nightly report.", _SendResult(message_id=1234), relay=True,
+            adapters=adapters, gateway_config=gateway_config,
+        )
+
+        assert error is None
+        assert standalone_calls == []
+        assert len(router_calls) == 1
+        transport, _pconfig, _runtime_adapter = self._authorized_transport()
+        assert transport.is_relay
+        assert transport.adapter is adapters[Platform.RELAY]
+        assert router_calls[0]["transport"] is transport
+        assert router_calls[0]["target"].platform == Platform.TELEGRAM
+        assert ROUTER_CONSTRUCTIONS[0]["config"] is gateway_config
+        assert ROUTER_CONSTRUCTIONS[0]["adapters"] is adapters
+
+    def test_satellite_grant_preserves_binding_without_config_replacement(self):
+        """Disabled satellite ``platforms.telegram`` block + exact primary route: the lane's
+        authorized transport (primary adapter, enablement-corrected pconfig) reaches the router
+        untouched; the router itself sees the ORIGINAL (disabled-block) config."""
+        shared, primary_adapter = _satellite_adapters(granted=True)
+        gateway_config = _satellite_config()
+        error, router_calls, standalone_calls = _run(
+            _job(), "Nightly report.", _SendResult(message_id=1234),
+            adapters=shared, gateway_config=gateway_config,
+        )
+
+        assert error is None
+        assert standalone_calls == []
+        assert len(router_calls) == 1
+        transport, pconfig, runtime_adapter = self._authorized_transport()
+        assert not transport.is_relay
+        assert transport.adapter is primary_adapter
+        assert runtime_adapter is primary_adapter
+        assert transport.config is pconfig
+        assert pconfig.enabled is True
+        assert router_calls[0]["transport"] is transport
+        # No production config rewrite: the satellite block stays disabled in the config the
+        # router was built with, and that config is the very object the gateway loaded.
+        assert ROUTER_CONSTRUCTIONS[0]["config"] is gateway_config
+        assert gateway_config.platforms[Platform.TELEGRAM].enabled is False
+        assert ROUTER_CONSTRUCTIONS[0]["adapters"] == {Platform.TELEGRAM: primary_adapter}
+
+    def test_disabled_block_without_a_grant_never_sends(self):
+        """Satellite with a disabled block and NO matching primary route: fail closed. No live
+        send, no standalone send, no arbitrary adapter grant."""
+        shared, _primary_adapter = _satellite_adapters(granted=False)
+        error, router_calls, standalone_calls = _run(
+            _job(), "Nightly report.", _SendResult(message_id=1234),
+            adapters=shared, gateway_config=_satellite_config(),
+        )
+
+        assert router_calls == []
+        assert standalone_calls == []
+        assert ROUTER_CONSTRUCTIONS == []
+        assert error is not None
+        assert "not configured/enabled" in error
+        assert len(RESOLVED_TRANSPORTS) == 1
+        assert RESOLVED_TRANSPORTS[0]["resolved"] is None
+
+    def test_disabled_native_block_in_a_plain_adapter_map_never_sends(self):
+        """A plain adapter dict (no satellite grant) against a disabled block is not authorized:
+        presence of an adapter object alone must not grant a transport."""
+        adapters = _adapters()
+        error, router_calls, standalone_calls = _run(
+            _job(), "Nightly report.", _SendResult(message_id=1234),
+            adapters=adapters, gateway_config=_satellite_config(),
+        )
+
+        assert router_calls == []
+        assert standalone_calls == []
+        assert ROUTER_CONSTRUCTIONS == []
+        assert error is not None
+        assert "not configured/enabled" in error
+
+    def test_router_fake_signature_matches_production(self):
+        """The stub above must stay honest: production accepts ``transport`` as an optional
+        keyword (default ``None``)."""
+        import inspect
+
+        from gateway.delivery import DeliveryRouter
+
+        params = inspect.signature(DeliveryRouter._deliver_to_platform).parameters
+        assert "transport" in params
+        assert params["transport"].default is None
 
 
 def test_scheduler_module_exposes_the_confirmation_helper():

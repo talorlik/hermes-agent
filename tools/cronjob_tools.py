@@ -615,7 +615,12 @@ def _action_create(a: Dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
-               if a["paused"] is not False or a["paused_reason"] is not None else {}))
+               if a["paused"] is not False or a["paused_reason"] is not None else {}),
+            # CLI-only lanes, forwarded only when explicitly given so create_job keeps its own
+            # defaults (omitted pinned != explicit pinned=False at the API boundary).
+            **({"pinned": bool(a["pinned"])} if a["pinned"] is not None else {}),
+            **({"interpreter": _normalize_optional_job_value(a["interpreter"])}
+               if a["interpreter"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
         return tool_error(_partial.pop("error"), success=False, **_partial)
@@ -765,6 +770,14 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
     if a["reasoning_effort"] is not None:
         # CLI-only lane; update_job validates, empty string clears the pin.
         updates["reasoning_effort"] = a["reasoning_effort"]
+    if a["pinned"] is not None:
+        # CLI-only lane; omitted leaves the pin alone. update_job's _apply_pin_update turns True
+        # into the current main provider+model (unless an explicit model is in this same update,
+        # which wins) and False into a release of both.
+        updates["pinned"] = bool(a["pinned"])
+    if a["interpreter"] is not None:
+        # CLI-only lane; empty string clears, update_job normalizes/validates.
+        updates["interpreter"] = _normalize_optional_job_value(a["interpreter"]) or None
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -963,11 +976,19 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
     all: Optional[bool] = None,
+    pinned: Optional[bool] = None,
+    interpreter: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None) -> str:
-    """Unified cron job management tool."""
+    """Unified cron job management tool.
+
+    ``pinned`` / ``interpreter`` are CLI-only lanes (``hermes cron create/edit --pinned /
+    --interpreter``) like ``model``/``provider``/``reasoning_effort``: absent from CRONJOB_SCHEMA
+    and the model dispatch. ``pinned`` is tri-state — omitted (None) leaves the per-job pin
+    untouched, ``True`` locks the current main model unless an explicit ``model`` is given in the
+    same call, ``False`` releases the pin (``cron.jobs`` owns those semantics)."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
@@ -1121,10 +1142,11 @@ def check_cronjob_requirements() -> bool:
     )
 
 
-# Agent-facing arguments forwarded verbatim to cronjob(). model / provider / base_url are
-# intentionally NOT here: per-job inference pins are user-owned (dashboard, `hermes cron
-# create/edit --model`, hand-edited jobs) — the agent must not point unattended spend at a
-# different model. Programmatic callers of cronjob() itself retain the parameters.
+# Agent-facing arguments forwarded verbatim to cronjob(). model / provider / base_url /
+# reasoning_effort / pinned / interpreter are intentionally NOT here: per-job inference pins are
+# user-owned (dashboard, `hermes cron create/edit --model/--pinned`, hand-edited jobs) — the agent
+# must not point unattended spend at a different model. Programmatic callers of cronjob() itself
+# retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
