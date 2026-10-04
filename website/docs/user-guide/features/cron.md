@@ -433,7 +433,8 @@ computer wakes, while the VPN or Wi-Fi is still reconnecting — does not sit
 out a whole period. The scheduler re-runs it automatically after **5, 15, and
 30 minutes** (inspired by Claude Cowork's scheduled-task re-runs), then falls
 back to the normal schedule. Because zero API calls were made, the re-run is
-spend-neutral and cannot duplicate any side effect.
+spend-neutral and cannot duplicate any side effect. Re-runs also do not count
+toward a job's `repeat` limit: the occurrence they repeat already counted once.
 
 While a re-run is pending, the interim failure notice is suppressed — you get
 the real result when a re-run succeeds, or a normal failure alert once the
@@ -451,7 +452,8 @@ cron:
 
 A recurring job that keeps failing with the *same* error alerts you **once**,
 not on every run. Each failure is recorded as a durable **incident**, keyed by
-the job plus a normalized signature of the error text, in the same per-profile
+the job plus a normalized signature of the error text (case, whitespace and
+measured durations such as `idle for 603s` are ignored), in the same per-profile
 ledger database as the execution history; the first failure of a signature is
 always delivered, and repeats are then withheld while the incident is `alerted`
 (the run is still recorded — `hermes cron runs` and the failure streak see it,
@@ -539,7 +541,7 @@ When scheduling jobs, you specify where the output goes:
 | `"mattermost"` | Mattermost home channel | |
 | `"email"` | Email | |
 | `"sms"` | SMS via Twilio | |
-| `"homeassistant"` | Home Assistant | |
+| `"homeassistant"` | Home Assistant (plugin) | Uses `HASS_HOME_CHANNEL`; requires the [`homeassistant` plugin](../messaging/homeassistant.md) |
 | `"dingtalk"` | DingTalk | |
 | `"feishu"` | Feishu/Lark | |
 | `"wecom"` | WeCom | |
@@ -1349,6 +1351,8 @@ Ask the agent to manage jobs through the `cronjob` tool, `hermes cron edit`, or 
 :::
 
 Jobs may store `model` and `provider` as `null`. When those fields are omitted, Hermes resolves them at execution time from the global configuration. They only appear in the job record when a per-job override is set.
+
+A per-job `base_url` override needs an explicit `provider`. For a provider with a stored key (a named custom provider or a built-in one), the override must have the same origin as that provider's configured endpoint: the same scheme, host and port. Another scheme, port or subdomain is refused, so the stored key is only ever sent where you configured it. A bare `provider: custom` takes any `base_url` that no stored key goes with. When a stored key matches the URL's hostname (for example `DEEPSEEK_API_KEY` for `api.deepseek.com`), the same rule applies: the `base_url` must have the origin of an endpoint you configured or of a built-in provider.
 
 The storage uses atomic file writes so interrupted writes do not leave a partially written job file behind.
 
