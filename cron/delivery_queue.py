@@ -191,6 +191,9 @@ def _exact_status(row: dict) -> dict:
         "DEAD": "failed",
         "UNKNOWN": "unknown",
     }.get(state, "failed")
+    if state == "DELIVERED" and str(row.get("transport_status") or "") == "suppressed":
+        # Settled without a send (warning policy): never reported as delivered.
+        status = "suppressed"
     return {
         **row,
         "execution_id": str(row["id"]),
@@ -428,7 +431,11 @@ def _finish(
     permanent: bool = False,
     transport_status: Optional[str] = None,
     receipt_id: Optional[str] = None,
+    suppressed: bool = False,
 ) -> bool:
+    """``suppressed`` (no error): the sender withheld every target under the warning policy, so
+    the row settles as ``suppressed`` — honest durable state, never a claimed send."""
+    suppressed = bool(suppressed) and not error
     if generation is not None or owner_token is not None:
         if generation is None or owner_token is None:
             return False
@@ -440,7 +447,7 @@ def _finish(
             owner_token=str(owner_token),
             error=error,
             permanent=permanent,
-            transport_status=transport_status,
+            transport_status="suppressed" if suppressed else transport_status,
             receipt_id=receipt_id,
         )
     safe_error = (
@@ -454,7 +461,7 @@ def _finish(
                WHERE execution_id=? AND status='delivering'
                  AND owner_process_id=? AND owner_pid=? AND delivery_contract=0""",
             (
-                "failed" if error else "delivered",
+                "failed" if error else ("suppressed" if suppressed else "delivered"),
                 _hermes_now().isoformat(),
                 safe_error,
                 str(execution_id),
@@ -596,6 +603,29 @@ def reconcile_admitted() -> int:
     return settled
 
 
+def _apply_exact_thread_update(row: dict) -> bool:
+    """A continuation thread the sender opened becomes the exact row's canonical destination
+    BEFORE any send: release this claim (no attempt, no incident) and re-admit the row under the
+    updated destination so a crash between open and send cannot open a second thread on retry."""
+    if int(row.get("delivery_contract") or 0) != 1:
+        return False
+    thread_updates = row["job"].pop("_exact_thread_updates", None)
+    opened_thread_id = (
+        thread_updates.get(str(row["outbox_id"])) if isinstance(thread_updates, dict) else None
+    )
+    if not opened_thread_id:
+        return False
+    from cron.outbox import release_exact_claim, update_destination_thread
+
+    if release_exact_claim(
+        str(row["outbox_id"]),
+        generation=int(row["generation"]),
+        owner_token=str(row["owner_token"]),
+    ):
+        update_destination_thread(str(row["outbox_id"]), str(opened_thread_id))
+    return True
+
+
 def drain(
     send: Callable[..., Optional[str]],
     *,
@@ -666,9 +696,14 @@ def drain(
                 if temporary is not None:
                     temporary.cleanup()
             transport_status, receipt_id = _bot_admission(row)
-            if not _finish(
+            # The sender flags a run whose EVERY target was withheld by the warning policy.
+            suppressed = bool(row["job"].get("_notification_all_targets_suppressed"))
+            if _apply_exact_thread_update(row):
+                pass  # re-admitted under its canonical thread; nothing was sent
+            elif not _finish(
                 delivery_id,
                 error=error,
+                suppressed=suppressed,
                 generation=(
                     int(row["generation"])
                     if int(row.get("delivery_contract") or 0) == 1
@@ -683,21 +718,6 @@ def drain(
                 receipt_id=receipt_id,
             ):
                 raise RuntimeError("delivery outcome was not persisted")
-            if error and int(row.get("delivery_contract") or 0) == 1:
-                thread_updates = row["job"].pop("_exact_thread_updates", {})
-                opened_thread_id = (
-                    thread_updates.get(str(row["outbox_id"]))
-                    if isinstance(thread_updates, dict)
-                    else None
-                )
-                if opened_thread_id:
-                    from cron.outbox import update_destination_thread
-
-                    updated = update_destination_thread(
-                        str(row["outbox_id"]), str(opened_thread_id)
-                    )
-                    if updated is not None:
-                        reactivate_exact(str(row["outbox_id"]))
         finally:
             stop.set()
             if renewer is not None:
@@ -737,7 +757,7 @@ def _terminalize_wait_timeout(
                 _prune_terminal_unlocked(conn)
             return message
         return "timed out observing gateway delivery; queue attempt remains in flight"
-    if row["status"] == "delivered":
+    if row["status"] in ("delivered", "suppressed"):
         return ""
     return str(row.get("error") or f"delivery {row['status']}")
 
@@ -762,10 +782,12 @@ def enqueue_and_wait(
         destination=destination,
         outbox_id=outbox_id,
     )
+    # "suppressed" is a settled non-send under the warning policy: not an error, not a delivery
+    # (the caller reads the durable status to classify it).
     if queued["status"] in _TERMINAL:
         return (
             None
-            if queued["status"] == "delivered"
+            if queued["status"] in ("delivered", "suppressed")
             else str(queued.get("error") or f"delivery {queued['status']}")
         )
     wait_timeout = (
@@ -781,7 +803,7 @@ def enqueue_and_wait(
         ):
             return (
                 None
-                if row["status"] == "delivered"
+                if row["status"] in ("delivered", "suppressed")
                 else str(row.get("error") or f"delivery {row['status']}")
             )
         time.sleep(1.0)

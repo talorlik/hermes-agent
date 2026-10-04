@@ -198,7 +198,9 @@ def cron_list(show_all: bool = False):
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {color(*badge)}")
         for label, value in _job_rows(job):
-            print(f"    {label + ':':<11}{value}")
+            # Pad to 10 then one space: identical to the historical ``<11`` layout for every
+            # short label, and still readable for the long "Script failure policy" row.
+            print(f"    {label + ':':<10} {value}")
         for line in _job_warnings(job):
             print(f"    {line}")
         print()
@@ -239,6 +241,9 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
+        # Stored policy, shown only for script jobs (it governs nothing without a script); the
+        # value is displayed as recorded, never defaulted here.
+        ("Script failure policy", job.get("script_failure_policy") if job.get("script") else ""),
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
@@ -332,8 +337,56 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
         print(f"{record.get('id', '?')}  {record.get('status', '?'):<9}  "
               f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
               f"{record.get('claimed_at', '?')}")
-        if record.get("error"):
-            print(f"    {record['error']}")
+        for line in _execution_evidence_lines(record):
+            print(f"    {line}")
+
+
+def _redact_execution_text(text: Any) -> str:
+    """Forced redaction for ledger error text shown on a terminal (the ledger stores it raw)."""
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(str(text), force=True, redact_url_credentials=True)
+    except Exception:
+        return "[REDACTED - error unavailable]"
+
+
+def _execution_evidence_lines(record: Dict[str, Any]) -> List[str]:
+    """Durable facts of one execution attempt, displayed as recorded: the occurrence outcome
+    (typed outcome, retry occurrence), the delivery outcome and the detached producer evidence.
+    Nothing is reclassified here; absent facts print nothing."""
+    lines: List[str] = []
+    outcome = record.get("outcome")
+    if outcome and outcome != record.get("status"):
+        lines.append(f"outcome: {outcome}")
+    if record.get("occurrence_key") or record.get("retry_at"):
+        parts = []
+        if record.get("occurrence_key"):
+            parts.append(f"occurrence={record['occurrence_key']}")
+        if record.get("retry_at"):
+            parts.append(f"retry_at={record['retry_at']}")
+        lines.append("occurrence: " + "  ".join(parts))
+    if record.get("error"):
+        lines.append(f"error: {_redact_execution_text(record['error'])}")
+    if (record.get("delivery_target") or record.get("delivery_status")
+            or record.get("delivery_attempts") or record.get("delivery_outcome")):
+        attempts = record.get("delivery_attempts") or 0
+        parts = [f"target={record.get('delivery_target') or '?'}",
+                 f"status={record.get('delivery_status') or '?'}",
+                 f"attempts={attempts}"]
+        if record.get("delivery_outcome"):
+            parts.append(f"outcome={record['delivery_outcome']}")
+        lines.append("delivery: " + "  ".join(parts))
+        if record.get("delivery_error"):
+            lines.append(f"delivery error: {_redact_execution_text(record['delivery_error'])}")
+    if record.get("detached_run_id") or record.get("detached_status"):
+        parts = [f"run={record.get('detached_run_id') or '?'}",
+                 f"status={record.get('detached_status') or '?'}"]
+        if record.get("detached_worker"):
+            parts.append(f"worker={record['detached_worker']}")
+        if record.get("lease_expires_at"):
+            parts.append(f"lease_expires_at={record['lease_expires_at']}")
+        lines.append("detached: " + "  ".join(parts))
+    return lines
 
 
 _INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "resolved": Colors.GREEN,
@@ -705,7 +758,10 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"))
+                   ("interpreter", "interpreter"),
+                   # Parsed by `cron create/edit --script-failure-policy`; the create parser
+                   # defaults it to "continue", the edit parser to None (= leave stored value).
+                   ("script_failure_policy", "script_failure_policy"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:
@@ -730,6 +786,16 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
             print(template.format(job_data[key]))
 
 
+def _print_stored_script_policy(job_id: str) -> None:
+    """Print the persisted script failure policy for a script job, read back from the store
+    (the tool's formatted job echo does not carry it). Shown as recorded, never defaulted; a
+    prompt-only job prints nothing because the policy governs nothing without a script."""
+    from cron.jobs import get_job
+    stored = get_job(job_id) or {}
+    if stored.get("script") and stored.get("script_failure_policy"):
+        print(f"  Script failure policy: {stored['script_failure_policy']}")
+
+
 def cron_create(args):
     # The gateway-lifecycle guard lives in cron.jobs.create_job (every creation path); a block
     # surfaces as result["error"].
@@ -749,6 +815,7 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     _print_job_details(result.get("job", {}))
+    _print_stored_script_policy(result["job_id"])
     if not result.get("job", {}).get("enabled", True):
         print("  Created PAUSED — resume to schedule, or explicitly run now.")
     else:

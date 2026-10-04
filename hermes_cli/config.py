@@ -29,7 +29,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, Any, Literal, Optional, List, Tuple, Set
+from typing import Callable, Dict, Any, Literal, Optional, List, Tuple, Set
 
 import hermes_yaml as yaml
 
@@ -162,10 +162,17 @@ def validate_env_var_name_for_write(key: str) -> None:
 # read_user_config_raw() + save_config()). save_config itself no longer re-enters via
 # read_raw_config; it takes its raw mapping from require_readable_config_before_write.
 _CONFIG_LOCK = threading.RLock()
-# path -> last successfully loaded (expanded) config; served after a parse failure so a
-# mid-edit broken YAML never silently drops user overrides (e.g. approvals.deny rules).
-_LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
-# path -> (user_mtime_ns, user_size, managed_mtime_ns, managed_size, merged, env_ref_snapshot).
+@dataclass(frozen=True)
+class _LastGoodConfig:
+    # Recovery must re-expand only user-authored templates, never a merged policy value.
+    user: Dict[str, Any]
+    # Save-time template preservation compares against the value the caller actually loaded.
+    expanded: Dict[str, Any]
+
+
+# path -> user provenance and expanded comparison state from the last successful load/save.
+_LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, _LastGoodConfig] = {}
+# path -> (*user_signature, *managed_signature, merged, layer_env_snapshot).
 # load_config() returns a deepcopy of the cached value while the signature matches (skips
 # safe_load + merge + normalize + expand, ~13 ms). Writers use the config writer seam (fresh inode
 # -> new mtime_ns) so no explicit invalidation is needed. The managed-file signature is folded
@@ -176,7 +183,7 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # _normalize_* + _expand_env_vars (~13 ms/call). save_config() + migrate_config() write via
 # the config writer seam, which produces a fresh inode, so stat() sees a new signature and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, ...]] = {}
+_LOAD_CONFIG_CACHE: Dict[str, Tuple[Any, ...]] = {}
 # path -> (mtime_ns, size, ino, ctime_ns, raw yaml dict) for read_raw_config() (no defaults merged in).
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, ...]] = {}
 
@@ -1594,7 +1601,9 @@ def _env_ref_lookup(name: str) -> Optional[str]:
     return _get_secret(name)
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match(
+    m: re.Match, resolver: Optional[Callable[[str], Optional[str]]] = None,
+) -> str:
     """Expand one ``${VAR}`` (legacy bare name) or ``${env:VAR}`` (Cursor-style SecretRef).
     Other SecretRef sources (``file:``, ``bitwarden:``, ``vault:``...) are NOT resolved here:
     external backends inject their values into the environment at startup (the ``secrets:``
@@ -1611,7 +1620,7 @@ def _env_expand_match(m: re.Match) -> str:
                 "startup, so reference the variable as ${env:NAME} instead",
                 raw, inner.split(":", 1)[0])
         return raw  # non-env source, or empty ``${env:}``
-    val = _env_ref_lookup(name)
+    val = (resolver or _env_ref_lookup)(name)
     if val is not None:
         return val
     if inner.startswith("env:"):
@@ -1636,18 +1645,28 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
-def _expand_env_vars(obj):
+def _expand_env_vars(
+    obj: Any, *, resolver: Optional[Callable[[str], Optional[str]]] = None,
+) -> Any:
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` in string values (keys/non-strings untouched)."""
     if isinstance(obj, str):
-        return _ENV_REF_RE.sub(_env_expand_match, obj)
+        return _ENV_REF_RE.sub(lambda match: _env_expand_match(match, resolver), obj)
     if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
+        return {k: _expand_env_vars(v, resolver=resolver) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
+        return [_expand_env_vars(item, resolver=resolver) for item in obj]
     return obj
 
 
-def _env_ref_snapshot(obj, snapshot=None):
+def _expand_managed_env_vars(obj: Any) -> Any:
+    """Expand privileged policy using only the process environment, with the shared grammar."""
+    return _expand_env_vars(obj, resolver=os.environ.get)
+
+
+def _env_ref_snapshot(
+    obj: Any, snapshot: Optional[Dict[str, Optional[str]]] = None, *,
+    resolver: Optional[Callable[[str], Optional[str]]] = None,
+) -> Dict[str, Optional[str]]:
     """Map each env-sourced ``${...}`` ref in *obj* to its current value.
     Stored with cached ``load_config()`` results so a cache hit can detect that the expansion was
     made against a different environment (load before ``load_hermes_dotenv()``, in-process
@@ -1661,14 +1680,34 @@ def _env_ref_snapshot(obj, snapshot=None):
         for raw in _ENV_REF_RE.findall(obj):
             name = _env_ref_var_name(raw)
             if name is not None:
-                snapshot[name] = _env_ref_lookup(name)
+                snapshot[name] = (resolver or _env_ref_lookup)(name)
     elif isinstance(obj, dict):
         for value in obj.values():
-            _env_ref_snapshot(value, snapshot)
+            _env_ref_snapshot(value, snapshot, resolver=resolver)
     elif isinstance(obj, list):
         for item in obj:
-            _env_ref_snapshot(item, snapshot)
+            _env_ref_snapshot(item, snapshot, resolver=resolver)
     return snapshot
+
+
+@dataclass(frozen=True)
+class _ConfigEnvSnapshot:
+    # The same name in sibling leaves can depend on two different authorities.
+    user: Tuple[Tuple[str, Optional[str]], ...]
+    managed: Tuple[Tuple[str, Optional[str]], ...]
+
+    def is_current(self) -> bool:
+        return (
+            all(_env_ref_lookup(k) == v for k, v in self.user)
+            and all(os.environ.get(k) == v for k, v in self.managed)
+        )
+
+
+def _config_env_snapshot(user: Any, managed: Any) -> _ConfigEnvSnapshot:
+    return _ConfigEnvSnapshot(
+        tuple(_env_ref_snapshot(user).items()),
+        tuple(_env_ref_snapshot(managed, resolver=os.environ.get).items()),
+    )
 
 
 def _items_by_unique_name(items):
@@ -2273,8 +2312,10 @@ def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int, 
     return user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
 
 
-def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
-    """Warn about a parse failure and return the last-known-good config, or None (-> defaults).
+def _last_known_good_fallback(
+    config_path: Path, path_key: str, cache_sig: Any, exc: Exception,
+) -> Dict[str, Any]:
+    """Warn about a parse failure and rebuild last-known-good user data (or defaults).
     A parse failure must not silently replace the effective config with defaults — that drops
     EVERY user override, including security-critical ``approvals.deny`` rules, when a gateway
     user mid-edits config.yaml into broken YAML. Keep serving the last good config until fixed."""
@@ -2283,6 +2324,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     # process we still have the last successfully loaded config — keep serving it until the file is fixed.
     # See #31188.
     lkg = _LAST_EXPANDED_CONFIG_BY_PATH.get(path_key)
+    raw_good = lkg.user if lkg is not None else None
     fallback = "last-known-good"
     if lkg is None:
         # Fresh process (CLI restart, `hermes config get`): nothing loaded yet in this process, so
@@ -2292,41 +2334,47 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         from hermes_cli.config_backups import load_newest_good_backup
         raw_good = load_newest_good_backup(config_path)
         if raw_good is not None:
-            normalized = _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good))
-            expanded_good: Dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
-            lkg, _ = _merge_managed_overlay(expanded_good)
             fallback = "last-known-good-backup"
     _warn_config_parse_failure(
-        config_path, exc, fallback=fallback if lkg is not None else "defaults")
-    if lkg is None:
-        return None
-    # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
-    # expanded one. Expand defensively — idempotent when already expanded.
-    lkg_copy = FailedConfigRead(_expand_env_vars(copy.deepcopy(lkg)), error=exc)
-    if cache_sig is not None:
-        # Cache under the failed file's signature (empty env snapshot: always valid) so repeated
-        # loads don't re-parse the fallback; fixing the file changes the signature and reloads
-        # normally, and a read error is re-probed on every hit (_load_config_cache_hit).
-        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
+        config_path, exc, fallback=fallback if raw_good is not None else "defaults")
+    normalized = _canonicalize_config(
+        _deep_merge(copy.deepcopy(DEFAULT_CONFIG), copy.deepcopy(raw_good or {})))
+    expanded, managed_config, managed_read_ok = _merge_managed_overlay(_expand_env_vars(normalized))
+    # A resolved string can itself contain a placeholder. Re-expanding a mixed result would
+    # both violate single-pass substitution and let profile values supply managed policy.
+    lkg_copy = FailedConfigRead(expanded, error=exc)
+    if cache_sig is not None and managed_read_ok:
+        # Stable failures retain readonly identity, but profile/process rotation still rebuilds
+        # from the original authorities. Read errors are also re-probed on every cache hit.
+        _LOAD_CONFIG_CACHE[path_key] = (
+            *cache_sig, lkg_copy, _config_env_snapshot(normalized, managed_config))
+    else:
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
-    """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
+def _merge_managed_overlay(
+    expanded: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+    """Apply the overlay; return the merged config, managed mapping and read success.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
     a managed literal: managed values expand only against the process environment. This
     deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
     (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
+    managed = managed_scope._read_managed_config()
+    managed_config = managed.mapping()
+    # A transient failure is permissively empty, but cannot certify a complete load under
+    # unchanged metadata. Carry this read's provenance to both normal and recovery caches.
+    managed_read_ok = managed.shape.unreadable is None
     if not managed_config:
-        return expanded, managed_config
+        return expanded, managed_config, managed_read_ok
     # Same canonicalization as the user config BEFORE merging (parity with
     # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
     managed_normalized = _normalize_root_model_keys(managed_config)
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
+    return _deep_merge(expanded, _expand_managed_env_vars(managed_normalized)), managed_config, managed_read_ok
 
 
 def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, Any]]:
@@ -2347,9 +2395,9 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
                 f.read()
             return None
         except OSError:
-            return hit
-    env_snapshot = cached[9] if len(cached) > 9 else {}
-    if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
+            # An ongoing read failure does not freeze either expansion authority.
+            pass
+    if cached[9].is_current():
         return hit
     return None
 
@@ -2406,27 +2454,20 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 backup_config(config_path, "good")
             except Exception as e:
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
-                if lkg_copy is not None:
-                    return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
-                # Defaults stand in for the unreadable file: never the next last-known-good,
-                # never saveable, and cached like the LKG path.
-                fallback = FailedConfigRead(
-                    _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=e)
-                if cache_sig is not None:
-                    _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
-                return copy.deepcopy(fallback) if want_deepcopy else fallback
+                return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
-        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
-        if cache_sig is not None:
+        expanded, managed_config, managed_read_ok = _merge_managed_overlay(_expand_env_vars(normalized))
+        # The user read succeeded even if managed policy is temporarily unavailable. Keep its
+        # recovery/template provenance, without publishing the partial result as a full cache hit.
+        _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = _LastGoodConfig(
+            copy.deepcopy(normalized), copy.deepcopy(expanded))
+        if cache_sig is not None and managed_read_ok:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while
             # load_config_readonly() callers all see the same stable object. The env snapshot
             # records the values this expansion was made against so later loads detect drift.
             cached_copy = copy.deepcopy(expanded)
-            env_snapshot = _env_ref_snapshot(normalized)
-            if managed_config:
-                _env_ref_snapshot(managed_config, env_snapshot)
+            env_snapshot = _config_env_snapshot(normalized, managed_config)
             _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
             # Readonly path returns the same object later calls will see (identity invariant).
             if not want_deepcopy:
@@ -2536,9 +2577,10 @@ def save_config(
         current_normalized = _canonicalize_config(config)
         normalized = current_normalized
         if _raw_for_paths:
+            last_good = _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path))
             normalized = _preserve_env_ref_templates(
                 normalized, _canonicalize_config(_raw_for_paths),
-                _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
+                last_good.expanded if last_good is not None else None)
 
         if strip_defaults:
             # ``_strip_default_values`` always preserves ``_config_version`` itself.
@@ -2548,7 +2590,8 @@ def save_config(
         atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
-        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = _LastGoodConfig(
+            copy.deepcopy(normalized), copy.deepcopy(current_normalized))
     from hermes_cli.observability.shared_metrics_disabled import record_config_saved
     record_config_saved(_raw_for_paths, current_normalized)
 

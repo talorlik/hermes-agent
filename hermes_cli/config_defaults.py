@@ -1843,6 +1843,9 @@ DEFAULT_CONFIG = {
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,
+        # Ledger-wide terminal execution ceiling; None keeps history without a count limit.
+        # Malformed retention policy suspends all destructive retention; public finish still persists.
+        "max_terminal_executions": None,
         # Timeout (seconds) for a no-agent cron script. Env: HERMES_CRON_SCRIPT_TIMEOUT. Keep in
         # sync with cron.scheduler._DEFAULT_SCRIPT_TIMEOUT.
         "script_timeout_seconds": 3600,

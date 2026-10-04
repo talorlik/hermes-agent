@@ -336,7 +336,7 @@ def open_incidents() -> List[Dict[str, Any]]:
     with _transaction() as conn:
         rows = conn.execute(
             f"SELECT * FROM cron_incidents WHERE state IN ({open_states}) "
-            "ORDER BY last_seen_at DESC, id DESC"
+            "ORDER BY datetime(last_seen_at) DESC, last_seen_at DESC, id DESC"
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -380,7 +380,11 @@ def list_incidents(state: Optional[str] = None) -> List[Dict[str, Any]]:
     where, params = _state_filter(state)
     with _transaction() as conn:
         rows = conn.execute(
-            "SELECT * FROM cron_incidents" + where + " ORDER BY last_seen_at DESC, id DESC", params
+            # Instant order, not text order: stored stamps carry their UTC offset, and across a
+            # DST fall-back the later instant can sort earlier as text.
+            "SELECT * FROM cron_incidents" + where
+            + " ORDER BY datetime(last_seen_at) DESC, last_seen_at DESC, id DESC",
+            params,
         ).fetchall()
     return [dict(row) for row in rows]
 

@@ -172,7 +172,7 @@ def test_retention_is_per_job_and_preserves_inflight(monkeypatch, tmp_path):
     is covered by ``test_execution_schema_migration.py``.
     """
     executions = _point_ledger(monkeypatch, tmp_path)
-    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
+    monkeypatch.setattr(executions, "PER_JOB_TERMINAL_EXECUTIONS", 3)
     inflight = executions.create_execution("live", source="builtin")
     executions.mark_execution_running(inflight["id"])
     for index in range(8):
@@ -188,7 +188,7 @@ def test_recently_finished_long_running_execution_survives_retention(
     monkeypatch, tmp_path
 ):
     executions = _point_ledger(monkeypatch, tmp_path)
-    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1)
+    monkeypatch.setattr(executions, "PER_JOB_TERMINAL_EXECUTIONS", 1)
     long_running = executions.create_execution("long-running", source="builtin")
     assert executions.mark_execution_running(long_running["id"]) is not None
     newer = executions.create_execution("newer", source="builtin")
