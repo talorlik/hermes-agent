@@ -38,6 +38,26 @@ def install_state_dir(project_root: Path) -> Path:
     return installs_root() / install_key(project_root)
 
 
+def activation_state_dir(project_root: Path) -> Path:
+    """State dir a process may boot from. Writes stay on ``install_state_dir``.
+
+    A launch under a temporary ``HERMES_HOME`` has no committed generation of
+    its own. Refusing that launch forces every harness to run ``hermes pm
+    repair`` or time out on a full sync. Borrow the owner's committed record
+    for the read. A borrower that already has its own ``facts.json`` keeps it.
+    """
+    own = install_state_dir(project_root)
+    if (own / "facts.json").is_file():
+        return own
+    owner = owning_home_root(project_root)
+    if owner is None:
+        return own
+    borrowed = owner / "installs" / install_key(project_root)
+    if (borrowed / "facts.json").is_file():
+        return borrowed
+    return own
+
+
 def owning_home_root(project_root: Path) -> Path | None:
     """The data root that owns this checkout when the active root only borrows it, else ``None``.
 
@@ -257,7 +277,8 @@ def committed_venv(project_root: Path) -> Path | None:
 
 
 def _recorded_venv(project_root: Path) -> Path | None:
-    path = runtime_facts_path(project_root)
+    state = activation_state_dir(project_root)
+    path = state / "facts.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
@@ -274,7 +295,7 @@ def _recorded_venv(project_root: Path) -> Path | None:
     if not isinstance(value, str):
         raise RuntimeError("invalid dependency environment path")
     environment = Path(value).resolve()
-    generations = install_state_dir(project_root) / "environments"
+    generations = state / "environments"
     if not environment.is_relative_to(generations.resolve()) or not (environment / "pyvenv.cfg").is_file():
         raise RuntimeError(f"dependency environment is missing or outside this install: {environment}")
     return environment
@@ -385,7 +406,7 @@ def activate_dependencies(project_root: Path) -> None:
     """
     import sys
 
-    state = install_state_dir(project_root)
+    state = activation_state_dir(project_root)
     if state.is_dir():
         from hermes_cli.runtime_state import runtime_lock, recover_publication, lease_generation
         # The lock's holder may be another profile's backend running a full dependency rebuild;

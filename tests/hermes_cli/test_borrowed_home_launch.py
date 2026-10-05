@@ -203,3 +203,21 @@ def test_the_owner_still_owes_and_runs_its_tail(tmp_path, monkeypatch, completio
     assert venv_sync.prepare_launch(root, []) == Path(sys.executable)
     assert len(completion_tail) == 1
     assert published == [root]
+
+
+def test_activation_borrows_owner_facts_and_leaves_writes_on_the_borrower(tmp_path, monkeypatch):
+    """A temp HERMES_HOME with no generation boots from the owner's record.
+
+    ``install_state_dir`` stays on the borrower so a later sync cannot rewrite
+    the owner's facts.json.
+    """
+    from pm.environments import activation_state_dir
+
+    root = _checkout(tmp_path, monkeypatch)
+    _state(tmp_path / ".hermes", root)
+    borrower = _home(monkeypatch, tmp_path / "borrower")
+    key = install_key(root)
+    assert install_state_dir(root) == borrower / "installs" / key
+    assert activation_state_dir(root) == tmp_path / ".hermes" / "installs" / key
+    _state(borrower, root)
+    assert activation_state_dir(root) == borrower / "installs" / key
