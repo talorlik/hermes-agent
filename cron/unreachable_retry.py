@@ -141,8 +141,6 @@ def plan_retry(job: Dict[str, Any]) -> bool:
     the ladder instant when that is sooner than the natural occurrence; exhausted or
     inapplicable cycles clear state and leave the schedule untouched. Returns True when
     a retry was scheduled."""
-    if attempt >= len(RETRY_DELAYS_SECONDS):
-    retry_dt = _hermes_now() + timedelta(seconds=delay)
     from cron.jobs import _parse_aware  # late: jobs imports this module's helpers
 
     retry_dt = _ladder_instant(job, _parse_aware(job.get("next_run_at")), _hermes_now())
@@ -169,10 +167,3 @@ def plan_retry(job: Dict[str, Any]) -> bool:
         job.get("name", job.get("id", "?")), attempt + 1, len(RETRY_DELAYS_SECONDS),
         delay, retry_at)
     return True
-    is exhausted. The decision matches ``plan_retry`` without mutating the job.
-    if attempt >= len(RETRY_DELAYS_SECONDS):
-    retry_dt = _hermes_now() + timedelta(seconds=delay)
-    The due scan treats an off-lattice cron instant as a direct expression edit
-    than that lattice on purpose. Without this predicate the scan raises
-    ``ImportError``, logs the job as malformed, and drops the retry.
-    )

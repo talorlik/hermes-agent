@@ -93,7 +93,7 @@ class _FakeProc:
 def test_late_turn_report_books_delivery(tmp_path, monkeypatch):
     """Report appearing in the kill window = turn completed = booked, not a timeout."""
     from hermes_cli import quiet_single_query as qsq
-    monkeypatch.setattr(delivery.subprocess, "Popen", _FakeProc)
+    monkeypatch.setattr(qsq.subprocess, "Popen", _FakeProc)
     late_state = {}
 
     def fake_read(path, pid):

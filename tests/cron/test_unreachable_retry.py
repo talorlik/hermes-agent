@@ -28,7 +28,6 @@ def _iso(dt: datetime) -> str:
 
 
 def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(
-    parked = "2026-10-04T01:00:00+00:00"
     tmp_cron_home, monkeypatch,
 ):
     """Failed-unreachable runs re-fire on the 5/15/30-minute ladder instead of waiting a
@@ -192,3 +191,36 @@ def test_ladder_reruns_do_not_spend_extra_repeat_budget(tmp_cron_home, monkeypat
     assert held == [True, True, True, False]
     # But a rung whose limit was edited down to the count does retire the job: send its notice.
     assert not ur.will_retry(dict(runs[1], repeat={"times": 1, "completed": 1}))
+
+
+def test_is_retry_fire_matches_only_the_parked_instant():
+    """A ladder re-run matches only the parked instant and schedule expression."""
+    job = {
+        "schedule": {"kind": "cron", "expr": "0 * * * *"},
+        ur.STATE_KEY: {"attempt": 1, "at": "2026-10-05T00:00:00+00:00", "expr": "0 * * * *"},
+    }
+    assert ur.is_retry_fire(job, "2026-10-05T00:00:00+00:00") is True
+    assert ur.is_retry_fire(job, "2026-10-05T01:00:00+00:00") is False
+    drifted = {
+        "schedule": {"kind": "cron", "expr": "15 * * * *"},
+        ur.STATE_KEY: {"attempt": 1, "at": "2026-10-05T00:00:00+00:00", "expr": "0 * * * *"},
+    }
+    assert ur.is_retry_fire(drifted, "2026-10-05T00:00:00+00:00") is False
+
+
+def test_retry_yields_to_nearer_natural_run(tmp_cron_home, monkeypatch):
+    """The durable store mutation leaves a nearer natural occurrence intact."""
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(ur, "_hermes_now", lambda: now)
+    natural_next = (now + timedelta(minutes=1)).isoformat()
+    job = {
+        "id": "near-natural",
+        "name": "near natural",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "state": "scheduled",
+        "next_run_at": natural_next,
+    }
+
+    assert ur.plan_retry(job) is False
+    assert job.get(ur.STATE_KEY) is None
+    assert job["next_run_at"] == natural_next
