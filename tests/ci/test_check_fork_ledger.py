@@ -1232,6 +1232,352 @@ def test_repaired_conflict_merge_stays_unmapped_without_the_lines(tmp_path):
     assert "does not keep current upstream lines" in problems
 
 
+def _repaired_ledger(owner_commits: str, bad: str) -> str:
+    return _entry(
+        "G-SHARED",
+        "shared path",
+        commits=owner_commits,
+        owned_files=["shared.py"],
+    ) + (
+        "## G-FORK-LEDGER: fixture ledger\n"
+        "- Commits: self\n"
+        f"- Repaired-Conflict-Merges: {bad}\n"
+        "- Owned-Files:\n"
+        "  - docs/FORK_CHANGES.md\n"
+        "- Intent: A later owned edit of a conflict path is the owner's audited work.\n"
+        "- Protected-Invariant: A drop with no later owned edit stays a failure.\n"
+        "- Tests: tests/ci/test_check_fork_ledger.py\n"
+        "- Retirement-Condition: The fixture is gone.\n"
+        "- Disposition: active\n"
+    )
+
+
+def _blob(repo: Path, rev: str, path: str) -> str:
+    return _git(repo, "rev-parse", f"{rev}:{path}")
+
+
+def test_upstream_line_deletion_waives_only_lines_in_the_declared_blobs(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "declared-deletion")
+    repo = Path(fx["repo"])
+    # The upstream version the merge resolved against. Its lines are the audited text.
+    resolved = _blob(repo, "upstream-main~1", "shared.py")
+    body = _repaired_ledger(fx["custom"], fx["bad"]).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + resolved + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    # The declaration covers the resolved version, not the lines upstream added after it.
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "leaves" in problems and "unaudited" in problems
+
+
+def test_upstream_line_deletion_covers_the_current_upstream_version(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "declared-current")
+    repo = Path(fx["repo"])
+    current = _blob(repo, "upstream-main", "shared.py")
+    body = _repaired_ledger(fx["custom"], fx["bad"]).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + current + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert fx["bad"] in payload["repaired_conflict_merges"]
+
+
+def test_upstream_line_deletion_counts_repeated_lines(tmp_path):
+    # The audited blob never contained the line. Upstream now has it twice and
+    # the tip kept it once, so one occurrence is unaudited. Set membership
+    # would see the line present at the tip and waive both; counting must not.
+    repo = tmp_path / "repeated-line"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "OTHER = 1\n", "base")
+    audited = _blob(repo, "HEAD", "shared.py")
+    _git(repo, "checkout", "-b", "fork-main")
+    custom = _commit_file(repo, "shared.py", "OTHER = 1\nEXTRA = 'fork'\n", "fork edit")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'x'\n", "upstream adds the line")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream by keeping the fork file")
+    bad = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'x'\nVALUE = 'x'\n", "upstream repeats the line")
+    _git(repo, "checkout", "fork-main")
+    (repo / "shared.py").write_text("VALUE = 'x'\nEXTRA = 'fork'\n")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "keep one occurrence")
+    kept = _git(repo, "rev-parse", "HEAD")
+    body = _repaired_ledger(f"{custom}, {kept}", bad).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + audited + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "unaudited" in problems
+
+
+def _commit_bytes(repo: Path, rel: str, content: bytes, subject: str) -> str:
+    path = repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-m", subject)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def test_upstream_line_deletion_counts_a_crlf_difference(tmp_path):
+    # A CR-LF line and an LF line are different content. The audited blob is LF
+    # and upstream is now CR-LF, so the difference is unaudited.
+    repo = tmp_path / "crlf"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_bytes(repo, "shared.py", b"X\n", "base with LF")
+    audited = _blob(repo, "HEAD", "shared.py")
+    _git(repo, "checkout", "-b", "fork-main")
+    custom = _commit_bytes(repo, "shared.py", b"OTHER\n", "fork drops the line")
+    _git(repo, "checkout", "upstream-main")
+    _commit_bytes(repo, "shared.py", b"X\r\n", "upstream switches to CR-LF")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream by keeping the fork file")
+    bad = _git(repo, "rev-parse", "HEAD")
+    body = _repaired_ledger(custom, bad).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + audited + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "unaudited" in problems
+
+
+def test_upstream_line_deletion_counts_a_missing_final_newline(tmp_path):
+    # Git treats a missing final newline as distinct content. The audited blob
+    # has the newline and upstream does not, so the difference is unaudited.
+    # str.splitlines() would collapse the two and waive it.
+    repo = tmp_path / "final-newline"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_bytes(repo, "shared.py", b"X\n", "base with a final newline")
+    audited = _blob(repo, "HEAD", "shared.py")
+    _git(repo, "checkout", "-b", "fork-main")
+    custom = _commit_bytes(repo, "shared.py", b"OTHER\n", "fork drops the line")
+    _git(repo, "checkout", "upstream-main")
+    _commit_bytes(repo, "shared.py", b"X", "upstream drops the final newline")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream by keeping the fork file")
+    bad = _git(repo, "rev-parse", "HEAD")
+    body = _repaired_ledger(custom, bad).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + audited + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "unaudited" in problems
+
+
+def test_upstream_line_deletion_counts_blank_lines(tmp_path):
+    # A trailing blank line is text. The audited blob has one blank line and
+    # upstream now has two, so one is unaudited. Stripping newlines before
+    # counting would hide it.
+    repo = tmp_path / "blank-lines"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "\nX\n", "base with one blank line")
+    audited = _blob(repo, "HEAD", "shared.py")
+    _git(repo, "checkout", "-b", "fork-main")
+    custom = _commit_file(repo, "shared.py", "X\n", "fork drops the blank line")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "\n\nX\n", "upstream adds a second blank line")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream by keeping the fork file")
+    bad = _git(repo, "rev-parse", "HEAD")
+    body = _repaired_ledger(custom, bad).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + audited + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "unaudited" in problems
+
+
+def test_upstream_line_deletion_rejects_a_repeated_blob_id(tmp_path):
+    # Repeating a blob hash must not count its lines twice. One audited
+    # occurrence cannot cover two upstream occurrences by being named twice.
+    repo = tmp_path / "repeated-blob"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'x'\n", "base")
+    audited = _blob(repo, "HEAD", "shared.py")
+    _git(repo, "checkout", "-b", "fork-main")
+    custom = _commit_file(repo, "shared.py", "OTHER = 1\n", "fork drops the line")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "shared.py", "VALUE = 'x'\nVALUE = 'x'\n", "upstream repeats the line")
+    _git(repo, "checkout", "fork-main")
+    merge = subprocess.run(
+        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+    )
+    assert merge.returncode == 1
+    _git(repo, "checkout", "--ours", "--", "shared.py")
+    _git(repo, "add", "shared.py")
+    _git(repo, "commit", "-m", "sync upstream by keeping the fork file")
+    bad = _git(repo, "rev-parse", "HEAD")
+    body = _repaired_ledger(custom, bad).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs "
+        + audited + "+" + audited + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "repeats a blob id" in problems
+
+
+def test_upstream_line_deletion_rejects_a_blob_upstream_never_committed(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "foreign-blob")
+    repo = Path(fx["repo"])
+    _commit_file(repo, "other.py", "OTHER = 1\n", "unrelated")
+    foreign = _blob(repo, "HEAD", "other.py")
+    body = _repaired_ledger(fx["custom"], fx["bad"]).replace(
+        "- Repaired-Conflict-Merges:",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + foreign + "\n"
+        "- Repaired-Conflict-Merges:",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "not a blob upstream ever committed" in problems
+
+
+def test_upstream_line_deletion_is_refused_from_any_other_entry(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "owner-declares")
+    repo = Path(fx["repo"])
+    current = _blob(repo, "upstream-main", "shared.py")
+    body = _repaired_ledger(fx["custom"], fx["bad"]).replace(
+        "- Owned-Files:\n  - shared.py\n",
+        "- Upstream-Line-Deletions: shared.py removed-upstream-blobs " + current + "\n"
+        "- Owned-Files:\n  - shared.py\n",
+        1,
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    problems = " ".join(
+        problem for entry in payload["invalid_entries"] for problem in entry["problems"]
+    )
+    assert "may be declared only by G-FORK-LEDGER" in problems
+
+
+def test_repaired_conflict_merge_still_fails_when_the_later_edit_is_unmapped(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "unmapped-rewrite")
+    repo = Path(fx["repo"])
+    _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'fork-rewrite'\nEXTRA = 'fork'\n",
+        "unmapped rewrite of the shared module",
+    )
+    unmapped = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(repo, _repaired_ledger(fx["custom"], fx["bad"]))
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    assert unmapped in {item["sha"] for item in payload["unmapped_commits"]}
+
+
+def test_repaired_conflict_merge_ignores_a_later_edit_of_an_unowned_path(tmp_path):
+    fx = _conflict_drop_repo(tmp_path, "unowned-rewrite")
+    repo = Path(fx["repo"])
+    rewrite = _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'fork-rewrite'\nEXTRA = 'fork'\n",
+        "rewrite with no owner for the path",
+    )
+    body = _repaired_ledger(f"{fx['custom']}, {rewrite}", fx["bad"]).replace(
+        "  - shared.py\n", "  - other.py\n", 1
+    )
+    _write_ledger(repo, body)
+    code, payload = _run_checker(repo)
+    assert code == 1, payload
+    assert fx["bad"] in {item["sha"] for item in payload["unmapped_commits"]}
+    assert "shared.py" in payload["unowned_paths"]
+    problems = " ".join(
+        problem
+        for entry in payload["invalid_entries"]
+        for problem in entry["problems"]
+    )
+    assert "does not keep current upstream lines: shared.py" in problems
+
+
 def test_restored_conflict_merge_stays_unmapped_when_unlisted(tmp_path):
     fx = _conflict_drop_repo(tmp_path, "unlisted-repair")
     repo = Path(fx["repo"])

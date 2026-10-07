@@ -42,6 +42,11 @@ already claims.
 dropped upstream lines only when the checked tip still keeps every current
 upstream line of each conflict path, in upstream order. Listing the SHA is not
 enough. A tip that drops a line leaves the commit unmapped and names the path.
+A later edit of the file is not a waiver: ownership attributes the edit, it does
+not prove the upstream lines survived it. A drop that is intentional belongs in
+`Upstream-Line-Deletions`, which names the path and the blob of the upstream
+version whose lines were removed, so the deletion is audited text rather than an
+inferred consequence of some other commit.
 The SHA stays in `repaired_conflict_merges` so the old merge remains visible.
 
 A path may be declared once; a repeated row fails closed whether the winner
@@ -482,14 +487,27 @@ def _blob_text(repo: Path, entry: tuple[str, str, str] | None) -> str | None:
     return _git_bytes(repo, "cat-file", "-p", entry[2]).decode("utf-8", "surrogateescape")
 
 
+def _line_records(text: str) -> list[str]:
+    """Split only at LF and keep the terminator, matching git's line identity.
+
+    str.splitlines() collapses a missing final newline, a CR-LF, and a unicode
+    line separator into one line, so two blobs git treats as different compare
+    equal. An unterminated final record stays unterminated.
+    """
+    records = text.split("\n")
+    return [record + "\n" for record in records[:-1]] + (
+        records[-1:] if records[-1] else []
+    )
+
+
 def _upstream_lines_kept(upstream: str, actual: str, fork: str) -> bool:
     """True when every upstream line survives and every extra line came from the fork."""
     if bytes((0,)) in upstream.encode("utf-8", "surrogateescape"):
         return actual == upstream
     if bytes((0,)) in actual.encode("utf-8", "surrogateescape"):
         return False
-    required = upstream.splitlines()
-    live = actual.splitlines()
+    required = _line_records(upstream)
+    live = _line_records(actual)
     index = 0
     for line in required:
         while index < len(live) and live[index] != line:
@@ -498,7 +516,7 @@ def _upstream_lines_kept(upstream: str, actual: str, fork: str) -> bool:
             return False
         index += 1
     upstream_lines = set(required)
-    fork_lines = set(fork.splitlines())
+    fork_lines = set(_line_records(fork))
     return all(line in upstream_lines or line in fork_lines for line in live)
 
 
@@ -722,6 +740,116 @@ def _tip_missing_upstream_lines(
     return missing
 
 
+_DELETION_ITEM = re.compile(
+    r"^(?P<path>\S+) removed-upstream-blobs (?P<blobs>[0-9a-f]{40}(?:\+[0-9a-f]{40})*)$"
+)
+
+
+def _classify_upstream_line_deletions(
+    repo: Path,
+    entries: list[LedgerEntry],
+    upstream_oid: str,
+    fork_oid: str,
+) -> dict[str, str]:
+    """Audit an intentional removal of upstream lines, and return the waivers.
+
+    ``Upstream-Line-Deletions`` names the path and the blob of the upstream
+    version whose lines the fork removed. The blob is the audited text: the
+    declaration only waives lines that are absent at the tip when that exact
+    blob is what upstream currently has. Upstream moving on invalidates it, so
+    a deletion cannot silently cover lines nobody reviewed. The field may be
+    declared only by G-FORK-LEDGER, which owns no product path, so the owner of
+    the path cannot waive its own deletion.
+    """
+    declarers = [e for e in entries if "Upstream-Line-Deletions" in e.fields]
+    for entry in declarers:
+        if entry.entry_id != "G-FORK-LEDGER":
+            entry.problems.append(
+                "Upstream-Line-Deletions may be declared only by G-FORK-LEDGER"
+            )
+    ledger_entries = [e for e in declarers if e.entry_id == "G-FORK-LEDGER"]
+    if len(ledger_entries) > 1:
+        for entry in ledger_entries:
+            entry.problems.append(
+                "Upstream-Line-Deletions requires one unique G-FORK-LEDGER entry"
+            )
+        return {}
+    if not ledger_entries:
+        return {}
+    entry = ledger_entries[0]
+    raw = entry.fields["Upstream-Line-Deletions"].strip()
+    if not raw:
+        entry.problems.append("Upstream-Line-Deletions cannot be empty")
+        return {}
+    waivers: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        matched = _DELETION_ITEM.fullmatch(item)
+        if not matched:
+            entry.problems.append(
+                "Upstream-Line-Deletions item must be "
+                "'<path> removed-upstream-blobs <40-hex>[+<40-hex>...]': " + item
+            )
+            continue
+        path = matched.group("path")
+        blobs = matched.group("blobs").split("+")
+        if len(blobs) != len(set(blobs)):
+            entry.problems.append(
+                f"Upstream-Line-Deletions for {path} repeats a blob id; "
+                "repeating a hash does not audit more text"
+            )
+            continue
+        if path in waivers:
+            entry.problems.append(
+                f"duplicate Upstream-Line-Deletions declaration: {path}"
+            )
+            continue
+        # Every declared blob must be an ancestor version of the path, so the
+        # declaration cannot name an arbitrary blob to launder a deletion.
+        for blob in blobs:
+            owners = _git(
+                repo, "log", "--format=%H", upstream_oid, "--find-object", blob
+            ).split()
+            if not owners:
+                entry.problems.append(
+                    f"Upstream-Line-Deletions blob {blob[:12]} for {path} "
+                    "is not a blob upstream ever committed"
+                )
+                break
+        else:
+            # Count occurrences, not set membership. A line upstream now has
+            # twice, of which the tip kept one, is a new line the declaration
+            # never audited; treating lines as a set would waive it.
+            from collections import Counter
+
+            def _records(raw: bytes) -> list[str]:
+                # Same contract as _line_records, applied to raw blob bytes so
+                # no decode-and-strip step can hide a line ending.
+                return _line_records(raw.decode("utf-8", errors="surrogateescape"))
+
+            tip_counts = Counter(_records(_git_bytes(repo, "show", f"{fork_oid}:{path}")))
+            upstream_counts = Counter(
+                _records(_git_bytes(repo, "show", f"{upstream_oid}:{path}"))
+            )
+            audited_counts: Counter[str] = Counter()
+            for blob in blobs:
+                audited_counts.update(_records(_git_bytes(repo, "cat-file", "-p", blob)))
+            uncovered = sum(
+                max(0, upstream_counts[line] - tip_counts[line] - audited_counts[line])
+                for line in upstream_counts
+            )
+            if uncovered:
+                entry.problems.append(
+                    f"Upstream-Line-Deletions for {path} leaves "
+                    f"{uncovered} current upstream line(s) unaudited"
+                )
+                continue
+            waivers[path] = "+".join(blobs)
+    return waivers
+
+
 def _classify_repaired_conflict_merges(
     repo: Path,
     entries: list[LedgerEntry],
@@ -729,11 +857,14 @@ def _classify_repaired_conflict_merges(
     fork_oid: str,
     work_shas: set[str],
     sync_set: set[str],
+    deleted_upstream_blobs: dict[str, str],
 ) -> list[str]:
     """Map a conflict merge only when the tip still keeps upstream lines.
 
     The listing does not waive the commit. Verification uses the checked tip
     and the current upstream ref, so a later drop of those lines fails closed.
+    A later owned edit of the file is not a waiver: ownership attributes the
+    edit, it does not prove the upstream lines survived it.
     """
     declarers = [
         entry for entry in entries if "Repaired-Conflict-Merges" in entry.fields
@@ -816,9 +947,13 @@ def _classify_repaired_conflict_merges(
                 f"{token}"
             )
             continue
-        missing = _tip_missing_upstream_lines(
-            repo, conflict_paths, upstream_oid, fork_oid
-        )
+        missing = [
+            path
+            for path in _tip_missing_upstream_lines(
+                repo, conflict_paths, upstream_oid, fork_oid
+            )
+            if path not in deleted_upstream_blobs
+        ]
         if missing:
             entry.problems.append(
                 f"Repaired-Conflict-Merges commit {token} does not keep current "
@@ -1731,8 +1866,12 @@ def run_check(repo: Path, ledger_path: Path, upstream_ref: str, fork_ref: str) -
     )
     sync_set = set(sync_merges)
     work_shas = {commit["sha"] for commit in work}
+    deleted_upstream_blobs = _classify_upstream_line_deletions(
+        repo, entries, upstream_oid, fork_oid
+    )
     repaired = _classify_repaired_conflict_merges(
-        repo, entries, upstream_oid, fork_oid, work_shas, sync_set
+        repo, entries, upstream_oid, fork_oid, work_shas, sync_set,
+        deleted_upstream_blobs,
     )
     repaired_set = set(repaired)
     work = [commit for commit in work if commit["sha"] not in repaired_set]

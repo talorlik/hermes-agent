@@ -78,7 +78,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CRON-DURABLE: durable scheduler outcomes, detached runs, fail-closed scripts
-- Commits: d7cf45920d38a9823c03562a97494c25ca5fea61
+- Commits: d7cf45920d38a9823c03562a97494c25ca5fea61, 4a7f53254e4b3b8702e7d0c3225f3897a1bdcee7
 - Owned-Files:
   - cron/deferrals.py
   - cron/delivery_queue.py
@@ -91,7 +91,10 @@ change; entry is removed after the next clean sync shows no residual delta),
   - cron/outbox.py
   - cron/scheduler.py
   - cron/scheduler_delivery.py
+  - cron/scheduler_delivery_run.py
+  - cron/scheduler_outcomes.py
   - cron/scheduler_script.py
+  - cron/scheduler_tick.py
   - cron/unreachable_retry.py
   - hermes_cli/cron.py
   - hermes_cli/subcommands/cron.py
@@ -118,6 +121,20 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/cron/test_model_drift_compat.py
   - tests/cron/test_script_claim_heartbeat.py
   - tests/cron/test_unreachable_retry.py
+  - tests/cron/g01c_managed_store_fixture.py
+  - tests/cron/test_bot_chat_timeout_marker.py
+  - tests/cron/test_cron_script.py
+  - tests/cron/test_deferral_production_contract.py
+  - tests/cron/test_delivery_generation_atomicity.py
+  - tests/cron/test_delivery_generation_producer.py
+  - tests/cron/test_execution_retention_policy.py
+  - tests/cron/test_g01c_causal_boundary_regressions.py
+  - tests/cron/test_gateway_startup_import_closure.py
+  - tests/cron/test_jobs_delivery_projection.py
+  - tests/cron/test_jobs_import_contract.py
+  - tests/cron/test_jobs_syntax.py
+  - tests/cron/test_monitor_kind.py
+  - tests/cron/test_warning_execution_outcome.py
   - tests/hermes_cli/test_cron.py
   - tests/hermes_cli/test_cron_exit_code_propagation.py
   - website/docs/user-guide/features/cron.md
@@ -148,6 +165,7 @@ change; entry is removed after the next clean sync shows no residual delta),
   - tests/hermes_cli/test_kanban_write_txn_busy_retry.py
   - tests/plugins/test_kanban_dashboard_plugin.py
   - tests/tools/test_kanban_tools.py
+  - tests/tools/test_kanban_tools_parse_contract.py
   - website/docs/user-guide/features/kanban.md
 - Intent: Protect durable Kanban lifecycle transitions and serve the board dashboard's task deep links and bounded schema-v2 orchestration summaries without coupling board operations to a producer.
 - Protected-Invariant: Stale lifecycle transitions fail closed; replayed claims and guarded comments are idempotent; summary paths stay profile-confined and unsafe or inconsistent files remain panel-local; stale asynchronous responses cannot overwrite the selected board.
@@ -433,20 +451,48 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream clears HERMES_LAUNCHD_LABEL in this test, or this host no longer exports a launchd job label into the test process.
 - Disposition: active
 
+## G-CONFIG-SCOPE: last-good config recovery and managed-scope layer shapes
+- Commits: none
+- Owned-Files:
+  - hermes_cli/config.py
+  - hermes_cli/config_effective.py
+  - hermes_cli/managed_scope.py
+  - tests/hermes_cli/test_config_effective.py
+  - tests/hermes_cli/test_config_scope_expansion.py
+  - tests/hermes_cli/test_managed_scope_config.py
+  - tests/hermes_cli/test_managed_scope_loaders.py
+- Intent: Config loading keeps the last successfully parsed user layer separately from the merged policy value, so recovery after a mid-edit parse failure re-expands only user-authored templates. The effective-config cache keys on the per-layer shape each read produced, so a managed overlay that fails to parse is ignored loudly and never re-resolved through a profile's secret scope. The scheduler's exact thread admission reads config through this surface, which is why the cron reconciliation commit carried it.
+- Protected-Invariant: A broken user YAML never silently drops overrides; a managed `${VAR}` resolves against the process environment only; a merged policy value is never fed back into template expansion.
+- Tests: tests/hermes_cli/test_config_effective.py, tests/hermes_cli/test_config_scope_expansion.py, tests/hermes_cli/test_managed_scope_config.py, tests/hermes_cli/test_managed_scope_loaders.py
+- Retirement-Condition: Upstream separates the last-good user layer from the expanded value and keys the effective cache on layer shape.
+- Disposition: active
+
+## G-PM-TEMP-HOME: temporary homes boot from the owner's committed environment
+- Commits: 0dfe32746ba664217fd74d32a7234f30e8a406b1
+- Owned-Files:
+  - pm/environments.py
+  - tests/hermes_cli/test_borrowed_home_launch.py
+- Intent: A launch under a temporary HERMES_HOME has no committed generation of its own. Refusing it forced every test harness to run `hermes pm repair` or wait out a full sync. The activation state dir borrows the owning home's committed record for the read; writes stay on the install state dir, and a borrower with its own facts.json keeps it.
+- Protected-Invariant: A borrowed read never writes into the owner's state dir; a home with its own committed generation is never overridden by the owner's.
+- Tests: tests/hermes_cli/test_borrowed_home_launch.py
+- Retirement-Condition: Upstream lets a temporary home activate from the owning install's committed generation.
+- Disposition: active
+
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
-- Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 46
+- Commits: self
+- Ledger-Revision: 47
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
-- Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58
+- Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
+- Upstream-Line-Deletions: cron/scheduler.py removed-upstream-blobs 6276f9477279568c1dfb163e5dba4606b110ec6d+8a1f5827553dbbe509a362dee701024b70683014, cron/executions.py removed-upstream-blobs f64945e56081545a639079c36361f817c34646e7+4f40500bfc3aa322b28c3126f8712bbca4a2f5d2, hermes_cli/cron.py removed-upstream-blobs c73465fab94d9353470a476feeb3b6a378156722
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - website/docs/developer-guide/FORK_CHANGES.md
   - scripts/ci/check_fork_ledger.py
   - tests/ci/test_check_fork_ledger.py
   - tests/ci/test_check_fork_ledger_adversarial.py
-- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test. Revision 35 removes the retired update-workflow name from the fork-sync retirement condition. Revision 36 rejects a conflicted sync that keeps the wholesale fork file and accepts one that keeps upstream lines with fork insertions on top. Revision 37 retires the desktop entries whose current trees match upstream pin `547248908bf07e22dc21eec20fe416684f55a596`, because the stale fork copies broke `npm run build`. G-DESKTOP-UPDATE-20260921 stays active: `ui-tui/src/__tests__/createGatewayEventHandler.test.ts` still differs from that pin. Revision 38 claims the signing adapter that follows electron-builder 26.15.3's osx-sign 1.3.3 supplier, because the upstream 2.4.0 pin made `npm run builder` die before packaging. Revision 39 claims the packager load of app-builder-lib from its installed `main` (`out/` on 26.15.3), because the hardcoded `dist/` import died with `ERR_MODULE_NOT_FOUND` after the signing adapter passed. Revision 40 claims the runner's 26.15.3 config adapter, because the 27 alpha config (`msix`, `asar.unpack`, toolset file URLs) failed schema validation after the import path was fixed. Revision 41 claims the arch-target load from the installed compiled root, because `app-builder-lib/internal` does not exist on 26.15.3 and afterPack imports that signer on macOS. Revision 42 requires that load to reject a mismatched pin and a `main` that leaves the package root before `require`. Revision 43 claims `2d75df969f923ca86f8360ae51ac86d492825391` on G-UPDATE-FORKSYNC and owns the two update tests that commit introduced. Revision 44 maps `ba7235102d001f2d616be8f28df7400f0ae0c39a` and `ab70ac98d6f31d18217cdb2511fb681083157c62` only while the checked tip keeps every current upstream line of each conflict path. Listing those SHAs is not a waiver. Revision 45 maps `19d7fe26b0efef91f031260eb52f0569458b2c58` as a cross-owner commit. It restores the oneshot guard without dropping upstream lines. Listing that SHA is not a waiver either. Revision 46 maps `9a1ce849032259bf36c545e85db96fe86a864db3` under G-ONESHOT-ISOLATION. It deletes the rebinding copies and keeps every upstream line. Listing that SHA is not a waiver either.
-- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal. `Cross-Owner-Commits` maps a work commit only when every changed path already has one effective owner, at least two owners are involved, the commit does not change the ledger, and no entry has already claimed it. `Repaired-Conflict-Merges` maps a published conflict merge only when the checked tip still keeps every current upstream line of each conflict path, in upstream order. A tip that drops a line leaves that SHA unmapped and names the path.
+- Intent: Record every fork-only change and fail closed if a work commit is unmapped, a current path is unowned or ambiguous, or the checker cannot run. `Commits: self` is component-scoped self-mapping for commits that touch only G-FORK-LEDGER files and change this specific entry. Every ledger maintenance commit bumps Ledger-Revision so the authorization is explicit and entry-scoped. `History-Reconciliations` authorizes only audited zero-tree ancestry links needed for non-force publication after a history reconstruction. Revision 32: extend G-DESKTOP-UPDATE-20260921 to own `apps/desktop/electron/command-screenshot-monitor.ts` and `apps/desktop/electron/preload.ts` after prepare d4bc63cd (spawned by update ce08cc8d) failed with `unknown_fork_change`. Revision 33 links pre-integrate tip `1d8887eedad60deaa9d9d5f48b98fa5730de1ae4` through zero-tree reconciliation `288f24682a67cdbca1ff00e011144cb961f65d5b`, maps the replayed first-parent commits onto their existing owners, and records the two published cross-owner commits that cannot be split without a non-fast-forward rewrite. Revision 34 claims the desktop-launch restore and records the launchd-hermetic drain test. Revision 35 removes the retired update-workflow name from the fork-sync retirement condition. Revision 36 rejects a conflicted sync that keeps the wholesale fork file and accepts one that keeps upstream lines with fork insertions on top. Revision 37 retires the desktop entries whose current trees match upstream pin `547248908bf07e22dc21eec20fe416684f55a596`, because the stale fork copies broke `npm run build`. G-DESKTOP-UPDATE-20260921 stays active: `ui-tui/src/__tests__/createGatewayEventHandler.test.ts` still differs from that pin. Revision 38 claims the signing adapter that follows electron-builder 26.15.3's osx-sign 1.3.3 supplier, because the upstream 2.4.0 pin made `npm run builder` die before packaging. Revision 39 claims the packager load of app-builder-lib from its installed `main` (`out/` on 26.15.3), because the hardcoded `dist/` import died with `ERR_MODULE_NOT_FOUND` after the signing adapter passed. Revision 40 claims the runner's 26.15.3 config adapter, because the 27 alpha config (`msix`, `asar.unpack`, toolset file URLs) failed schema validation after the import path was fixed. Revision 41 claims the arch-target load from the installed compiled root, because `app-builder-lib/internal` does not exist on 26.15.3 and afterPack imports that signer on macOS. Revision 42 requires that load to reject a mismatched pin and a `main` that leaves the package root before `require`. Revision 43 claims `2d75df969f923ca86f8360ae51ac86d492825391` on G-UPDATE-FORKSYNC and owns the two update tests that commit introduced. Revision 44 maps `ba7235102d001f2d616be8f28df7400f0ae0c39a` and `ab70ac98d6f31d18217cdb2511fb681083157c62` only while the checked tip keeps every current upstream line of each conflict path. Listing those SHAs is not a waiver. Revision 45 maps `19d7fe26b0efef91f031260eb52f0569458b2c58` as a cross-owner commit. It restores the oneshot guard without dropping upstream lines. Listing that SHA is not a waiver either. Revision 46 maps `9a1ce849032259bf36c545e85db96fe86a864db3` under G-ONESHOT-ISOLATION. It deletes the rebinding copies and keeps every upstream line. Listing that SHA is not a waiver either. Revision 47 maps the four gateway-restore commits the cron reconciliation left unmapped: `4a7f53254e4b3b8702e7d0c3225f3897a1bdcee7` under G-CRON-DURABLE, `0dfe32746ba664217fd74d32a7234f30e8a406b1` under the new G-PM-TEMP-HOME, and `45ede46503b32dc3de89e154ffd7e1d2e6ebeabb` and `96460687e993b30041ab1cee4b2104cd7f5c5a94` as cross-owner commits. It owns the scheduler tick, outcome and delivery-run modules and their tests under G-CRON-DURABLE, the parse-contract test under G-KANBAN-LIFECYCLE, and the config-scope surface under the new G-CONFIG-SCOPE, because the weekly update's safety gate stopped on `unowned_extra: hermes_cli/config.py` and the checker named 27 unowned current paths. The same revision records the cron reconciliation's removal of upstream lines in `cron/scheduler.py`, `cron/executions.py` and `hermes_cli/cron.py` as `Upstream-Line-Deletions`, each bound to the blob of the upstream version whose lines were removed. Those lines are the pre-reconciliation scheduler, execution-store and cron-cli text that the fork replaced with its own modules; the declaration names that text instead of inferring the deletion from a later commit.
+- Protected-Invariant: `self` stays narrow. A commit is mapped only when it changes the ledger and every changed path is owned by G-FORK-LEDGER. A commit that also changes an unrelated path remains unmapped. History reconciliation cannot hide first-parent work, upstream work, current-tree changes, replacement-forged objects, unrelated roots, overlapping retired sets, inherited activation state, full-reachable revision high-water marks, commit-time Path-Precedence, oversized revisions, or sticky entry and History-Reconciliations removal. `Cross-Owner-Commits` maps a work commit only when every changed path already has one effective owner, at least two owners are involved, the commit does not change the ledger, and no entry has already claimed it. `Repaired-Conflict-Merges` maps a published conflict merge only when the checked tip still keeps every current upstream line of each conflict path, in upstream order. A tip that drops a line leaves that SHA unmapped and names the path. A later edit of the file is not a waiver. An intentional removal is declared in `Upstream-Line-Deletions` as the path plus the blobs of the upstream versions whose lines were removed, so the deletion is audited text. Every current upstream line the tip lacks must appear in one of those blobs; a line upstream added later is unaudited and fails. Each blob must be one upstream actually committed. Only G-FORK-LEDGER may declare it.
 - Tests: tests/ci/test_check_fork_ledger.py, tests/ci/test_check_fork_ledger_adversarial.py
 - Retirement-Condition: The fork stops carrying local commits and the ledger is no longer required.
 - Disposition: active
