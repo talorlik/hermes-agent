@@ -102,7 +102,7 @@ TICKER_INTERVAL_SECONDS = 60
 # mark_job_run / advance_next_run calls clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
-_fire_fence_locks: Dict[str, threading.RLock] = {}
+_fire_fence_locks: dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
 _fire_fence_lock_state = threading.local()
 
@@ -204,9 +204,6 @@ def get_cron_output_dir() -> Path:
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
 
 # Derived TTL = inactivity timeout × CLAIM_TTL_INACTIVITY_HEADROOM (cron/constants.py). The TTL
-# that DIED mid-run; the timeout is an *inactivity* limit, not a wall-clock cap, so healthy runs may
-# legitimately exceed it — hence the headroom.
-_ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 # only recovers a claim left by a tick that DIED mid-run.
 
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
@@ -265,12 +262,12 @@ def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return True
-            except (OSError, IOError):
+            except OSError:
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(0.1)
     if msvcrt is not None:
-        getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
         return True
     return None
 
@@ -281,8 +278,8 @@ def _release_flock(lock_fd) -> None:
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         elif msvcrt is not None:
-            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
-    except (OSError, IOError):
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
         pass
     finally:
         lock_fd.close()
@@ -328,7 +325,7 @@ def _jobs_lock():
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
-            except (OSError, IOError) as e:
+            except OSError as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
@@ -379,7 +376,7 @@ def _fire_job_lock(job_id: str):
             elif not result:
                 logger.error("Timed out waiting for fire fence %s; failing closed", lock_path)
             acquired = bool(result)
-        except (OSError, IOError) as exc:
+        except OSError as exc:
             logger.error("Cron fire fence unavailable for %s: %s", job_id, exc)
 
         held_locks[lock_key] = acquired
@@ -438,7 +435,7 @@ def _job_output_dir(job_id: str) -> Path:
     return _current_cron_store().output_dir / text
 
 
-def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
+def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> list[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
     if skills is None:
         raw_items = [skill] if skill else []
@@ -446,7 +443,7 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         raw_items = [skills]
     else:
         raw_items = list(skills)
-    normalized: List[str] = []
+    normalized: list[str] = []
     for item in raw_items:
         text = str(item or "").strip()
         if text and text not in normalized:
@@ -454,7 +451,7 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
-def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
+def _apply_skill_fields(job: dict[str, Any]) -> dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
@@ -481,37 +478,8 @@ NO_AGENT_WITHOUT_SCRIPT_ERROR = (
     "there is nothing for the job to run."
 )
 
-SCRIPT_FAILURE_POLICIES = frozenset({"continue", "fail_closed"})
-SCRIPT_FAILURE_POLICY_WITHOUT_SCRIPT_ERROR = (
-    "script_failure_policy='fail_closed' requires a nonblank script."
-)
 
-
-def validate_script_failure_policy(value: Any) -> str:
-    """Return a canonical policy or reject malformed explicit/stored values."""
-    if not isinstance(value, str) or value not in SCRIPT_FAILURE_POLICIES:
-        allowed = ", ".join(sorted(SCRIPT_FAILURE_POLICIES))
-        raise ValueError(
-            f"Invalid script_failure_policy {value!r}. Allowed values: {allowed}."
-        )
-    return value
-
-
-def get_job_script_failure_policy(job: Dict[str, Any]) -> str:
-    """Validate a stored policy, defaulting only a genuinely missing key."""
-    if "script_failure_policy" not in job:
-        return "continue"
-    return validate_script_failure_policy(job["script_failure_policy"])
-
-
-def _normalize_script_failure_policy(value: Any) -> str:
-    """Default an omitted create-time policy while rejecting explicit values."""
-    if value is None:
-        return "continue"
-    return validate_script_failure_policy(value)
-
-
-def job_payload_is_empty(job: Dict[str, Any]) -> bool:
+def job_payload_is_empty(job: dict[str, Any]) -> bool:
     """True when a job record has nothing runnable (blank prompt, no script, no skills) AND at
     least one payload field is explicitly present. ``no_agent`` already requires a script."""
     if _coerce_job_text(job.get("prompt")).strip() or _coerce_job_text(job.get("script")).strip():
@@ -521,7 +489,7 @@ def job_payload_is_empty(job: Dict[str, Any]) -> bool:
     return any(k in job for k in ("prompt", "script", "skill", "skills"))
 
 
-def _schedule_display_for_job(job: Dict[str, Any]) -> str:
+def _schedule_display_for_job(job: dict[str, Any]) -> str:
     display = _coerce_job_text(job.get("schedule_display")).strip()
     if display:
         return display
@@ -536,13 +504,12 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
-def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
     """Read-safe job shape: legacy/hand-edited records may have nullable ``prompt``, ``name``,
     ``schedule_display``. Storage is untouched; consumers never crash on formatting."""
     normalized = _apply_skill_fields(job)
     job_id = normalized["id"] = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = normalized["prompt"] = _coerce_job_text(normalized.get("prompt"))
-    normalized.setdefault("script_failure_policy", "continue")
     name = _coerce_job_text(normalized.get("name")).strip()
     if not name:
         label_source = (
@@ -561,18 +528,18 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def _has_pause_marker(job: Dict[str, Any]) -> bool:
+def _has_pause_marker(job: dict[str, Any]) -> bool:
     """True when the record carries any operator-facing pause signal."""
     return _coerce_job_text(job.get("state")).strip() == "paused" or bool(job.get("paused_at"))
 
 
-def is_job_runnable(job: Dict[str, Any]) -> bool:
+def is_job_runnable(job: dict[str, Any]) -> bool:
     """True iff the scheduler may fire this job: ``enabled`` plus pause markers as a second gate so
     a contradictory half-paused record never fires even before self-heal runs."""
     return bool(job.get("enabled", True)) and not _has_pause_marker(job)
 
 
-def effective_job_state(job: Dict[str, Any]) -> str:
+def effective_job_state(job: dict[str, Any]) -> str:
     """Operator-facing state derived from ``enabled``: an enabled job must never display as paused
     (list looked frozen while jobs kept firing). Terminal states are preserved regardless."""
     stored = _coerce_job_text(job.get("state")).strip()
@@ -588,12 +555,12 @@ def effective_job_state(job: Dict[str, Any]) -> str:
     return stored or "scheduled"
 
 
-def is_terminal_job(job: Dict[str, Any]) -> bool:
+def is_terminal_job(job: dict[str, Any]) -> bool:
     """Return whether a job record is in a terminal scheduler state."""
     return job.get("state") in {"completed", "error"}
 
 
-def _is_recoverable_error_job(job: Dict[str, Any]) -> bool:
+def _is_recoverable_error_job(job: dict[str, Any]) -> bool:
     """True for a recurring job stuck in ``state=error`` (set ONLY when ``compute_next_run()`` fails
     for a cron/interval job: croniter missing, malformed schedule). Such a job still has future
     occurrences once the issue resolves, so treating it as terminal would block due-scan self-heal,
@@ -802,7 +769,7 @@ def _natural_every_to_cron(rest: str) -> Optional[str]:
 
 def _cron_schedule(
     expr: str, display: str, missing_croniter: str, invalid_label: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate a cron expression with croniter and build the stored schedule dict."""
     if not _ensure_croniter():
         raise ValueError(f"{missing_croniter} Install with: pip install croniter")
@@ -813,11 +780,11 @@ def _cron_schedule(
     return {"kind": "cron", "expr": expr, "display": display}
 
 
-def _interval_schedule(minutes: int) -> Dict[str, Any]:
+def _interval_schedule(minutes: int) -> dict[str, Any]:
     return {"kind": "interval", "minutes": minutes, "display": f"every {minutes}m"}
 
 
-def parse_schedule(schedule: str) -> Dict[str, Any]:
+def parse_schedule(schedule: str) -> dict[str, Any]:
     """Parse a schedule string into ``{"kind": "once"|"interval"|"cron", ...}`` with ``run_at`` /
     ``minutes`` / ``expr``. "30m" and "every 30m" are recurring intervals; "every monday 9am" and
     "0 9 * * *" are cron; an ISO timestamp is once."""
@@ -954,7 +921,7 @@ def _stored_wall_clock_is_future(stored: datetime, current: datetime) -> bool:
 
 
 def _recoverable_oneshot_run_at(
-    schedule: Dict[str, Any], now: datetime, *, last_run_at: Optional[str] = None,
+    schedule: dict[str, Any], now: datetime, *, last_run_at: Optional[str] = None,
 ) -> Optional[str]:
     """One-shot run time if still eligible: a small grace window covers jobs created just after
     their minute; once run, a one-shot is never eligible again."""
@@ -1005,7 +972,7 @@ _persisted_error_recoveries_recent: list = []
 
 
 def _job_is_stale_error_recurring(
-    job: Dict[str, Any], schedule: Dict[str, Any], now: datetime,
+    job: dict[str, Any], schedule: dict[str, Any], now: datetime,
 ) -> bool:
     """True when a recurring job (caller-checked) is wedged in a stale persisted error state:
     ``last_status == "error"``, not running in this process (never re-arm a live run underneath
@@ -1044,10 +1011,10 @@ def _job_is_stale_error_recurring(
 
 
 # Per-expr cache for _schedule_cadence_seconds' croniter measurements.
-_cron_cadence_cache: Dict[str, Optional[float]] = {}
+_cron_cadence_cache: dict[str, Optional[float]] = {}
 
 
-def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
+def _schedule_cadence_seconds(schedule: dict[str, Any]) -> Optional[float]:
     """Approximate schedule period in seconds, or None (croniter missing / malformed expr). Cron
     results are cached per expr because this runs under ``_jobs_lock`` every tick; the gap can vary
     with base time for irregular exprs, acceptable for a staleness *threshold*."""
@@ -1081,7 +1048,7 @@ def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
     return result
 
 
-def _append_telemetry_record(filename: str, entry: Dict[str, Any], recent: list) -> None:
+def _append_telemetry_record(filename: str, entry: dict[str, Any], recent: list) -> None:
     """Record ``entry`` in the bounded ``recent`` list and append to ``<cron_dir>/<filename>``
     (best effort — telemetry must never break a tick). Counters stay module-level ints per
     metric because tests reset them by name."""
@@ -1096,7 +1063,7 @@ def _append_telemetry_record(filename: str, entry: Dict[str, Any], recent: list)
         logger.debug("Could not append %s record: %s", filename, exc)
 
 
-def _record_persisted_error_recovery(job: Dict[str, Any], previous_next_run: str) -> None:
+def _record_persisted_error_recovery(job: dict[str, Any], previous_next_run: str) -> None:
     """Persist a countable, probe-visible signal for one stale-error re-arm."""
     global _persisted_error_recoveries
     entry = {
@@ -1110,7 +1077,7 @@ def _record_persisted_error_recovery(job: Dict[str, Any], previous_next_run: str
         "persisted_error_recoveries.jsonl", entry, _persisted_error_recoveries_recent)
 
 
-def get_persisted_error_recovery_stats() -> Dict[str, Any]:
+def get_persisted_error_recovery_stats() -> dict[str, Any]:
     """Probe-visible snapshot of persisted-error recoveries."""
     return {
         "persisted_error_recoveries": _persisted_error_recoveries,
@@ -1118,7 +1085,7 @@ def get_persisted_error_recovery_stats() -> Dict[str, Any]:
     }
 
 
-def _cron_next_run_matches_expr(schedule: Dict[str, Any], next_run_dt: datetime) -> bool:
+def _cron_next_run_matches_expr(schedule: dict[str, Any], next_run_dt: datetime) -> bool:
     """Whether ``next_run_dt`` is an occurrence of the schedule's current expr (detects a
     hand-edited ``schedule.expr`` whose stored ``next_run_at`` came from the old one).
     Best-effort: anything uncheckable (non-cron, no expr, no croniter, malformed) reports a
@@ -1152,7 +1119,7 @@ STALE_CRON_EXPR_EDIT = "expr_edit"
 
 
 def _classify_stale_cron_next_run(
-    schedule: Dict[str, Any], raw_next_run_dt: datetime, next_run_dt: datetime,
+    schedule: dict[str, Any], raw_next_run_dt: datetime, next_run_dt: datetime,
 ) -> str:
     """Explain WHY a stored ``next_run_at`` misses the current cron lattice; the causes need
     opposite actions. ``expr_edit``: a hand edit changed ``schedule.expr`` — re-anchor WITHOUT
@@ -1183,7 +1150,7 @@ _timezone_migration_catchups_recent: list = []
 
 
 def _record_timezone_migration_catchup(
-    job: Dict[str, Any], raw_next_run_dt: datetime, next_run_dt: datetime,
+    job: dict[str, Any], raw_next_run_dt: datetime, next_run_dt: datetime,
 ) -> None:
     """Persist a countable signal for one offset-migration catch-up fire."""
     global _timezone_migration_catchups
@@ -1200,7 +1167,7 @@ def _record_timezone_migration_catchup(
         "timezone_migration_catchups.jsonl", entry, _timezone_migration_catchups_recent)
 
 
-def get_timezone_migration_catchup_stats() -> Dict[str, Any]:
+def get_timezone_migration_catchup_stats() -> dict[str, Any]:
     """Probe-visible snapshot of offset-migration catch-up fires."""
     return {
         "timezone_migration_catchups": _timezone_migration_catchups,
@@ -1208,7 +1175,7 @@ def get_timezone_migration_catchup_stats() -> Dict[str, Any]:
     }
 
 
-def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
+def compute_next_run(schedule: dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """Compute the next run time for a schedule as an ISO string, or None if no more runs."""
     now = _hermes_now()
     if not isinstance(schedule, dict):
@@ -1301,7 +1268,7 @@ def record_ticker_heartbeat(success: bool = False) -> None:
         _write_marker("ticker_last_success", str(time.time()), ".hb_")
 
 
-def _read_marker_fields(name: str) -> List[str]:
+def _read_marker_fields(name: str) -> list[str]:
     try:
         return (_current_cron_store().cron_dir / name).read_text(encoding="utf-8-sig").split()
     except Exception:
@@ -1374,7 +1341,7 @@ def get_ticker_last_error() -> Optional[str]:
 
 # --- Job CRUD Operations ---
 
-def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
+def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
     """Tolerant jobs.json parse -> ``(data, used_strict_fallback)``: utf-8-sig absorbs a BOM, strict
     failure retries with ``strict=False``. IO/fallback errors propagate (caller decides repair vs
     bail)."""
@@ -1386,7 +1353,7 @@ def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
         return json.loads(raw, strict=False), True
 
 
-def load_jobs() -> List[Dict[str, Any]]:
+def load_jobs() -> list[dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
@@ -1399,7 +1366,7 @@ def load_jobs() -> List[Dict[str, Any]]:
 
     try:
         data, _strict_retry = _parse_jobs_file(jobs_file)
-    except IOError as e:
+    except OSError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
     except Exception as e:
@@ -1410,7 +1377,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     # corruption. Repair details are logged only by the locked pass (an unlocked pass re-runs
     # under the lock below), so each warning is emitted once per repair.
     repair = "had invalid control characters" if _strict_retry else None
-    notes: List[str] = []
+    notes: list[str] = []
     unmergeable = False  # disk shape _peek_jobs_unlocked cannot read: only a replace save fixes it
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
@@ -1481,7 +1448,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     return jobs
 
 
-def _peek_jobs_unlocked() -> Optional[List[Dict[str, Any]]]:
+def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
     """Repair-free read under ``_jobs_lock()``: ``[]`` if missing, ``None`` if corrupt (never
     shrink-merge against an unknown baseline). Never saves — that would recurse."""
     jobs_file = _current_cron_store().jobs_file
@@ -1497,7 +1464,7 @@ def _peek_jobs_unlocked() -> Optional[List[Dict[str, Any]]]:
     return data if isinstance(data, list) else None
 
 
-def _jobs_file_stamp(jobs_file: Path) -> Optional[Tuple[int, int, int]]:
+def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[int, int, int]]:
     """Shrink-merge fast-path stamp ``(mtime_ns, size, ino)``; ``None`` if unstatable. ``st_ino`` is
     included because every writer uses mkstemp+rename, so a same-size write in one mtime quantum
     can't false-match."""
@@ -1508,7 +1475,7 @@ def _jobs_file_stamp(jobs_file: Path) -> Optional[Tuple[int, int, int]]:
         return None
 
 
-def _record_load_stamp(stamp: Optional[Tuple[int, int, int]]) -> None:
+def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
     """Remember jobs.json's stamp for the enclosing _jobs_lock() section (no-op outside one) so the
     save path can skip the shrink-merge when disk provably hasn't changed. Capture it BEFORE
     reading: a mid-read sibling then mismatches (fail-safe); stamping after would certify an
@@ -1522,8 +1489,8 @@ def _record_load_stamp(stamp: Optional[Tuple[int, int, int]]) -> None:
 
 
 def _unmerged_disk_jobs(
-    jobs: List[Dict[str, Any]], removed_ids: Optional[Collection[str]]
-) -> List[Dict[str, Any]]:
+    jobs: list[dict[str, Any]], removed_ids: Optional[Collection[str]]
+) -> list[dict[str, Any]]:
     """On-disk jobs missing from *jobs* and not intentionally removed. Stamp match => nothing
     landed, return without parsing; unreadable store => raise RuntimeError (fail closed: writing
     over an unknown baseline would silently drop every job in it)."""
@@ -1536,7 +1503,7 @@ def _unmerged_disk_jobs(
             f"Cron database corrupted; refusing to overwrite {_current_cron_store().jobs_file}")
     seen = {str(j["id"]) for j in jobs if isinstance(j, dict) and j.get("id")}
     seen |= {str(i) for i in (removed_ids or ()) if i}
-    recovered: List[Dict[str, Any]] = []
+    recovered: list[dict[str, Any]] = []
     for disk_job in disk_jobs:
         if not isinstance(disk_job, dict) or not disk_job.get("id"):
             continue
@@ -1548,8 +1515,8 @@ def _unmerged_disk_jobs(
 
 
 def _merge_unexpected_disk_jobs(
-    jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-) -> List[Dict[str, Any]]:
+    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
+) -> list[dict[str, Any]]:
     """*jobs* plus on-disk jobs absent from the payload (under the degraded flock-timeout path a
     stale writer would otherwise clobber concurrent creates). Deletes pass ``removed_ids``; never
     mutates *jobs*."""
@@ -1570,7 +1537,7 @@ def _unlink_quiet(path: Optional[str]) -> None:
             os.unlink(path)
 
 
-def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
+def _stage_jobs_payload(jobs_file: Path, jobs: list[dict[str, Any]]) -> str:
     """Serialize the store payload to a fsynced temp file beside the resolved *jobs_file*; return its path."""
     fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_")
     try:
@@ -1590,7 +1557,7 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 
 def _save_jobs_unlocked(
-    jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
+    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
@@ -1637,87 +1604,20 @@ def _save_jobs_unlocked(
         raise
 
 
-@dataclass(frozen=True)
-class DeliveryProjectionGuard:
-    """The delivery-projection generation a jobs.json publication claims to own.
-
-    ``save_jobs(..., delivery_guard=guard)`` publishes only if the SQLite projection for ``job_id``
-    still carries exactly this ``execution_id`` AND ``revision`` at write time, with the projection
-    writers excluded for the whole write/replace. A missing projection is rejected, and so is a
-    guard without a ``revision``: an execution id alone is a partial generation token (it cannot
-    distinguish a same-execution rotation), so it fails closed instead of publishing.
-
-    ``absent_only`` is the token-free asynchronous callback's guard: it publishes only while the
-    job has NO projection generation at all (legacy jobs that never ran under the producer), and
-    that no-row condition is checked under the same reservation, so a generation created between
-    a caller's pre-check and the write rejects the publication instead of being overwritten.
-    """
-
-    job_id: str
-    execution_id: Optional[str]
-    revision: Optional[int] = None
-    absent_only: bool = False
-
-
 def save_jobs(
-    jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False, delivery_guard: Optional[DeliveryProjectionGuard] = None,
-) -> bool:
-    """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``.
-
-    Without ``delivery_guard`` this is the legacy unconditional save and returns True. With a
-    guard, the generation comparison and the JSON publication happen under one exclusion in the
-    order jobs lock -> outbox RLock -> SQLite ``BEGIN IMMEDIATE`` reservation: a projection
-    rotation that committed first makes this return False with jobs.json untouched; once the
-    reservation is held, independent projection writers (any process) block until the replace
-    finishes. The reservation is released on every exit, including exceptions. No outbox helper
-    that opens its own connection may run inside the guarded section (see
-    ``cron.outbox.reserve_job_delivery_projection``).
-    """
+    jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
+    replace: bool = False,
+):
+    """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
     with _jobs_lock():
-        if delivery_guard is None:
-            _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
-            return True
-        from cron.outbox import projection_generation_matches, reserve_job_delivery_projection
-
-        if delivery_guard.absent_only:
-            with reserve_job_delivery_projection(delivery_guard.job_id) as projection:
-                if projection is not None:
-                    logger.debug(
-                        "Job '%s': token-free delivery publication rejected; projection "
-                        "generation %s/%s exists",
-                        delivery_guard.job_id, projection.get("execution_id"),
-                        projection.get("revision"))
-                    return False
-                _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
-                return True
-        if delivery_guard.revision is None:
-            logger.debug(
-                "Job '%s': delivery publication rejected; guard for execution %s carries no "
-                "owned revision (partial generation token)",
-                delivery_guard.job_id, delivery_guard.execution_id)
-            return False
-        with reserve_job_delivery_projection(delivery_guard.job_id) as projection:
-            if not projection_generation_matches(
-                projection,
-                execution_id=delivery_guard.execution_id,
-                revision=delivery_guard.revision,
-            ):
-                logger.debug(
-                    "Job '%s': delivery publication rejected; owned generation %s/%s, projection %s",
-                    delivery_guard.job_id, delivery_guard.execution_id, delivery_guard.revision,
-                    None if projection is None else
-                    (projection.get("execution_id"), projection.get("revision")))
-                return False
-            _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
-            return True
+        _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 
 
 _MISSING = object()
 
 
 def _with_job(
-    job_id: Any, fn: Callable[[List[Dict[str, Any]], int, Dict[str, Any]], Any], missing: Any = None,
+    job_id: Any, fn: Callable[[list[dict[str, Any]], int, dict[str, Any]], Any], missing: Any = None
 ) -> Any:
     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
     if none."""
@@ -1729,12 +1629,12 @@ def _with_job(
     return missing
 
 
-def _complete_job_record(job: Dict[str, Any]) -> None:
+def _complete_job_record(job: dict[str, Any]) -> None:
     """Retire *job* in place as a terminal completion (record kept for `cronjob list`)."""
     job.update(enabled=False, state="completed", next_run_at=None)
 
 
-def _activate_job_record(job: Dict[str, Any]) -> None:
+def _activate_job_record(job: dict[str, Any]) -> None:
     """Clear pause markers in place so *job* is runnable again."""
     job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None)
 
@@ -1761,30 +1661,7 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
-def _resolve_default_model_snapshot() -> Optional[str]:
-    """Default model resolved as the ticker's ``run_job`` does, so unpinned jobs can snapshot it and
-    keep running on it after a later swap. ``None`` on missing config or failure ("no snapshot")."""
-    try:
-        from hermes_cli.config_effective import load_user_config_effective
-
-        cfg_path = get_hermes_home() / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        cfg = load_user_config_effective(cfg_path)
-        cron_cfg = cfg.get("cron") or {}
-        if isinstance(cron_cfg, dict):
-            cron_model = cron_cfg.get("model")
-            if isinstance(cron_model, str) and cron_model.strip():
-                return cron_model.strip()
-        model_cfg = cfg.get("model") or {}
-        if isinstance(model_cfg, dict):
-            model_cfg = model_cfg.get("default") or model_cfg.get("model")
-        return model_cfg.strip() or None if isinstance(model_cfg, str) else None
-    except Exception:
-        return None
-
-
-def _main_model_pin() -> Tuple[Optional[str], Optional[str]]:
+def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     """``(provider, model)`` the main agent runs on right now (``model.default`` + the provider it
     resolves to), for ``pinned=True`` jobs: the lock is a plain per-job pin, so the scheduler needs
     no second precedence axis. ``(None, None)`` when nothing is configured (the job stays unpinned)."""
@@ -1816,12 +1693,12 @@ def _normalize_base_url(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value, strip_trailing_slash=True)
 
 
-def _normalize_str_list(items: Any) -> Optional[List[str]]:
+def _normalize_str_list(items: Any) -> Optional[list[str]]:
     """Non-blank stripped items of *items*, or None when nothing remains."""
     return [str(j).strip() for j in items if str(j).strip()] or None
 
 
-def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
+def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
     persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
     or None stays None (the unrestricted default); a non-list raises before anything is stored."""
@@ -1832,7 +1709,7 @@ def _normalize_enabled_toolsets(value: Any) -> Optional[List[str]]:
     return [str(j).strip() for j in value if str(j).strip()]
 
 
-def _normalize_context_from(value: Any) -> Optional[List[str]]:
+def _normalize_context_from(value: Any) -> Optional[list[str]]:
     """Accept a job id or a list of ids; anything else is None."""
     if isinstance(value, str):
         value = [value]
@@ -1871,12 +1748,11 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
-_CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+_CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
     "base_url": _normalize_base_url,
     "script": _normalize_job_optional_text,
-    "script_failure_policy": _normalize_script_failure_policy,
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "enabled_toolsets": _normalize_enabled_toolsets,
@@ -1886,7 +1762,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
 }
-_UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+_UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
     "enabled_toolsets": _normalize_enabled_toolsets,
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
@@ -1894,53 +1770,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
-    "script_failure_policy": validate_script_failure_policy,
 }
-
-
-def _compute_provider_model_snapshots(
-    *,
-    provider: Any,
-    model: Any,
-    base_url: Any,
-    no_agent: Any,
-) -> Tuple[Optional[str], Optional[str]]:
-    """Snapshot unpinned provider/model resolution: the scheduler runs the job on this snapshot after
-    a later global switch instead of silently changing spend. Pinned axes and no-agent jobs carry no
-    snapshot."""
-    normalized_provider = _normalize_job_optional_text(provider)
-    normalized_model = _normalize_job_optional_text(model)
-    normalized_base_url = _normalize_base_url(base_url)
-    if bool(no_agent):
-        return None, None
-
-    provider_snapshot: Optional[str] = None
-    model_snapshot: Optional[str] = None
-    if normalized_provider is None:
-        with contextlib.suppress(Exception):
-            from hermes_cli.runtime_provider import resolve_runtime_provider
-
-            runtime_kwargs = {"requested": None}
-            if normalized_base_url:
-                runtime_kwargs["explicit_base_url"] = normalized_base_url
-            snap = resolve_runtime_provider(**runtime_kwargs)
-            provider_snapshot = str(snap.get("provider") or "").strip().lower() or None
-    if normalized_model is None:
-        with contextlib.suppress(Exception):
-            model_snapshot = _resolve_default_model_snapshot() or None
-    return provider_snapshot, model_snapshot
-
-
-def _normalized_inference_axes(
-    job: Dict[str, Any],
-) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
-    """Return the stored inference-routing fields in their semantic form."""
-    return (
-        _normalize_job_optional_text(job.get("provider")),
-        _normalize_job_optional_text(job.get("model")),
-        _normalize_base_url(job.get("base_url")),
-        bool(job.get("no_agent")),
-    )
 
 
 def _validate_job_mode_invariants(
@@ -1948,7 +1778,6 @@ def _validate_job_mode_invariants(
     monitor_url: Optional[str],
     no_agent: bool,
     script: Optional[str],
-    script_failure_policy: str = "continue",
 ) -> None:
     """Execution-mode invariants shared by create_job and update_job (no bypass via the update
     door)."""
@@ -1963,8 +1792,6 @@ def _validate_job_mode_invariants(
             "based on source changes. Use a plain no_agent script job instead.")
     if no_agent and not script:
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
-    if script_failure_policy == "fail_closed" and not script:
-        raise ValueError(SCRIPT_FAILURE_POLICY_WITHOUT_SCRIPT_ERROR)
 
 
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
@@ -1974,7 +1801,7 @@ def _oneshot_past_grace_error(run_at: Any) -> ValueError:
 
 
 def _next_run_or_reject_past_oneshot(
-    parsed_schedule: Dict[str, Any], label: str, fallback_run_at: Any, what: str,
+    parsed_schedule: dict[str, Any], label: str, fallback_run_at: Any, what: str,
 ) -> Optional[str]:
     """``compute_next_run`` that raises (after a warning log) for a one-shot outside the grace
     window, so a ghost job with ``next_run_at=None`` can never be stored."""
@@ -1994,16 +1821,15 @@ def create_job(
     name: Optional[str] = None,
     repeat: Optional[int] = None,
     deliver: Optional[str] = None,
-    origin: Optional[Dict[str, Any]] = None,
+    origin: Optional[dict[str, Any]] = None,
     skill: Optional[str] = None,
-    skills: Optional[List[str]] = None,
+    skills: Optional[list[str]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
-    script_failure_policy: Optional[str] = None,
-    context_from: Optional[Union[str, List[str]]] = None,
-    enabled_toolsets: Optional[List[str]] = None,
+    context_from: Optional[Union[str, list[str]]] = None,
+    enabled_toolsets: Optional[list[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
@@ -2015,7 +1841,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
@@ -2050,8 +1876,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
-    _validate_job_mode_invariants(
-        f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"], f["script_failure_policy"])
+    _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -2068,12 +1893,6 @@ def create_job(
     name = name or label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
-    provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-        provider=f["provider"],
-        model=f["model"],
-        base_url=f["base_url"],
-        no_agent=f["no_agent"],
-    )
     next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
 
     job = {
@@ -2084,11 +1903,8 @@ def create_job(
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": f["model"],
         "provider": f["provider"],
-        "provider_snapshot": provider_snapshot,
-        "model_snapshot": model_snapshot,
         "base_url": f["base_url"],
         "script": f["script"],
-        "script_failure_policy": f["script_failure_policy"],
         "no_agent": f["no_agent"],
         "monitor_script": f["monitor_script"],
         "monitor_url": f["monitor_url"],
@@ -2132,53 +1948,16 @@ def create_job(
     return job
 
 
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Get a job by ID, overlaying the FINALIZED outbox delivery projection.
-
-    The outbox settles a run's delivery outcome in ``executions.db`` (CAS-finalized once per
-    execution) while ``jobs.json`` still carries whatever ``mark_job_run`` wrote at agent exit;
-    the projection is canonical, so readers must not see the stale store value. The overlay is
-    read-side only — the store is never rewritten here — and an unfinalized projection (a run
-    still delivering) is ignored. A projection lookup failure degrades to the stored record.
-
-    Vocabularies differ: the outbox settles a generation with its run-lane statuses
-    (``completed``/``failed``), which only supersede a PENDING delivery status in the store
-    (``delivery_failed``/``delivery_queued``); any other finalized status was written in the
-    store's own vocabulary by an explicit finalizer and is authoritative."""
+def get_job(job_id: str) -> Optional[dict[str, Any]]:
+    """Get a job by ID."""
     job = next((j for j in load_jobs() if j["id"] == job_id), None)
-    if job is None:
-        return None
-    normalized = _normalize_job_record(job)
-    try:
-        from cron.outbox import get_job_delivery_projection
-
-        projection = get_job_delivery_projection(str(job_id))
-    except Exception:
-        projection = None
-    if projection is not None and projection.get("finalized"):
-        # A settled projection corrects a run whose delivery was still pending when jobs.json was
-        # written (late retry success / exhaustion). The run scheduler begins the projection
-        # generation at run start, so a finalized row always belongs to the latest execution.
-        settled = projection.get("last_status")
-        current = normalized.get("last_status")
-        if settled in ("completed", "failed"):
-            # Settle-written lane statuses: they only supersede a pending delivery status.
-            if current in ("delivery_failed", "delivery_queued"):
-                normalized["last_status"] = "ok" if settled == "completed" else "error"
-        elif settled is not None:
-            # An explicit finalizer wrote a jobs.json-vocabulary status: authoritative.
-            normalized["last_status"] = settled
-        normalized["last_delivery_error"] = projection.get("last_delivery_error")
-        for key in ("last_delivery_unverified", "last_delivery_queued"):
-            if projection.get(key) is not None:
-                normalized[key] = projection.get(key)
-    return normalized
+    return _normalize_job_record(job) if job is not None else None
 
 
 class AmbiguousJobReference(LookupError):
     """Raised when a job name matches more than one job."""
 
-    def __init__(self, ref: str, matches: List[Dict[str, Any]]):
+    def __init__(self, ref: str, matches: list[dict[str, Any]]):
         self.ref = ref
         self.matches = matches
         ids = ", ".join(m["id"] for m in matches)
@@ -2187,7 +1966,7 @@ class AmbiguousJobReference(LookupError):
             f"Use the job ID instead.")
 
 
-def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
+def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
     """Resolve an ID or name to a job record. Exact ID wins, then case-insensitive name; an
     ambiguous name raises AmbiguousJobReference rather than silently picking one."""
     if not ref:
@@ -2205,7 +1984,7 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
-def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
+def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
@@ -2221,7 +2000,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def _reject_terminal_activation(job: Dict[str, Any], updated: Dict[str, Any], job_id: str) -> None:
+def _reject_terminal_activation(job: dict[str, Any], updated: dict[str, Any], job_id: str) -> None:
     """A genuinely terminal job cannot be reactivated through update_job (use cron resume)."""
     if (
         is_terminal_job(job)
@@ -2237,7 +2016,7 @@ def _reject_terminal_activation(job: Dict[str, Any], updated: Dict[str, Any], jo
             "through update_job; use cron resume --run-now or --at.")
 
 
-def _apply_pin_update(job: Dict[str, Any], updates: Dict[str, Any]) -> None:
+def _apply_pin_update(job: dict[str, Any], updates: dict[str, Any]) -> None:
     """``pinned`` is not stored; it rewrites the per-job pin. ``True`` with no explicit model locks
     the main agent's current provider+model onto the job, ``False`` releases both so the job follows
     the main model again (an explicit ``model`` in the same update wins over either)."""
@@ -2253,7 +2032,7 @@ def _apply_pin_update(job: Dict[str, Any], updates: Dict[str, Any]) -> None:
         updates["provider"], updates["model"] = None, None
 
 
-def _normalize_job_updates(job: Dict[str, Any], updates: Dict[str, Any]) -> None:
+def _normalize_job_updates(job: dict[str, Any], updates: dict[str, Any]) -> None:
     """Normalize updates in place like create_job; invalid values raise BEFORE the merge. ``repeat``
     accepts the stored dict or a bare value (coerced, completed counter preserved)."""
     for key, norm in _UPDATE_FIELD_NORMALIZERS.items():
@@ -2272,7 +2051,7 @@ def _normalize_job_updates(job: Dict[str, Any], updates: Dict[str, Any]) -> None
 
 
 def _rederive_repeat_for_schedule_change(
-    job: Dict[str, Any], updates: Dict[str, Any]
+    job: dict[str, Any], updates: dict[str, Any]
 ) -> None:
     """Re-derive the ``repeat`` default when a schedule update flips the kind.
 
@@ -2303,7 +2082,7 @@ def _rederive_repeat_for_schedule_change(
     updates["repeat"] = repeat
 
 
-def _apply_schedule_update(updated: Dict[str, Any], updates: Dict[str, Any], job_id: str) -> None:
+def _apply_schedule_update(updated: dict[str, Any], updates: dict[str, Any], job_id: str) -> None:
     """Parse a string schedule, refresh ``schedule_display`` and (unless paused) ``next_run_at``."""
     updated_schedule = updated["schedule"]
     if isinstance(updated_schedule, str):
@@ -2316,7 +2095,7 @@ def _apply_schedule_update(updated: Dict[str, Any], updates: Dict[str, Any], job
             updated_schedule, updated.get("name", job_id), updated_schedule, "update ")
 
 
-def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
+def _fill_missing_next_run(updated: dict[str, Any]) -> None:
     """An enabled, unpaused record must never persist without ``next_run_at`` (it would never fire).
     """
     if (
@@ -2334,102 +2113,28 @@ def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
     updated["next_run_at"] = next_run
 
 
-def update_job(
-    job_id: str,
-    updates: Dict[str, Any],
-    *,
-    expected_execution_id: Optional[str] = None,
-    expected_projection_revision: Optional[int] = None,
-    require_no_delivery_projection: bool = False,
-) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed.
-
-    ``expected_execution_id`` / ``expected_projection_revision`` are a compare-and-swap token
-    against the outbox delivery projection: delivery bookkeeping from a run that has since
-    been superseded (a newer execution began, or the projection was already finalized) must
-    not clobber the live record. The token is the ``(execution_id, revision)`` PAIR; a partial
-    token fails closed. When the token does not match the current projection — or no projection
-    exists — nothing is written and ``None`` is returned. The pre-check here is a cheap early
-    exit; the binding comparison runs inside ``save_jobs`` under the projection reservation.
-
-    ``require_no_delivery_projection`` is the token-free asynchronous delivery callback's guard:
-    the update publishes only while the job has no delivery projection generation at all (checked
-    again under the projection reservation at write time), returning ``None`` otherwise. The plain
-    token-free call stays the legacy unconditional (synchronous/manual) update."""
+def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Update a job by ID, refreshing derived schedule fields when needed."""
     # ``id`` is a path component under OUTPUT_DIR — changing it would leak path-escape values.
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
-    delivery_guard: Optional[DeliveryProjectionGuard] = None
-    if require_no_delivery_projection:
-        if expected_execution_id is not None or expected_projection_revision is not None:
-            raise ValueError(
-                "require_no_delivery_projection cannot be combined with a generation token")
-        # Cheap early exit; NOT the authority (the binding no-row check runs inside save_jobs
-        # under the projection reservation, so a generation created after this read rejects).
-        try:
-            from cron.outbox import get_job_delivery_projection
-
-            if get_job_delivery_projection(str(job_id)) is not None:
-                return None
-        except Exception:
-            return None
-        delivery_guard = DeliveryProjectionGuard(
-            job_id=str(job_id), execution_id=None, absent_only=True)
-    elif expected_execution_id is not None or expected_projection_revision is not None:
-        if expected_execution_id is None or expected_projection_revision is None:
-            # A generation token is the (execution_id, revision) pair. Execution-only would treat
-            # whatever revision is current as owned (a same-execution rotation then accepts a stale
-            # publication); revision-only would silently degrade to a token-free write. Both are
-            # partial tokens: fail closed, nothing written.
-            logger.debug(
-                "Job '%s': guarded update rejected; partial generation token (execution=%s, "
-                "revision=%s)", job_id, expected_execution_id, expected_projection_revision)
-            return None
-        # Cheap early exit outside the jobs lock. NOT the authority: the binding comparison runs
-        # again inside save_jobs under the projection reservation, so a rotation that lands
-        # between this read and the write is rejected instead of being published as current.
-        try:
-            from cron.outbox import get_job_delivery_projection, projection_generation_matches
-
-            projection = get_job_delivery_projection(str(job_id))
-        except Exception:
-            return None
-        if not projection_generation_matches(
-            projection,
-            execution_id=expected_execution_id,
-            revision=expected_projection_revision,
-        ):
-            return None
-        delivery_guard = DeliveryProjectionGuard(
-            job_id=str(job_id),
-            execution_id=str(expected_execution_id),
-            revision=int(expected_projection_revision),
-        )
 
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
-        previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
-        if {
-            "monitor_script", "monitor_url", "no_agent", "script", "script_failure_policy",
-        }.intersection(updates):
+        if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
             _validate_job_mode_invariants(
                 updated.get("monitor_script") or None,
                 updated.get("monitor_url") or None,
                 bool(updated.get("no_agent")),
-                _normalize_job_optional_text(updated.get("script")),
-                get_job_script_failure_policy(updated))
+                _normalize_job_optional_text(updated.get("script")))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
-        inference_fields_changed = (
-            bool({"provider", "model", "base_url", "no_agent"}.intersection(updates))
-            and _normalized_inference_axes(updated) != previous_inference_axes
-        )
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
@@ -2441,121 +2146,16 @@ def update_job(
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
             updated.pop("pending_slot", None)
-        if inference_fields_changed:
-            snapshots = _compute_provider_model_snapshots(
-                provider=updated.get("provider"),
-                model=updated.get("model"),
-                base_url=updated.get("base_url"),
-                no_agent=updated.get("no_agent"),
-            )
-            updated["provider_snapshot"], updated["model_snapshot"] = snapshots
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
         jobs[i] = updated
-        if delivery_guard is None:
-            save_jobs(jobs)
-        elif not save_jobs(jobs, delivery_guard=delivery_guard):
-            # The projection rotated after the early check: nothing was written.
-            return None
+        save_jobs(jobs)
         return _normalize_job_record(updated)
 
     return _with_job(job_id, apply)
 
 
-def resnapshot_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Refresh provider/model snapshots for a job's UNPINNED axes to the
-    current global resolution.
-
-    This is the "adopt the current global default" companion to explicit
-    pinning (#44585). ``resnapshot_job`` re-captures the current resolution;
-    the stored snapshots remain the job's effective pins until another resnap.
-
-    Semantics:
-      - Pinned axes (job has an explicit provider/model) keep their snapshot
-        None and are left untouched.
-      - no_agent script jobs carry no snapshot and are left untouched.
-      - If the current resolution fails, the previous snapshot is left in
-        place (fail-open, matching create_job semantics).
-
-    Makes no inference call — it only recomputes the snapshot string from
-    config. Returns the normalized updated job, or None if not found.
-    """
-    job = resolve_job_ref(job_id)
-    if not job:
-        return None
-
-    def apply(
-        jobs: List[Dict[str, Any]], i: int, stored: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-            provider=stored.get("provider"),
-            model=stored.get("model"),
-            base_url=stored.get("base_url"),
-            no_agent=stored.get("no_agent"),
-        )
-        if (
-            _normalize_job_optional_text(stored.get("provider")) is None
-            and provider_snapshot is not None
-        ):
-            stored["provider_snapshot"] = provider_snapshot
-        if (
-            _normalize_job_optional_text(stored.get("model")) is None
-            and model_snapshot is not None
-        ):
-            stored["model_snapshot"] = model_snapshot
-        jobs[i] = stored
-        save_jobs(jobs)
-        return _normalize_job_record(stored)
-
-    return _with_job(job["id"], apply)
-
-
-def resnapshot_all_unpinned() -> List[Dict[str, Any]]:
-    """Refresh provider/model snapshots for every job that has any unpinned
-    axis, adopting the current global resolution for each.
-
-    Skips no_agent jobs and jobs pinned on all inference axes (nothing
-    unpinned to refresh). Equivalent to calling ``resnapshot_job`` for each
-    eligible job. Returns the list of updated jobs.
-    """
-    updated: List[Dict[str, Any]] = []
-    with _jobs_lock():
-        jobs = load_jobs()
-        changed = False
-        for job in jobs:
-            if bool(job.get("no_agent")):
-                continue
-            if job.get("provider") and job.get("model"):
-                # Pinned on every axis — nothing unpinned to refresh.
-                continue
-            provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-                provider=job.get("provider"),
-                model=job.get("model"),
-                base_url=job.get("base_url"),
-                no_agent=job.get("no_agent"),
-            )
-            refreshed = False
-            if (
-                _normalize_job_optional_text(job.get("provider")) is None
-                and provider_snapshot is not None
-            ):
-                job["provider_snapshot"] = provider_snapshot
-                refreshed = True
-            if (
-                _normalize_job_optional_text(job.get("model")) is None
-                and model_snapshot is not None
-            ):
-                job["model_snapshot"] = model_snapshot
-                refreshed = True
-            if refreshed:
-                changed = True
-                updated.append(_normalize_job_record(job))
-        if changed:
-            save_jobs(jobs)
-    return updated
-
-
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
@@ -2568,7 +2168,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
     })
 
 
-def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
+def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     """Resume a paused job. Accepts a job ID or name.
 
     A recurring job paused across one of its slots must not lose that slot silently: the stored
@@ -2608,7 +2208,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     })
 
 
-def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Schedule a job for the next tick (ID or name). ``extra_prompt`` is stamped as
     ``manual_run_prompt`` for that single fire only; ``mark_job_run`` clears it."""
     job = resolve_job_ref(job_id)
@@ -2652,7 +2252,7 @@ _REARM_RECURRING_ERROR = (
 )
 
 
-def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
+def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
     """Re-arm a completed one-shot as an explicit new occurrence."""
     job_ref = resolve_job_ref(job_id)
     if not job_ref:
@@ -2750,11 +2350,6 @@ def clear_preflight_alerted(job_id: str) -> None:
     _set_alert_flag(job_id, "preflight_alerted", False)
 
 
-def clear_drift_alerted(job_id: str) -> None:
-    """Clear the drift alert-dedup marker (resolution matches again)."""
-    _set_alert_flag(job_id, "drift_alerted", False)
-
-
 def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     """Durably record (as ``last_fire_error``) that a scheduled fire could not be handed to the
     runner — written by the dashboard fire webhook when the loopback forward fails. Without it
@@ -2770,7 +2365,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
 
 
 def _record_run_outcome(
-    job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
+    job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
@@ -2799,9 +2394,6 @@ def _record_run_outcome(
         # call. Delivery failures keep their own sticky last_delivery_error.
         job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
     job["last_delivery_error"] = delivery_error
-    # A terminal run resolves the deferred-occurrence projection (the durable obligation itself
-    # is settled in cron.deferrals by the scheduler).
-    job.pop("last_defer", None)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
@@ -2809,7 +2401,7 @@ def _record_run_outcome(
         job["run_claim"] = None
 
 
-def _advance_after_run(job: Dict[str, Any], now: str, *, ladder_rung: bool = False) -> None:
+def _advance_after_run(job: dict[str, Any], now: str, *, ladder_rung: bool = False) -> None:
     """Bump ``repeat.completed`` and recompute ``next_run_at``; retire the record as a terminal
     completion when the repeat limit is reached or a one-shot has no further run.
 
@@ -2930,67 +2522,7 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked)
 
 
-def mark_job_deferred(
-    job_id: str,
-    retry_at: str,
-    *,
-    reason: str = "",
-    occurrence_key: str = "",
-    attempts: int = 0,
-    expected_fire_owner: Optional[str] = None,
-) -> bool:
-    """Record a transient defer without consuming the logical occurrence."""
-
-    def apply(jobs, _i, job):
-        if expected_fire_owner is not None:
-            claim = job.get("fire_claim")
-            if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
-                logger.warning(
-                    "mark_job_deferred: job_id %s fire claim owner changed; "
-                    "discarding stale defer",
-                    job_id,
-                )
-                return False
-        canonical_retry_at = str(retry_at)
-        job["last_status"] = "deferred"
-        job["last_error"] = None
-        job["last_defer"] = {
-            "at": _hermes_now().isoformat(),
-            "reason": str(reason or "")[:500],
-            "occurrence_key": str(occurrence_key or ""),
-            "retry_at": canonical_retry_at,
-            "attempts": int(attempts),
-        }
-        job["fire_claim"] = None
-        if job.get("run_claim") is not None:
-            job["run_claim"] = None
-        schedule = job.get("schedule") or {}
-        if schedule.get("kind") == "once":
-            repeat = job.get("repeat") or {}
-            if int(repeat.get("completed") or 0) > 0:
-                repeat["completed"] = int(repeat["completed"]) - 1
-                job["repeat"] = repeat
-            schedule["run_at"] = canonical_retry_at
-            job["schedule"] = schedule
-        job["next_run_at"] = canonical_retry_at
-        if job.get("state") != "paused":
-            job["state"] = "scheduled"
-        save_jobs(jobs)
-        return True
-
-    def locked():
-        found = _with_job(job_id, apply, missing=_MISSING)
-        if found is _MISSING:
-            logger.warning(
-                "mark_job_deferred: job_id %s not found, skipping save", job_id
-            )
-            return False
-        return found
-
-    return _under_fire_fence(job_id, locked)
-
-
-def _write_oneshot_diagnostic(job: Dict[str, Any], text: str, what: str) -> bool:
+def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
     """Best-effort operator-visible trace in the job's output dir; never breaks the caller."""
     try:
         save_job_output(job.get("id", ""), text)
@@ -3000,7 +2532,7 @@ def _write_oneshot_diagnostic(job: Dict[str, Any], text: str, what: str) -> bool
         return False
 
 
-def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
+def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
     """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
     (interrupted mid-run); removing it silently would leave no output, error, or record.
 
@@ -3035,7 +2567,7 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
             job.get("name", job.get("id", "?")))
 
 
-def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None:
+def _write_missed_oneshot_diagnostic(job: dict[str, Any], next_run: str) -> None:
     """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
     """
     _write_oneshot_diagnostic(
@@ -3110,7 +2642,7 @@ def claim_dispatch(job_id: str) -> bool:
     return claimed
 
 
-def _refresh_claim(jobs: List[Dict[str, Any]], claim: Any, expected_owner: str) -> bool:
+def _refresh_claim(jobs: list[dict[str, Any]], claim: Any, expected_owner: str) -> bool:
     """Compare-and-refresh a claim's ``at`` stamp; False unless *expected_owner* still holds it."""
     if not isinstance(claim, dict) or claim.get("by") != expected_owner:
         return False
@@ -3209,7 +2741,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
-) -> Union[bool, Dict[str, Any]]:
+) -> Union[bool, dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
     fence + file lock: reject missing/terminal/paused jobs unless ``force`` (explicit manual
@@ -3309,7 +2841,7 @@ def _completed_oneshot_retention_days() -> float:
 
 
 def _sweep_completed_oneshots(
-    raw_jobs: List[Dict[str, Any]], now: datetime, *, removed_ids: Optional[Set[str]] = None,
+    raw_jobs: list[dict[str, Any]], now: datetime, *, removed_ids: Optional[set[str]] = None,
 ) -> bool:
     """Prune completed one-shot records past retention (in place; True when anything was removed).
     Removed ids go into *removed_ids* so save_jobs's shrink-merge guard allows the delete. Age is
@@ -3347,7 +2879,7 @@ def _sweep_completed_oneshots(
 
 # --- Due scan ---
 
-def get_due_jobs() -> List[Dict[str, Any]]:
+def get_due_jobs() -> list[dict[str, Any]]:
     """Return all jobs due now. A recurring job more than one period stale (gateway down, or a run
     overran the interval) has its backlog collapsed — next_run_at fast-forwards so nothing
     burst-fires — but still fires ONCE now (via mark_job_run, consuming one ``repeat.times`` run),
@@ -3364,15 +2896,15 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 class _DueScan:
     """Mutable state threaded through one due scan: the raw store records plus what to persist."""
 
-    raw_jobs: List[Dict[str, Any]]
+    raw_jobs: list[dict[str, Any]]
     now: datetime
     needs_save: bool = False
-    removed: Set[str] = field(default_factory=set)
+    removed: set[str] = field(default_factory=set)
     # Miss/catch-up metrics, emitted once the save that persists the scan's repairs lands: an
     # unwritable store re-finds the same miss every tick, so counting before the save over-counts.
-    on_saved: List[Callable[[], None]] = field(default_factory=list)
+    on_saved: list[Callable[[], None]] = field(default_factory=list)
 
-    def find(self, job_id: Any) -> Optional[Dict[str, Any]]:
+    def find(self, job_id: Any) -> Optional[dict[str, Any]]:
         return next((rj for rj in self.raw_jobs if rj["id"] == job_id), None)
 
     def persist(self, job_id: Any, **fields: Any) -> None:
@@ -3391,7 +2923,7 @@ class _DueScan:
             self.needs_save = True
 
 
-def _normalize_due_scan_records(raw_jobs: List[Dict[str, Any]]) -> bool:
+def _normalize_due_scan_records(raw_jobs: list[dict[str, Any]]) -> bool:
     """Repair malformed store records in place BEFORE the due scan keys off them: a missing ``id``
     (older writers used ``job_id``), non-dict ``schedule``, or non-ISO timestamp used to abort the
     whole scan before save_jobs(), freezing the scheduler in a fast-forward loop."""
@@ -3411,7 +2943,7 @@ def _normalize_due_scan_records(raw_jobs: List[Dict[str, Any]]) -> bool:
     return changed
 
 
-def _self_disable_half_paused(job: Dict[str, Any], scan: _DueScan) -> None:
+def _self_disable_half_paused(job: dict[str, Any], scan: _DueScan) -> None:
     """Self-heal enabled=true with pause markers: the operator believes the job is frozen while the
     scheduler would still fire it. Force enabled=false so listings are honest; logged loudly since
     pause_job sets both fields atomically, so this should be rare."""
@@ -3431,7 +2963,7 @@ def _self_disable_half_paused(job: Dict[str, Any], scan: _DueScan) -> None:
     scan.needs_save = True
 
 
-def _recover_missing_next_run(job: Dict[str, Any], scan: _DueScan) -> Optional[str]:
+def _recover_missing_next_run(job: dict[str, Any], scan: _DueScan) -> Optional[str]:
     """Recompute and persist a missing ``next_run_at``; None when unrecoverable. One-shots use the
     grace window; recurring jobs get here after a direct jobs.json edit bypassed add_job() or a
     transient croniter ImportError left them in state 'error' (#127182) — re-armed ones go back
@@ -3450,7 +2982,7 @@ def _recover_missing_next_run(job: Dict[str, Any], scan: _DueScan) -> Optional[s
     logger.info(
         "Job '%s' had no next_run_at; recovering %s run at %s",
         job.get("name", job.get("id", "?")), recovery_kind, recovered_next)
-    fields: Dict[str, Any] = {"next_run_at": recovered_next}
+    fields: dict[str, Any] = {"next_run_at": recovered_next}
     if _is_recoverable_error_job(job):
         fields["state"] = "scheduled"
     job.update(fields)
@@ -3463,14 +2995,14 @@ class _DueJob:
     """One candidate under evaluation: its record, schedule and the stored next_run in raw/aware
     form."""
 
-    job: Dict[str, Any]
+    job: dict[str, Any]
     scan: _DueScan
     next_run: str  # stored ISO string, compared string-exact against manual_run_at
     raw_next_run_dt: datetime  # as stored (may carry a pre-migration offset)
     next_run_dt: datetime  # normalized to the configured tz
 
     @property
-    def schedule(self) -> Dict[str, Any]:
+    def schedule(self) -> dict[str, Any]:
         return self.job.get("schedule", {})
 
     @property
@@ -3554,8 +3086,6 @@ def _reanchor_stale_cron(d: _DueJob) -> bool:
 
     A direct edit of schedule.expr leaves next_run_at on the old lattice, so re-anchor first (from
     the current expr, so this converges). Some instants are off the lattice on purpose and
-    instant off the lattice, and re-anchoring THAT swallowed a due occurrence — so classify, and
-    let
     authorize one fire instead: an offset-representation migration that would otherwise swallow
     a never-fired occurrence, and the failure-path planners' parked instants (a quota recovery
     before a sparse cron's next natural occurrence, an unreachable-model retry rung). All fall
@@ -3643,7 +3173,7 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     return True
 
 
-def _oneshot_dispatch_limit_reached(job: Dict[str, Any], scan: _DueScan) -> bool:
+def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool:
     """One-shot dispatch-limit guard; True when the job must not fire this tick.
 
     A finite one-shot claimed via claim_dispatch() whose tick died before mark_job_run has
@@ -3685,7 +3215,7 @@ def _oneshot_dispatch_limit_reached(job: Dict[str, Any], scan: _DueScan) -> bool
     return True
 
 
-def _restore_unclaimed_slot(job: Dict[str, Any], scan: _DueScan) -> Optional[str]:
+def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str]:
     """Put an occurrence the dispatcher advanced past but never claimed back on the schedule
     (#107485); returns the restored ``next_run_at`` or None. Restored ONCE: the stamp is dropped
     here, so the slot then meets the ordinary late / fast-forward / ``cron.catch_up_missed``
@@ -3708,7 +3238,7 @@ def _restore_unclaimed_slot(job: Dict[str, Any], scan: _DueScan) -> Optional[str
     return slot
 
 
-def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
+def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
@@ -3791,7 +3321,7 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     return True
 
 
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
+def _get_due_jobs_locked() -> list[dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     raw_jobs = load_jobs()
     scan = _DueScan(raw_jobs, _hermes_now())
@@ -3907,7 +3437,7 @@ def _canonical_skill_ref(raw: Any) -> str:
     return value.strip().lstrip("/")
 
 
-def referenced_skill_names() -> Set[str]:
+def referenced_skill_names() -> set[str]:
     """Skill names referenced by ANY cron job, deliberately including paused/disabled ones (resuming
     must still find them); the curator protects these from inactivity archival. Canonicalized as the
     scheduler does, so absolute paths are protected too. A corrupt store yields an empty set."""
@@ -3926,8 +3456,8 @@ def referenced_skill_names() -> Set[str]:
 
 
 def rewrite_skill_refs(
-    consolidated: Optional[Dict[str, str]] = None, pruned: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    consolidated: Optional[dict[str, str]] = None, pruned: Optional[list[str]] = None,
+) -> dict[str, Any]:
     """Rewrite cron job skill references after a curator consolidation pass (a job listing a
     consolidated/pruned skill would otherwise run without it). Consolidated names map to their
     umbrella target without duplication, pruned names are dropped, ordering is preserved, and the
@@ -3942,14 +3472,14 @@ def rewrite_skill_refs(
 
     with _jobs_lock():
         jobs = load_jobs()
-        rewrites: List[Dict[str, Any]] = []
+        rewrites: list[dict[str, Any]] = []
         for job in jobs:
             skills_before = _normalize_skill_list(job.get("skill"), job.get("skills"))
             if not skills_before:
                 continue
-            mapped: Dict[str, str] = {}
-            dropped: List[str] = []
-            new_skills: List[str] = []
+            mapped: dict[str, str] = {}
+            dropped: list[str] = []
+            new_skills: list[str] = []
             for name in skills_before:
                 if name in consolidated:
                     target = consolidated[name]
@@ -3976,8 +3506,3 @@ def rewrite_skill_refs(
             save_jobs(jobs)
             logger.info("Curator rewrote skill references in %d cron job(s)", len(rewrites))
         return {"rewrites": rewrites, "jobs_updated": len(rewrites), "jobs_scanned": len(jobs)}
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-# ---- END PLUGIN-COMPAT ----

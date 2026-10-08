@@ -39,7 +39,6 @@ class _FakeConn:
             self.in_transaction = True
         elif key in {"COMMIT", "ROLLBACK"}:
             self.in_transaction = False
-        return None
 
     def count(self, prefix):
         prefix = prefix.upper()
