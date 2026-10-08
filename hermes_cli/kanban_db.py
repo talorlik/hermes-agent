@@ -108,6 +108,10 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# Kinds an unblock may assert. ``dependency`` waits in todo, never blocked, so
+# it can never match and must be rejected before mutation. The CLI parser reads
+# this at import; dropping it takes down every ``hermes`` command.
+VALID_UNBLOCK_EXPECTED_KINDS = VALID_BLOCK_KINDS - {"dependency"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -3576,14 +3580,56 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_block_kind: Optional[str] = None,
+    reason: Optional[str] = None,
+    reason_comment_author: Optional[str] = None,
+    receipt_capture: Optional[Any] = None,
+) -> bool:
+    """``blocked``/``scheduled`` -> its resumable phase, unless a typed-kind guard mismatches.
+
+    An ``expected_block_kind`` demands a blocked task of that exact kind and
+    refuses before any mutation. Guarded reason comments, the event, and the
+    receipt share the status-change transaction. ``block_kind`` survives so a
+    same-kind re-block still counts as a loop.
+    """
+    from hermes_cli.kanban_db_connect import (
+        LifecycleReceipt,
+        _clear_receipt_capture,
+        _stage_receipt,
+    )
+
+    _clear_receipt_capture(conn, receipt_capture)
+    if (
+        expected_block_kind is not None
+        and expected_block_kind not in VALID_UNBLOCK_EXPECTED_KINDS
+    ):
+        raise ValueError(
+            "expected_block_kind must be one of "
+            f"{sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
+        )
+    if reason is not None:
+        reason = redact_review_value(reason)
+        if not isinstance(reason, str) or not reason.strip():
+            reason = None
     now = int(time.time())
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if expected_block_kind is not None and (
+            current is None
+            or current["status"] != "blocked"
+            or current["block_kind"] != expected_block_kind
+        ):
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if current is not None and current["status"] == "blocked"
             else "ready"
         )
         _reclaim_dangling_run(
@@ -3605,16 +3651,38 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
+        comment_id = None
+        if reason and reason_comment_author:
+            comment_id = add_comment(
+                conn, task_id, reason_comment_author, f"UNBLOCK: {reason}",
+            )
+        payload: Optional[dict] = (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
+        )
+        if reason:
+            payload = dict(payload or {})
+            payload["reason"] = reason
+        _append_event(conn, task_id, "unblocked", payload)
+        event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        event_id = int(event_row[0]) if event_row and event_row[0] else None
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="unblock",
+                task_id=task_id,
+                prior_status=current["status"] if current is not None else None,
+                final_status=new_status,
+                newly_committed=True,
+                event_id=event_id,
+                comment_id=comment_id,
             ),
         )
         return True

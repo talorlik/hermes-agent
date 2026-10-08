@@ -2713,6 +2713,19 @@ def test_block_task_invalid_expected_status_raises(kanban_home):
         assert kb.get_task(conn, tid).status == "ready"
 
 
+def test_kanban_parser_imports_unblock_expected_kinds():
+    """Parser construction reads the constant at import. A missing name
+    takes down every hermes command, including cron doctor."""
+    from hermes_cli import kanban_parser
+
+    assert kb.VALID_UNBLOCK_EXPECTED_KINDS == (
+        kb.VALID_BLOCK_KINDS - {"dependency"}
+    )
+    assert kanban_parser.kb.VALID_UNBLOCK_EXPECTED_KINDS == (
+        kb.VALID_UNBLOCK_EXPECTED_KINDS
+    )
+
+
 def test_unblock_task_expected_block_kind_match_succeeds(kanban_home):
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="unblock cas match", assignee="worker")
