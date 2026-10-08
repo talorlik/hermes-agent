@@ -3200,13 +3200,19 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
-) -> bool:
+    expected_status: Optional[str] = None,
+    reason_comment_author: Optional[str] = None,
+    with_reason: bool = False,
+    receipt_capture: Optional[Any] = None,
+):
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
     promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    transition. When ``with_reason`` is set, the return is ``(ok, why)``.
+    ``expected_status`` is a compare-and-swap guard. ``receipt_capture``
+    publishes the committed block for ``kanban block --json``.
 
     An already-``blocked`` card that the failure breaker parked UNTYPED
     (``block_kind IS NULL``, no live run) is classified in place when *kind*
@@ -3215,14 +3221,31 @@ def block_task(
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
     """
+    from hermes_cli.kanban_db_connect import (
+        LifecycleReceipt,
+        _clear_receipt_capture,
+        _stage_receipt,
+    )
+
+    def _ret(ok: bool, why: Optional[str] = None):
+        return (ok, why) if with_reason else ok
+
+    _clear_receipt_capture(conn, receipt_capture)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
-            return False
+            return _ret(False, "task not found")
+        if expected_status is not None and cur_row["status"] != expected_status:
+            return _ret(
+                False,
+                f"expected status {expected_status!r}, task is {cur_row['status']!r}",
+            )
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -3232,7 +3255,7 @@ def block_task(
         # card -- its run is over -- so it is refused like any stale worker.
         if cur_row["status"] == "blocked":
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
-                return False
+                return _ret(False, "blocked card cannot be reclassified")
             classified = conn.execute(
                 "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
@@ -3240,11 +3263,20 @@ def block_task(
                 (kind, task_id),
             ).rowcount
             if classified != 1:
-                return False
-            _append_event(conn, task_id, "blocked", {
+                return _ret(False, "blocked card changed concurrently")
+            event_id = _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
-            return True
+            _stage_receipt(
+                conn, receipt_capture,
+                LifecycleReceipt(
+                    operation="block", task_id=task_id,
+                    prior_status="blocked", final_status="blocked",
+                    newly_committed=True, run_id=None, event_id=event_id,
+                    comment_id=None,
+                ),
+            )
+            return _ret(True)
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
@@ -3276,19 +3308,34 @@ def block_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params = (*params, expected_status)
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return _ret(False, "task changed concurrently")
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        event_id = _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        comment_id = None
+        if reason and reason_comment_author:
+            comment_id = add_comment(conn, task_id, reason_comment_author, f"BLOCKED: {reason}")
+        _stage_receipt(
+            conn, receipt_capture,
+            LifecycleReceipt(
+                operation="block", task_id=task_id,
+                prior_status=cur_row["status"], final_status=new_status,
+                newly_committed=True, run_id=run_id, event_id=event_id,
+                comment_id=comment_id,
+            ),
+        )
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
+            return _ret(True)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    return True
+    return _ret(True)
 
 
 def _route_block(
