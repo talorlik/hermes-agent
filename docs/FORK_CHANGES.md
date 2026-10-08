@@ -145,7 +145,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-KANBAN-LIFECYCLE: durable Kanban lifecycle contracts and CAS guards
-- Commits: 1ab971057377815a36ce2c521dd794d9d1798f4f, e84910466496b942b0a9bada5e455ad16a0a8d68, f45949d4f4f751209c41e29f8623e3f898c916cf, d95f6c15e636335ed02d9c0e35d158b9aa9ef6d9, 3eeb47ec1da93f7667e3bfd2003cc4c9bb470c1a
+- Commits: 1ab971057377815a36ce2c521dd794d9d1798f4f, e84910466496b942b0a9bada5e455ad16a0a8d68, f45949d4f4f751209c41e29f8623e3f898c916cf, d95f6c15e636335ed02d9c0e35d158b9aa9ef6d9, 3eeb47ec1da93f7667e3bfd2003cc4c9bb470c1a, 720e9e2a4bfa7ecd06f515c4a9b18c3e95e56879
 - Owned-Files:
   - hermes_cli/kanban.py
   - hermes_cli/kanban_db.py
@@ -480,7 +480,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 50
+- Ledger-Revision: 51
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
