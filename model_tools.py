@@ -22,6 +22,7 @@ from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
+from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
 from utils import file_signature
 
 logger = logging.getLogger(__name__)
@@ -150,19 +151,17 @@ discover_builtin_tools()
 # MCP discovery is deliberately NOT run here: it blocks up to 120 s and the
 # gateway lazy-imports this module inside its event loop; each entry point
 # (gateway/run.py, cli.py, tui_gateway, acp_adapter) runs it at startup.
-if os.environ.get("HERMES_ONESHOT_EXPLICIT_NO_TOOLS") != "1":
-    try:  # plugin tool discovery (user/project/pip plugins)
-        # MCP tool discovery (external MCP servers from config) used to run here as a module-level side effect.
-        # It was removed because discover_mcp_tools() internally uses a blocking future.result(timeout=120)
-        # wait, and the gateway lazy-imports this module from inside the asyncio event loop on the first user
-        # message — freezing Discord/Telegram heartbeats for up to 120s whenever any configured MCP server was
-        # slow or unreachable (#16856). - gateway/run.py            -> start_gateway() uses run_in_executor -
-        # acp_adapter/server.py     -> asyncio.to_thread on session init
-        from hermes_cli.plugins import discover_plugins
-
-        discover_plugins()
-    except Exception as e:
-        logger.debug("Plugin discovery failed: %s", e)
+try:  # plugin tool discovery (user/project/pip plugins)
+    # MCP tool discovery (external MCP servers from config) used to run here as a module-level side effect.
+    # It was removed because discover_mcp_tools() internally uses a blocking future.result(timeout=120)
+    # wait, and the gateway lazy-imports this module from inside the asyncio event loop on the first user
+    # message — freezing Discord/Telegram heartbeats for up to 120s whenever any configured MCP server was
+    # slow or unreachable (#16856). - gateway/run.py            -> start_gateway() uses run_in_executor -
+    # acp_adapter/server.py     -> asyncio.to_thread on session init
+    from hermes_cli.plugins import discover_plugins
+    discover_plugins()
+except Exception as e:
+    logger.debug("Plugin discovery failed: %s", e)
 
 
 # Backward-compat constants (built once after discovery)
@@ -325,9 +324,10 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
             enabled.append("kanban")
         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
     else:
-        from toolsets import get_all_toolsets
+        from toolsets import TOOLSET_SESSION_PLATFORMS, get_all_toolsets
         for ts_name in get_all_toolsets():
-            tools.update(resolve_toolset(ts_name))
+            if ts_name not in TOOLSET_SESSION_PLATFORMS:
+                tools.update(resolve_toolset(ts_name))
     # Disabled toolsets are always subtracted LAST, so a tool in a disabled
     # toolset is stripped even when a composite (hermes-cli) re-enables it.
     # This ensures that even if a composite toolset (like hermes-cli) is enabled, any tools belonging to a
@@ -611,7 +611,7 @@ _AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task"}
 # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
 # prompts keep working); schemas advertise only new names.
 _LEGACY_TOOL_ALIASES = {
-    "todo": "todo_list", "cronjob": "cronjob_manage", "process": "process_manage",
+    **dict.fromkeys(TODO_LEGACY_ALIASES, TODO_SCHEMA["name"]), "cronjob": "cronjob_manage", "process": "process_manage",
     "tour": "gui_tour", "tip": "show_tip",
 }
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
