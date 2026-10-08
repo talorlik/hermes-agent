@@ -2663,7 +2663,9 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
+    expected_status: Optional[str] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    receipt_capture: Optional[Any] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2681,7 +2683,34 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    ``expected_status`` is a compare-and-swap guard. A typo raises. A stale
+    observation returns False before card-audit or acceptance side effects,
+    and is checked again inside the write transaction. ``receipt_capture``
+    publishes the committed completion; a mismatch publishes nothing.
     """
+    from hermes_cli.kanban_db_connect import (
+        LifecycleReceipt,
+        _clear_receipt_capture,
+        _stage_receipt,
+    )
+
+    _clear_receipt_capture(conn, receipt_capture)
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(
+            f"expected_status must be one of {sorted(VALID_STATUSES)}"
+        )
+    if expected_status is not None or expected_run_id is not None:
+        observed = get_task(conn, task_id)
+        if observed is None:
+            return False
+        if expected_status is not None and observed.status != expected_status:
+            return False
+        if (
+            expected_run_id is not None
+            and observed.current_run_id != int(expected_run_id)
+        ):
+            return False
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2701,6 +2730,12 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        if expected_status is not None:
+            fresh = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if fresh is None or fresh["status"] != expected_status:
+                return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
@@ -2730,6 +2765,9 @@ def complete_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params = (*params, expected_status)
         if conn.execute(sql, params).rowcount != 1:
             return False
         if isinstance(metadata, dict):
@@ -2754,6 +2792,21 @@ def complete_task(
             conn, task_id, "completed",
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
+        )
+        event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+        event_id = int(event_row[0]) if event_row and event_row[0] else None
+        _stage_receipt(
+            conn,
+            receipt_capture,
+            LifecycleReceipt(
+                operation="complete",
+                task_id=task_id,
+                prior_status=prior_status,
+                final_status="done",
+                newly_committed=True,
+                run_id=run_id,
+                event_id=event_id,
+            ),
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
