@@ -1697,7 +1697,21 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
-def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+    expected_status: Optional[str] = None, if_absent: bool = False,
+    receipt_capture: Optional[Any] = None,
+) -> int:
+    """Append a guarded comment, optionally replaying an existing canonical body."""
+    from hermes_cli.kanban_db_connect import (
+        LifecycleReceipt,
+        _clear_receipt_capture,
+        _stage_receipt,
+    )
+
+    _clear_receipt_capture(conn, receipt_capture)
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -1706,13 +1720,45 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        _require_task(conn, task_id)
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        if expected_status is not None and row["status"] != expected_status:
+            raise ValueError(
+                f"refusing to comment: expected status {expected_status!r}, task is {row['status']!r}"
+            )
+        # The guard precedes dedup, and both run under the same writer lock.
+        existing = None
+        if if_absent:
+            existing = conn.execute(
+                "SELECT id FROM task_comments WHERE task_id = ? AND author = ? "
+                "AND body = ? ORDER BY id LIMIT 1",
+                (task_id, author.strip(), body.strip()),
+            ).fetchone()
+        event_id = None
+        if existing is not None:
+            comment_id = int(existing["id"])
+        else:
+            cur = conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
+            )
+            comment_id = int(cur.lastrowid or 0)
+            _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+            event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+            event_id = int(event_row[0]) if event_row and event_row[0] else None
+        _stage_receipt(
+            conn, receipt_capture,
+            LifecycleReceipt(
+                operation="comment", task_id=task_id,
+                prior_status=row["status"], final_status=row["status"],
+                newly_committed=existing is None,
+                event_id=event_id, comment_id=comment_id,
+            ),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -2199,17 +2245,59 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, idempotent_replay: bool = False,
+    receipt_capture: Optional[Any] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). Replay requires an
+    explicit claimer and the same unexpired, authoritative current run.
     """
+    from hermes_cli.kanban_db_connect import (
+        LifecycleReceipt,
+        _clear_receipt_capture,
+        _stage_receipt,
+    )
+
+    _clear_receipt_capture(conn, receipt_capture)
+    if idempotent_replay and not claimer:
+        raise ValueError("idempotent_replay requires an explicit claimer")
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if idempotent_replay:
+            current = get_task(conn, task_id)
+            if current is not None and current.status == "running":
+                # Validate both sides of the run pointer while holding the
+                # writer lock; a matching task lease alone is insufficient.
+                run = conn.execute(
+                    "SELECT id FROM task_runs WHERE id = ? AND task_id = ? "
+                    "AND status = 'running' AND ended_at IS NULL AND outcome IS NULL "
+                    "AND claim_lock = ? AND claim_expires = ? AND claim_expires >= ?",
+                    (current.current_run_id, task_id, lock, current.claim_expires,
+                     int(time.time())),
+                ).fetchone()
+                if current.claim_lock != lock or run is None:
+                    return None
+                event = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id = ? "
+                    "AND kind = 'claimed' AND run_id = ? ORDER BY id DESC LIMIT 1",
+                    (task_id, current.current_run_id),
+                ).fetchone()
+                if event is None:
+                    return None
+                _stage_receipt(
+                    conn, receipt_capture,
+                    LifecycleReceipt(
+                        operation="claim", task_id=task_id,
+                        prior_status="running", final_status="running",
+                        newly_committed=False, run_id=current.current_run_id,
+                        event_id=event["id"],
+                    ),
+                )
+                return current
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2228,6 +2316,20 @@ def claim_task(
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
+        event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? "
+            "AND kind = 'claimed' AND run_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        _stage_receipt(
+            conn, receipt_capture,
+            LifecycleReceipt(
+                operation="claim", task_id=task_id,
+                prior_status="ready", final_status="running",
+                newly_committed=True, run_id=run_id,
+                event_id=event["id"] if event else None,
+            ),
+        )
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
 
@@ -3386,6 +3488,8 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    expected_status: Optional[str] = None,
+    receipt_capture: Optional[Any] = None,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3405,9 +3509,26 @@ def request_review(
     task stays ``running`` and retryable, with no attachments and no event.
     """
 
+    from hermes_cli.kanban_db_connect import (
+        LifecycleReceipt,
+        ReceiptFinalizationError,
+        TransactionOutcomeUnknownError,
+        _clear_receipt_capture,
+        _stage_receipt,
+    )
+
     def _ret(ok: bool, reason: Optional[str] = None):
         return (ok, reason) if with_reason else ok
 
+    _clear_receipt_capture(conn, receipt_capture)
+    if expected_status is not None and expected_status not in VALID_STATUSES:
+        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+    if expected_status is not None:
+        observed = get_task(conn, task_id)
+        if observed is None:
+            return _ret(False, "task not found")
+        if observed.status != expected_status:
+            return _ret(False, f"expected status {expected_status!r}, task is {observed.status!r}")
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     # Declared (metadata["artifacts"]) and prose-referenced files
@@ -3428,6 +3549,10 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            if expected_status is not None and trow["status"] != expected_status:
+                return _ret(
+                    False, f"expected status {expected_status!r}, task is {trow['status']!r}",
+                )
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -3504,6 +3629,20 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
+            event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
+            event_id = int(event_row[0]) if event_row and event_row[0] else None
+            _stage_receipt(
+                conn, receipt_capture,
+                LifecycleReceipt(
+                    operation="request_review", task_id=task_id,
+                    prior_status=trow["status"], final_status="review",
+                    newly_committed=True, run_id=run_id, event_id=event_id,
+                ),
+            )
+    except (ReceiptFinalizationError, TransactionOutcomeUnknownError):
+        # A committed or uncertain transaction can reference these copies;
+        # deleting them would destroy the durable review evidence.
+        raise
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
