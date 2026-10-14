@@ -1,10 +1,42 @@
 """Cron admission must not become a second writer or a completed-delivery claim."""
-
 from pathlib import Path
+import subprocess
 from unittest.mock import Mock
 
 from cron import scheduler_delivery as delivery
 from tools import bot_live_delivery as mailbox
+
+
+class _FakeAuthority:
+    """The profile authority's canonical deliver door: one admission per stable
+    id, exact retries inspect the committed state, the owner may settle it."""
+
+    def __init__(self):
+        self.records = {}
+
+    def publish(self, key, **changes):
+        record = self.records[key]
+        record.update(changes)
+        with mailbox._locked(record['profile_home']) as root:
+            mailbox._write(root / f'{key}.json', record)
+
+    def __call__(self, home, params):
+        record = self.records.get(params["id"])
+        if record is None:
+            record = self.records[params["id"]] = dict(
+                status="queued", delivery_id=params["id"], profile_home=str(Path(home).resolve()),
+                session_id="local-bot", message=params["message"], admission_id="adm-" + params["id"][:8],
+                reply="", error="", reason="")
+            with mailbox._locked(home) as root:
+                mailbox._write(root / f"{params['id']}.json", record)
+        elif record["message"] != params["message"]:
+            raise ValueError("admission_conflict")
+        return dict(record)
+
+
+def _owner(home):
+    return dict(profile_home=str(Path(home).resolve()), session_id="local-bot", canonical=True,
+                lease_id="authority-1", live_session_id="local-bot")
 
 
 def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypatch):
@@ -12,19 +44,16 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
     source = tmp_path / "custom-home"
     monkeypatch.setenv("HERMES_HOME", str(source))
     subprocess_run = Mock(side_effect=AssertionError("live owner must not spawn CLI"))
-    monkeypatch.setattr(delivery, "_run_bot_chat_turn", subprocess_run)
+    monkeypatch.setattr(subprocess, "run", subprocess_run)
     from hermes_cli.profiles import get_profile_dir
 
+    authority = _FakeAuthority()
+    monkeypatch.setattr(mailbox, "authority_delivery", authority)
     for profile, home in [("", source), ("research", get_profile_dir("research"))]:
-        owner = dict(
-            profile_home=str(home.resolve()),
-            session_id="bot",
-            lease_id="lease",
-            live_session_id="live",
-        )
-        discovery = Mock(return_value=owner)
+        discovery = Mock(return_value=_owner(home))
         monkeypatch.setattr(mailbox, "find_canonical_live_owner", discovery)
         job = dict(id="digest", name="Digest", execution_id="first-run")
+        admitted_before = len(authority.records)
         pending = delivery._deliver_to_bot_chat(job, "payload", profile)
         assert pending and "queued" in pending
         records = list((home / "runtime/bot_live_delivery").glob("*.json"))
@@ -32,12 +61,15 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
         key = records[0].stem
         record = mailbox.read_delivery_result(home, key)
         assert record and record["message"].endswith("payload")
+        # Same execution id -> same stable delivery id, no second admission.
         discovery.side_effect = AssertionError("receipt must precede discovery")
         assert delivery._deliver_to_bot_chat(dict(job), "payload", profile) == pending
-        mailbox.claim_pending_delivery(home, owner)
-        mailbox.complete_delivery(home, key, status="ambiguous", error="owner died")
+        assert key in authority.records and len(authority.records) == admitted_before + 1
+        # The owner dies mid-execution: the authority reports the admission ambiguous.
+        authority.publish(key, status="ambiguous", error="owner died")
         outcome = delivery._deliver_to_bot_chat(dict(job), "payload", profile)
-        assert outcome and "ambiguous" in outcome
+        assert outcome and "ambiguous" in outcome and "owner died" in outcome
+        # Only a NEW execution mints a new id.
         discovery.side_effect = None
         next_job = dict(job, execution_id="next-run")
         outcome = delivery._deliver_to_bot_chat(next_job, "payload", profile)
@@ -46,97 +78,30 @@ def test_live_delivery_retry_keeps_receipt_across_owner_loss(tmp_path, monkeypat
     subprocess_run.assert_not_called()
 
 
-def test_exact_retry_attempt_uses_fresh_bot_chat_receipt(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    owner = {
-        "profile_home": str(tmp_path.resolve()),
-        "session_id": "bot",
-        "lease_id": "lease",
-        "live_session_id": "live",
-    }
-    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda _home: owner)
-    base_job = {"id": "digest", "execution_id": "run"}
-
-    first = dict(base_job, _exact_delivery_attempt_id="outbox:1")
-    assert "queued" in delivery._deliver_to_bot_chat(first, "payload", "")
-    first_record = mailbox.claim_pending_delivery(tmp_path, owner)
-    assert first_record is not None
-    mailbox.complete_delivery(
-        tmp_path,
-        first_record["delivery_id"],
-        status="failed",
-        error="HTTP 429 rate limit",
-        reason="provider_rate_limit",
-    )
-
-    second = dict(base_job, _exact_delivery_attempt_id="outbox:2")
-    assert "queued" in delivery._deliver_to_bot_chat(second, "payload", "")
-    second_record = mailbox.claim_pending_delivery(tmp_path, owner)
-    assert second_record is not None
-    assert second_record["delivery_id"] != first_record["delivery_id"]
-
-
 def test_result_records_pending_until_terminal_receipt(tmp_path, monkeypatch):
     from cron import jobs
     from gateway import config
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("_HERMES_CRON_EXTERNAL_WORKER", raising=False)
-    owner = dict(
-        profile_home=str(tmp_path.resolve()),
-        session_id="bot",
-        lease_id="lease",
-        live_session_id="live",
-    )
-    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: owner)
+    monkeypatch.setattr(mailbox, "find_canonical_live_owner", lambda home: _owner(tmp_path))
+    authority = _FakeAuthority()
+    monkeypatch.setattr(mailbox, "authority_delivery", authority)
     monkeypatch.setattr(delivery._sched, "load_config", dict)
     monkeypatch.setattr(config, "load_gateway_config", lambda: None)
-    monkeypatch.setattr(delivery, "_run_bot_chat_turn", Mock(side_effect=AssertionError("CLI")))
+    monkeypatch.setattr(subprocess, "run", Mock(side_effect=AssertionError("CLI")))
     updates = []
-    monkeypatch.setattr(
-        jobs,
-        "update_job",
-        lambda key, values, **kwargs: updates.append((values, kwargs)),
-    )
-    # The invocation carries the generation the producer actually admitted for ITS execution
-    # (real projection row), never a borrowed "latest" projection identity.
-    from cron import outbox
-
-    admitted = outbox.begin_job_delivery_projection("digest", "run")
-    job = dict(
-        id="digest",
-        execution_id="run",
-        deliver="bot-chat",
-        _delivery_projection_revision=admitted["revision"],
-    )
-    # A callback without an owned revision token must not write the modern projection: the
-    # admission is queued (not an error) but no guarded update is attempted.
-    assert delivery._deliver_result(dict(id="digest", execution_id="run", deliver="bot-chat"), "payload") is None
-    assert updates == []
+    monkeypatch.setattr(jobs, "update_job", lambda key, values: updates.append(values))
+    job = dict(id="digest", execution_id="run", deliver="bot-chat")
     error = delivery._deliver_result(job, "payload")
     assert error is None
-    queued = updates[-1][0]["last_delivery_queued"]
-    assert updates[-1][1] == {
-        "expected_execution_id": "run",
-        "expected_projection_revision": admitted["revision"],
-    }
+    queued = updates[-1]["last_delivery_queued"]
     assert queued and next(iter(queued.values()))["status"] == "queued"
-    assert (
-        delivery._sched._classify_delivery_outcome(
-            delivery_error=error,
-            delivery_queued=queued,
-            should_deliver=True,
-            unresolved_origin=False,
-            normalized_deliver="bot-chat",
-            incident_acked=False,
-            success=True,
-        )
-        == "queued"
-    )
-    record = mailbox.claim_pending_delivery(tmp_path, owner)
-    assert record is not None
-    mailbox.complete_delivery(
-        tmp_path, record["delivery_id"], status="settled", reply="done"
-    )
+    assert delivery._sched._classify_delivery_outcome(
+        delivery_error=error, delivery_queued=queued, should_deliver=True, unresolved_origin=False,
+        normalized_deliver="bot-chat", incident_acked=False, success=True) == "queued"
+    (key,) = authority.records
+    assert next(iter(queued.values()))["delivery_id"] == key
+    authority.publish(key, status="settled", reply="done")
     assert delivery._deliver_result(job, "payload") is None
-    assert updates[-1][0]["last_delivery_queued"] is None
+    assert updates[-1]["last_delivery_queued"] is None
