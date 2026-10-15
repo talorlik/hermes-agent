@@ -278,7 +278,9 @@ tests exist, tests pass, no regressions.
 - **Empty diff** — check `git status`, tell user nothing to verify
 - **Not a git repo** — skip and tell user
 - **Large diff (>15k chars)** — split by file, review each separately
-- **delegate_task returns non-JSON** — retry once with stricter prompt, then treat as FAIL
+- **delegate_task returns non-JSON** - retry once with stricter prompt, then treat as FAIL
+- **Unexpanded `<tag>` placeholders in the reviewer goal** - `delegate_task` refuses them; substitute the real scan text and diff before dispatch
+- **Background reviewer on Telegram or any later-result session** - `delegate_task` returns `dispatched` and delivers the verdict only after you end the turn. Do not poll the live transcript. Finish work that does not need the verdict, give a one-line status, and stop. Continue from the async result, not a re-dispatch of the same review
 - **False positives** — if reviewer flags something intentional, note it in fix prompt
 - **No test framework found** — skip regression check, reviewer verdict still runs
 - **Lint tools not installed** — skip that check silently, don't fail
