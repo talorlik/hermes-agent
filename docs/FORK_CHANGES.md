@@ -214,6 +214,16 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream skill gains an equivalent OAuth preflight.
 - Disposition: active
 
+## G-SKILL-REQUESTING-CODE-REVIEW: pin delegate_task review pitfalls
+- Commits: 73f7cb8df1c5aa263419ce99b992fe95db57ef92
+- Owned-Files:
+  - skills/software-development/requesting-code-review/SKILL.md
+- Intent: Source-owned requesting-code-review must match the installed copy. The skill documents that `delegate_task` refuses unexpanded placeholders and that a background reviewer on a later-result session delivers only after the parent ends the turn.
+- Protected-Invariant: Knowledge backup prepare fail-closes when this source-owned skill drifts; the owning bytes live in hermes-agent, not only the installed tree.
+- Tests: none (documentation-only; backup prepare is the live gate)
+- Retirement-Condition: Upstream skill documents the same placeholder and background-reviewer dispatch rules.
+- Disposition: active
+
 ## G-DOCS-GITHUB-WORKTREE: worktree cleanup guidance after PR merge
 - Commits: 351dfab6e78e200feaf5c838c8fb5ddb0e228c0f
 - Owned-Files:
@@ -480,7 +490,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 53
+- Ledger-Revision: 54
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
