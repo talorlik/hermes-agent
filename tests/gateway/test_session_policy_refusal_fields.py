@@ -92,6 +92,25 @@ def test_a_rebound_launch_key_names_api_key():
     assert (caught.value.field, caught.value.reason) == ('api_key', 'invalid_params')
 
 
+def test_oneshot_none_sentinel_is_an_explicit_empty_toolset(tmp_path):
+    """`hermes -z -t none` is the reserved empty toolset, including on bypass launches."""
+    params = {
+        'source': 'cli',
+        'cwd': str(tmp_path),
+        'model': 'fixture',
+        'toolsets': ['none'],
+        'safe_mode': True,
+        'ignore_user_config': True,
+    }
+    policy = build_policy(params, dict(_CFG), profile_terminal=False)
+    assert tuple(policy.toolsets) == ()
+    mixed = _refusal({'cwd': str(tmp_path), 'source': 'cli', 'toolsets': ['none', 'terminal']})
+    assert mixed.field == 'toolsets' and 'none' in mixed.detail
+    for bad in (['None'], ['none', 'none']):
+        refusal = _refusal({'cwd': str(tmp_path), 'source': 'cli', 'toolsets': bad})
+        assert refusal.field == 'toolsets'
+
+
 def test_a_clean_launch_still_builds(tmp_path):
     """The naming must not turn a valid launch into a refusal."""
     policy = build_policy({'source': 'cli', 'cwd': str(tmp_path), 'model': 'fixture'}, dict(_CFG))

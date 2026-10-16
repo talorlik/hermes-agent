@@ -419,6 +419,10 @@ def _resolve_toolsets(params, config, source, safe_mode, coding_posture=False, b
     if 'toolsets' in params:
         if not isinstance(explicit, list):
             _refuse('toolsets', f'must be a list of toolset names, got {type(explicit).__name__}')
+        # Oneshot reserved sentinel: exact ["none"] is an explicit empty toolset, not a registry
+        # name. Dream and `hermes -z -t none` send it on bypass launches. Any other mix stays a typo.
+        if explicit == ['none']:
+            explicit = []
         # The CLI validator's rule: a configured MCP server's toolset registers only after its first
         # connect, so an offline server is inactive, not a typo (#138748, #139154). A bypass launch never
         # reads the profile, so it takes the in-process registry alone.
