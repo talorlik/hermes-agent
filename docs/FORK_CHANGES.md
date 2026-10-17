@@ -174,21 +174,23 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ONESHOT-ISOLATION: explicit zero-tool isolation for oneshot runs
-- Commits: 1c6bc9f3afd9efd69dc3a0a0d1a8fbfeed6036cc, 4b1fe5f7723202224e13d62b91825532b8b84aba, 9a1ce849032259bf36c545e85db96fe86a864db3
+- Commits: 1c6bc9f3afd9efd69dc3a0a0d1a8fbfeed6036cc, 31d82ac6fb0c36d0583b5c0146918dea9239394c, 4b1fe5f7723202224e13d62b91825532b8b84aba, 9a1ce849032259bf36c545e85db96fe86a864db3
 - Owned-Files:
   - agent/agent_init.py
+  - gateway/session_policy.py
   - hermes_cli/_parser.py
   - hermes_cli/main.py
   - hermes_cli/oneshot.py
   - model_tools.py
   - tests/hermes_cli/test_mcp_startup.py
   - tests/hermes_cli/test_oneshot_skills.py
+  - tests/gateway/test_session_policy_refusal_fields.py
   - tests/hermes_cli/test_startup_plugin_gating.py
   - tests/test_model_tools.py
   - tests/tools/test_model_tools.py
-- Intent: A oneshot invocation that requests zero tools gets exactly zero tools: no MCP startup, no builtin tool discovery leaking into the run.
-- Protected-Invariant: Explicitly tool-less oneshot runs never load or expose any toolset.
-- Tests: tests/hermes_cli/test_oneshot_skills.py, tests/hermes_cli/test_mcp_startup.py, tests/test_model_tools.py
+- Intent: A oneshot invocation that requests zero tools gets exactly zero tools: no MCP startup, no builtin tool discovery leaking into the run. Gateway session.create accepts exact toolsets=['none'] as that empty set and still refuses mixed or unknown names.
+- Protected-Invariant: Explicitly tool-less oneshot runs never load or expose any toolset. Exact toolsets=['none'] is the reserved empty set; mixed lists and other spellings still refuse.
+- Tests: tests/hermes_cli/test_oneshot_skills.py, tests/hermes_cli/test_mcp_startup.py, tests/gateway/test_session_policy_refusal_fields.py, tests/test_model_tools.py
 - Retirement-Condition: Upstream enforces explicit zero-tool isolation on the oneshot path.
 - Disposition: active
 
@@ -462,7 +464,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-CONFIG-SCOPE: last-good config recovery and managed-scope layer shapes
-- Commits: none
+- Commits: 39fb95ec47655e743f540948f0704d5eb5932539
 - Owned-Files:
   - hermes_cli/config.py
   - hermes_cli/config_effective.py
@@ -490,7 +492,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 54
+- Ledger-Revision: 55
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
