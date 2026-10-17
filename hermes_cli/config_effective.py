@@ -30,25 +30,8 @@ _LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
 _EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
 
 
-class _CacheEntry(NamedTuple):
-    """One effective mapping with what identifies the two files it was built from and what each
-    looked like to the read behind it. Never handed out; ``effective`` leaves only as a copy."""
-    # utils.file_signature of the user file; None when there was no file.
-    user_sig: Optional[Tuple[int, int, int, int]]
-    # Which managed file was read, in which state: the scope's own path beside its signature, so
-    # two scopes whose files stat alike are still two entries.
 def _effective(raw: dict[str, Any]) -> dict[str, Any]:
-    # Each layer retains its own resolver, even when both reference the same variable.
     expanded = _config._expand_env_vars(raw)
-    # The user file as seen by the parse that produced ``effective``, recorded only when that
-    # parse was this loader's own (or there was no file). None when the mapping came from
-    # ``_RAW_CONFIG_CACHE``: another reader normalized that one (a null root is stored as
-    # ``{}``), so nothing here saw the file.
-    user_shape: Optional[_LayerShape]
-    # The managed file as seen by the read whose mapping was merged into ``effective``. None when
-    # that merge failed, so ``effective`` does not carry the layer the shape would describe. Never
-    # one with ``unreadable`` set: a result whose managed layer could not be read is not cached.
-    managed_shape: Optional[_LayerShape]
     merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
@@ -87,12 +70,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)
-    strict = strict_structure or strict_section is not None
     with _config._CONFIG_LOCK:
         user_sig, cache_sig = _config._load_config_cache_sig(config_path)
         cached = _EFFECTIVE_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:8] == cache_sig:
-            # saw; without the record it falls through and reads the layers itself.
             if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
                 return copy.deepcopy(cached[8])
 
@@ -101,8 +82,6 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
         if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
             raw = copy.deepcopy(raw_hit[4])  # one parse per process, shared with read_raw_config()
-            # A matching raw-cache read is the current user authority, just like a new parse.
-            # Replace older recovery data and own a copy before expansion or callers mutate it.
             _LAST_GOOD_USER_RAW.setdefault(path_key, copy.deepcopy(raw))
         elif user_sig is not None:
             try:
@@ -130,7 +109,6 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         effective = _effective(raw)
         # A recovered result is never cached under the corrupt file's signature: a later
         # ``fail_closed`` caller must still see the parse error, not a cache hit.
-        # (``_read_managed_config``), and an entry here would outlive it under an unchanged
         if cache_sig is not None and not recovered:
             _EFFECTIVE_CACHE[path_key] = (*cache_sig, copy.deepcopy(effective), env_snapshot)
         else:
