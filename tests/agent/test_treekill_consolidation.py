@@ -21,7 +21,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -72,7 +72,28 @@ class TestCodeExecutionDelegation:
         proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=5)
         code_execution_tool._kill_process_group(proc, escalate=True)
         assert calls == [(6666, _signal.SIGTERM), (6666, _signal.SIGKILL)]
-        proc.wait.assert_called_once_with(timeout=5)
+        assert proc.wait.call_args_list == [call(timeout=5), call(timeout=5)]
+
+    def test_escalate_reaps_after_sigkill(self, monkeypatch):
+        import signal as _signal
+
+        from tools import code_execution_tool
+
+        calls = []
+        monkeypatch.setattr(
+            deadline_mod,
+            "kill_process_tree",
+            lambda pid, sig=None: calls.append((pid, sig)) or True,
+        )
+        proc = MagicMock()
+        proc.pid = 6667
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="x", timeout=5),
+            0,
+        ]
+        code_execution_tool._kill_process_group(proc, escalate=True)
+        assert calls == [(6667, _signal.SIGTERM), (6667, _signal.SIGKILL)]
+        assert proc.wait.call_count == 2
 
     def test_swallows_delegation_raise_falls_back_to_plain_kill(self, monkeypatch):
         from tools import code_execution_tool

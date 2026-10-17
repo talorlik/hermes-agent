@@ -820,6 +820,16 @@ def _kill_process_group(proc, escalate: bool = False):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             _tree_signal(getattr(_signal, "SIGKILL", None))
+            # SIGKILL without a following wait leaves a defunct child. The
+            # parent is often a long-lived gateway, so the zombie stays until
+            # something else polls this Popen.
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.poll()
+                except Exception:
+                    pass
 
 
 def _load_config() -> dict:

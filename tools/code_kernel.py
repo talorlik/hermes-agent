@@ -317,8 +317,10 @@ class SessionKernel:
         self.cell_log_start = 0
         self.tool_call_counter: list[int] = [0]
         # Cells currently attached (bumped under the registry lock on selection, dropped when the
-        # cell settles). Reaping/cap-eviction skip attached kernels: tearing one down mid-spawn
-        # rmtree'd the staging dir under the spawner and killed live cells.
+        # cell settles). Reaping and cap-eviction must not teardown an attached kernel: the
+        # cell's finally/discard owns that, even if the child has already exited (poll() alone
+        # reaps the zombie). Tearing one down mid-cell closed death_pipe_w and rmtree'd the
+        # staging dir under the spawner.
         self.attached: int = 0
         # Owned by a live delegate_task child: exempt from LRU eviction (the child's teardown disposes it).
         self.pinned: bool = False
@@ -512,6 +514,11 @@ def _stdout_reader(kernel: SessionKernel) -> None:
         if not chunk:
             if buf:
                 raw(buf)
+            if kernel.proc is not None:
+                try:
+                    kernel.proc.poll()
+                except Exception:
+                    pass
             kernel.response_q.put({"status": "kernel-eof"})
             return
         buf += chunk
@@ -725,12 +732,37 @@ def _sweep_stale_staging_dirs(now: Optional[float] = None) -> int:
     return removed
 
 
+def _pop_exited_kernels() -> list[SessionKernel]:
+    """Pop idle kernels whose child has already exited.
+
+    Every registered child is poll()'d so an exited process is reaped.
+    ``attached > 0`` means a host cell is still inside
+    ``execute_in_session_kernel``: leave the kernel registered so that
+    cell's finally/discard owns teardown. Closing ``death_pipe_w`` or
+    rmtree'ing ``tmpdir`` from here would race the live cell.
+    """
+    doomed: list[SessionKernel] = []
+    for key in list(_KERNELS):
+        kernel = _KERNELS[key]
+        proc = kernel.proc
+        if proc is None:
+            continue
+        try:
+            exited = proc.poll() is not None
+        except Exception:
+            continue
+        if exited and kernel.attached == 0:
+            doomed.append(_KERNELS.pop(key))
+    return doomed
+
+
 def _reap_once() -> None:
-    """One background pass: the acquire-path idle criteria, then the stale-dir sweep."""
+    """One background pass: exited children, then idle criteria, then stale dirs."""
     _, idle_timeout = _lifecycle_limits()
     with _REGISTRY.lock:
+        exited = _pop_exited_kernels()
         expired = _pop_idle_expired(time.monotonic(), idle_timeout)
-    for doomed in expired:
+    for doomed in exited + expired:
         doomed.teardown()
     _sweep_stale_staging_dirs()
 

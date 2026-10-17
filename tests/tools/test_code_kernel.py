@@ -606,3 +606,90 @@ class TestStaleStagingDirSweep(unittest.TestCase):
                 self.assertFalse(old.exists())
                 self.assertTrue(young.exists())
                 self.assertTrue(bystander.exists())
+
+
+class _DeadProc:
+    """A child that has already exited. poll() is the reap."""
+
+    def __init__(self):
+        self.polls = 0
+        self.returncode = None
+
+    def poll(self):
+        self.polls += 1
+        self.returncode = 0
+        return 0
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+
+class TestDeadKernelIsReaped(unittest.TestCase):
+    def _close(self, fd: int) -> None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def test_reap_once_polls_attached_dead_kernel_and_leaves_it(self):
+        import shutil
+
+        from tools.code_kernel import SessionKernel, _KERNELS, _REGISTRY, _reap_once
+
+        kernel = SessionKernel(("dead-owner", "project", "python", "/tmp", ()))
+        proc = _DeadProc()
+        kernel.proc = proc  # type: ignore[assignment]
+        kernel.attached = 1
+        death_r, death_w = os.pipe()
+        kernel.death_pipe_w = death_w
+        tmp = tempfile.mkdtemp(prefix="reap_attached_")
+        kernel.tmpdir = tmp
+        with _REGISTRY.lock:
+            _KERNELS[kernel.key] = kernel
+        try:
+            _reap_once()
+            self.assertGreaterEqual(proc.polls, 1)
+            self.assertIs(_KERNELS.get(kernel.key), kernel)
+            self.assertEqual(kernel.attached, 1)
+            self.assertFalse(kernel.stop_event.is_set())
+            self.assertEqual(kernel.death_pipe_w, death_w)
+            os.fstat(death_w)
+            self.assertTrue(os.path.isdir(tmp))
+        finally:
+            with _REGISTRY.lock:
+                _KERNELS.pop(kernel.key, None)
+            self._close(death_r)
+            self._close(death_w)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_reap_once_pops_and_tears_down_unattached_exited_kernel(self):
+        import shutil
+
+        from tools.code_kernel import SessionKernel, _KERNELS, _REGISTRY, _reap_once
+
+        kernel = SessionKernel(("dead-idle", "project", "python", "/tmp", ()))
+        proc = _DeadProc()
+        kernel.proc = proc  # type: ignore[assignment]
+        kernel.attached = 0
+        death_r, death_w = os.pipe()
+        kernel.death_pipe_w = death_w
+        tmp = tempfile.mkdtemp(prefix="reap_idle_")
+        kernel.tmpdir = tmp
+        with _REGISTRY.lock:
+            _KERNELS[kernel.key] = kernel
+        try:
+            _reap_once()
+            self.assertGreaterEqual(proc.polls, 1)
+            self.assertNotIn(kernel.key, _KERNELS)
+            self.assertTrue(kernel.stop_event.is_set())
+            self.assertIsNone(kernel.death_pipe_w)
+            with self.assertRaises(OSError):
+                os.fstat(death_w)
+            self.assertFalse(os.path.exists(tmp))
+        finally:
+            with _REGISTRY.lock:
+                _KERNELS.pop(kernel.key, None)
+            self._close(death_r)
+            self._close(death_w)
+            shutil.rmtree(tmp, ignore_errors=True)
