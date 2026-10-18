@@ -60,6 +60,7 @@ grep -i "failed to send\|error" ~/.hermes/logs/gateway.log | tail -20
 ```
 
 Common gateway problems:
+- **Defunct kernel child**: state Z means the child already exited. `kill -9` does not reap it; only the parent `wait` or `poll` does. After SIGKILL, wait. On stdout EOF, poll. An attached count does not mean the process is still alive, so collect exited kernels even when attached.
 - **Gateway dies on SSH logout**: Enable linger: `sudo loginctl enable-linger $USER`
 - **Gateway dies on WSL2 close**: WSL2 requires `systemd=true` in `/etc/wsl.conf` for systemd services to work. Without it, gateway falls back to `nohup` (dies when session closes).
 - **Gateway crash loop**: Reset the failed state: `systemctl --user reset-failed hermes-gateway`
