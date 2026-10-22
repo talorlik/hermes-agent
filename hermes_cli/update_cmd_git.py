@@ -6,8 +6,8 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
-import re
-import shutil
+import os
+import shlex
 from contextlib import nullcontext, suppress
 import subprocess
 import sys
@@ -391,13 +391,11 @@ _SAFE_RECOVERY_REF_RE = re.compile(r"^refs/tags/pre-upstream-sync-[0-9]{8}-[0-9]
 
 _SYNC_OPERATION_MARKERS = {
     See #97052.
-def _safe_recovery_ref(value: object) -> str | None:
 def _finish_sync_outcome(
     if not isinstance(pre_sha, str) or _FULL_SHA_RE.fullmatch(pre_sha) is None:
         evidence_errors.append("missing or invalid pre-sync HEAD SHA")
     if not isinstance(post_sha, str) or _FULL_SHA_RE.fullmatch(post_sha) is None:
         evidence_errors.append("missing or invalid post-sync HEAD SHA")
-        evidence_errors.append("a no-op synchronization changed HEAD")
 def _verify_origin_main_postcondition(
 ) -> GitCommandObservation:
         or _FULL_SHA_RE.fullmatch(expected_sha) is None
@@ -409,20 +407,6 @@ def _verify_origin_main_postcondition(
         _should_skip_upstream_prompt() or not _offer_upstream_remote(git_cmd, cwd, assume_yes=assume_yes, input_fn=input_fn)
     ):
         return False
-def _validate_fork_sync_candidate(
-) -> bool:
-    tests_ok, test_detail = _run_fork_sync_tests(cwd)
-def _offer_upstream_remote_observed(
-) -> tuple[str, str]:
-    """Offer setup and retain exact add-command evidence on failure."""
-    """Return the validated fork synchronization policy."""
-def _sync_with_upstream_observed(
-) -> UpstreamSyncOutcome:
-    """Run the complete mutating sync behind a BaseException recovery boundary."""
-def _sync_with_upstream_observed_impl(
-) -> UpstreamSyncOutcome:
-    if not isinstance(pre_sha, str) or _FULL_SHA_RE.fullmatch(pre_sha) is None:
-        return finish("failed", "missing or invalid pre-sync HEAD SHA")
     print("\n→ Fetching upstream...")
     try:
         run_git(git_cmd, ["fetch", "upstream", tracking_refspec("upstream", "main"), "--quiet"], cwd=cwd, capture_output=True, check=True, **_no_prompt_git_kwargs())
@@ -442,7 +426,6 @@ def _sync_with_upstream_observed_impl(
             f"\nℹ Your fork has {origin_ahead} commit(s) not on upstream.\n"
             "  Skipping upstream sync to preserve your changes.\n"
             "  If you want to merge upstream changes, run:\n    git pull upstream main"
-            "  (set updates.fork_sync_strategy: merge in config.yaml to do this automatically)"
         )
         return True
     if upstream_ahead == 0:
@@ -527,6 +510,34 @@ def _has_http_code(stderr: str, *codes: str) -> bool:
     return any(f"HTTP {code}" in stderr or f"returned error: {code}" in stderr for code in codes)
 
 
+def _damaged_checkout_message(root: Path) -> str:
+    """The repair for a checkout git rejects: the installer pointed at THIS checkout (a bare one-liner
+    would rebuild the default directory and leave a ``--dir`` install broken)."""
+    if sys.platform == "win32":
+        quoted = "'" + str(root).replace("'", "''") + "'"
+        repair = ("& ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1)))"
+                  f" -InstallDir {quoted}")
+    else:
+        repair = f"curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --dir {shlex.quote(str(root))}"
+    return (f"✗ This Hermes checkout's git data is damaged (git no longer recognizes {root / '.git'}),"
+            " so it cannot be updated in place.\n"
+            "  Run the installer again to repair it; it moves the damaged checkout aside and keeps"
+            f" your config and chats:\n    {repair}")
+
+
+def _checkout_rejected_by_git(stderr: str, git_cmd, root: Path) -> bool:
+    """The fetch failed because git cannot open *root* itself, not because of its remote.
+
+    git prints the same ``fatal: not a git repository`` for a remote whose ``.git`` is broken, so the
+    stderr line alone is not proof: the checkout must also fail to resolve as its own top level.
+    """
+    if not any(line.startswith("fatal: not a git repository") for line in stderr.splitlines()):
+        return False
+    top = _git_run(git_cmd, ["rev-parse", "--show-toplevel"], cwd=root)
+    return top.returncode != 0 or os.path.normcase(os.path.realpath(top.stdout.strip())) != os.path.normcase(
+        os.path.realpath(root))
+
+
 # Ordered (predicate, diagnosis): curl reports HTTP errors as ``unable to access '<url>': ... error: 429``,
 # so rate-limit/outage checks must run BEFORE the generic "unable to access" check. An anonymous fetch
 # answered with HTTP 401 ("could not read Username") is GitHub during an outage (or a renamed/private
@@ -560,10 +571,13 @@ def _classify_fetch_failure(stderr: str) -> str:
     return next((message for matches, message in _FETCH_FAILURE_RULES if matches(stderr)), "✗ Failed to fetch updates from origin.")
 
 
-def _print_fetch_failure(stderr: str) -> None:
-    """Print the classified diagnosis plus bounded raw stderr for diagnosis."""
+def _print_fetch_failure(stderr: str, *, git_cmd=None, root: Optional[Path] = None) -> None:
+    """Print the classified diagnosis plus bounded raw stderr for diagnosis. With *root*, a checkout
+    git rejects (no fetch can ever work; the ZIP fallback cannot tell user edits apart) gets the
+    installer repair instead."""
     stderr = (stderr or "").strip()
-    print(_classify_fetch_failure(stderr))
+    damaged = root is not None and _checkout_rejected_by_git(stderr, git_cmd, Path(root))
+    print(_damaged_checkout_message(Path(root)) if damaged else _classify_fetch_failure(stderr))
     if stderr:
         lines = stderr.splitlines()
         for line in lines[:15]:
