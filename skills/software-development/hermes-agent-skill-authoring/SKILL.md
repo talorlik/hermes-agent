@@ -1,7 +1,7 @@
 ---
 name: hermes-agent-skill-authoring
 description: "Author in-repo SKILL.md files: frontmatter and structure."
-version: 2.0.0
+version: 2.0.2
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -195,6 +195,10 @@ A skill exists to make the agent's process more predictable — the agent reliab
 8. **Skipping the docs generator or pushing its unrelated drift.** Both directions are wrong: no regen = orphan skill with no docs page; blind regen = a ballooned diff full of other skills' drift.
 9. **Expecting the current session to see the new skill.** The loader is initialized at session start.
 10. **Letting skills accumulate sediment.** When adding a rule, remove the old wording it replaces.
+11. **Scoping a prohibition.** "Until step N", "while Y", "only to mark done", and "at this sentence" re-enable the action outside that scope. A heal run of the same command is still that action. If it must never happen, write that it does not apply at any step, for any reason, including the done mark.
+12. **"Follow the existing procedure" imports its close.** Card-complete, skip, and sweeper sentences in the followed file become this command's close unless the same paragraph withdraws them.
+13. **A verification line that accepts a named leftover as done.** A zero-leftover command then ends with leftovers. The done predicate is the empty inventory.
+14. **"Do not ask" leaves an approval wait.** Another skill's "stay until a named person approves" sentence is still in force. Withdraw that wait at every step and require the gated work. Pre-approved is not a done mark, and it does not authorize a forbidden action.
 
 ## Verification Checklist
 
