@@ -571,6 +571,30 @@ def test_capped_completion_attempts_leave_marker_for_explicit_update(source_laun
 
 
 @pytest.mark.platforms("posix")
+def test_capped_launch_does_not_reexec_the_store_python(source_launch, monkeypatch):
+    """A capped launch already on the store interpreter must not relaunch into itself.
+
+    Returning that same path makes bootstrap execv the launcher again. Each
+    pass embeds the previous command line until the spawn dies with E2BIG.
+    """
+    root, store_python, _ = source_launch
+    from pm.lock import Lockfile
+
+    pm.sync_venv(["all"], explicit=True, project_root=root)
+    pin = Lockfile(paths.lockfile_path())
+    pin.set_pin("python", "stale", {})
+    pin.save()
+    assert not pm.venv_is_current(project_root=root)
+    venv_sync.arm_completion(root)
+    venv_sync._completion_attempts_path(root).write_text(
+        f"{venv_sync.COMPLETION_RETRY_MAX_ATTEMPTS}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(sys, "executable", str(store_python))
+
+    assert venv_sync.prepare_launch(root, []) is None
+
+
+@pytest.mark.platforms("posix")
 def test_failed_tail_attempt_is_counted_and_success_clears_it(source_launch, tmp_path, monkeypatch, capsys):
     """A failing completion tail records the attempt; the successful retry clears the record."""
     root, store_python, _ = source_launch

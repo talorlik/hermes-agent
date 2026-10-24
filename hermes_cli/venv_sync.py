@@ -448,6 +448,12 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     # venv interpreter symlinked to the same binary is still a different
     # interpreter (its own sys.prefix) and must re-exec once.
     same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    capped = not _may_retry and _attempts >= COMPLETION_RETRY_MAX_ATTEMPTS
+    # A capped launch already on the store interpreter must not execv itself.
+    # The launcher is a python -c script; each self-exec embeds the previous
+    # command line until the spawn dies with E2BIG and the tail stays owed.
+    if same and capped:
+        return None
     if not current or not same:
         publish_launchers(root)
         return python
