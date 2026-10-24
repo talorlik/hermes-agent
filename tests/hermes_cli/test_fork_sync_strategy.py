@@ -39,6 +39,13 @@ def _patch_managed_uv():
         yield
 
 
+def test_update_git_module_imports() -> None:
+    """A spliced module-level line must not make the update git module unimportable."""
+    import importlib
+
+    importlib.import_module("hermes_cli.update_cmd_git")
+
+
 def test_fork_sync_gate_runs_only_dedicated_candidate_tests() -> None:
     calls: list[list[str]] = []
 

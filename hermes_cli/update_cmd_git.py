@@ -367,7 +367,6 @@ def _offer_upstream_remote(git_cmd: list[str], cwd: Path, *, assume_yes: bool, i
     return True
 
 
-_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 class UpstreamTargetBroken(Exception):
     """The fork sync's upstream target fails the startup syntax check: refused before its move."""
 
@@ -380,7 +379,6 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
                                   checkout_move=None) -> bool:
     """Offer to add ``upstream``, compare origin/main vs upstream/main, ff-pull when strictly behind, then push origin.
 
-_SAFE_RECOVERY_REF_RE = re.compile(r"^refs/tags/pre-upstream-sync-[0-9]{8}-[0-9]{6}$")
     Returns True only when origin/main was actually verified against upstream/main; False when the check never
     happened, so the caller never reports "up to date" on an origin-only compare. Fetches only upstream/main:
     a bare fetch drags in thousands of auto-generated branches. ``UpstreamTargetBroken`` when the
@@ -389,16 +387,7 @@ _SAFE_RECOVERY_REF_RE = re.compile(r"^refs/tags/pre-upstream-sync-[0-9]{8}-[0-9]
     ``checkout_move(target)`` is the caller's context for the one tree write (the merge): the
     paused gateways' tree gate is bound to *target* before git writes a file.
 
-_SYNC_OPERATION_MARKERS = {
     See #97052.
-def _finish_sync_outcome(
-    if not isinstance(pre_sha, str) or _FULL_SHA_RE.fullmatch(pre_sha) is None:
-        evidence_errors.append("missing or invalid pre-sync HEAD SHA")
-    if not isinstance(post_sha, str) or _FULL_SHA_RE.fullmatch(post_sha) is None:
-        evidence_errors.append("missing or invalid post-sync HEAD SHA")
-def _verify_origin_main_postcondition(
-) -> GitCommandObservation:
-        or _FULL_SHA_RE.fullmatch(expected_sha) is None
     """
     from hermes_cli.update_cmd import _count_commits_between, _has_upstream_remote, _no_prompt_git_kwargs, _should_skip_upstream_prompt
     from hermes_cli.update_cmd_check import tracking_refspec
@@ -431,7 +420,6 @@ def _verify_origin_main_postcondition(
     if upstream_ahead == 0:
         print("  ✓ Fork is up to date with upstream")
         return True
-    sync_tag = f"pre-upstream-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     print(f"\n→ Fork is {upstream_ahead} commit(s) behind upstream\n→ Pulling from upstream...")
     # A tree move like the pull itself: the marker and the owed tail are armed before git writes,
     # and the just-fetched ref is merged (a second `git pull` fetch could move past the marker's target).
