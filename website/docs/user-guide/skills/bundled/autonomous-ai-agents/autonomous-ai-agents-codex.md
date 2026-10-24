@@ -158,6 +158,16 @@ terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ```
 
+## Commit review from a gateway
+
+`codex exec review --commit` rejects `--sandbox`. Do not pass that flag to the review subcommand. From a gateway session, review in the worktree with `pty=true`:
+
+```
+codex exec -m gpt-6-astra -s danger-full-access --ephemeral --ignore-rules -o <outfile> "<prompt>"
+```
+
+Put the commit SHA, the defect, and the proof in the prompt. Tell the reviewer a missing ledger claim is not a code defect when that claim is a later commit: a squash deletes the branch SHA, so the claim cannot exist on the reviewed commit.
+
 ## Rules
 
 1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
