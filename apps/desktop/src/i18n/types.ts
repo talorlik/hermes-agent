@@ -24,6 +24,7 @@ import type { ModelSettingsTranslations } from './types_model_settings'
 import type { NoticeTranslations } from './types_notices'
 import type { NotificationSettingsTranslations } from './types_notifications'
 import type { OnboardingTranslations } from './types_onboarding'
+import type { PluginPreviewAccessTranslations } from './types_plugin_preview_access'
 import type { PluginUpdateTranslations } from './types_plugin_update'
 import type { SidebarProjectsTranslations } from './types_projects'
 import type { SharedMetricsTranslations } from './types_shared_metrics'
@@ -1888,7 +1889,8 @@ catalog: CatalogTranslations
     skillArchivedTitle: string
     skillArchivedMessage: string
     tabPlugins: string
-    plugins: PluginUpdateTranslations & {
+    plugins: PluginUpdateTranslations &
+      PluginPreviewAccessTranslations & {
       agentTitle: string
       agentBlurb: string
       pageBlurb: string
@@ -3378,27 +3380,27 @@ catalog: CatalogTranslations
     signIn: string
     signInHeading: string
     settingUp: string
-    codeBody: string
-    copyLink: string
+    finishInBrowser: string
     doNotShare: string
+    openPageAgain: string
     waiting: string
     finishingHeading: string
     finishingBody: string
-    signedInAs: (email: string) => string
+    /** Over the account email on the completed screen. */
+    signedInAsLabel: string
     signedIn: string
     completedBody: string
+    /** The free tier's apps: reconnect the ones that did not move; open Connectors to check. */
+    reconnect: string
+    openConnectors: string
     defaultModel: string
     change: string
     done: string
     notNow: string
     tryAgain: string
-    startAgain: string
     didNotComplete: string
-    rejectedBody: string
-    supersededBody: string
     timedOutHeading: string
     timedOutBody: string
-    retiredBody: string
     errorBody: string
     /** The account service asked for a short wait mid sign-in (a busy account, a rate limit, the ops pause). */
     busyHeading: string

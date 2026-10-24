@@ -14,6 +14,7 @@ import { esModelSettings } from './es_model_settings'
 import { esNotices } from './es_notices'
 import { esNotifications } from './es_notifications'
 import { esOnboarding } from './es_onboarding'
+import { esPluginPreviewAccess } from './es_plugin_preview_access'
 import { esPluginUpdate } from './es_plugin_update'
 import { esProjects } from './es_projects'
 import { esSharedMetrics } from './es_shared_metrics'
@@ -2487,6 +2488,7 @@ export const esOverrides = {
         `Fijado al commit ${sha}. Las actualizaciones se rechazan hasta que se reinstale con un nuevo commit fijado.`,
       pinnedBadge: (sha: string) => `fijado @ ${sha}`,
       ...esPluginUpdate,
+      ...esPluginPreviewAccess,
       uninstall: 'Desinstalar',
       uninstallTip: (name: string, profile: string) => `Desinstalar ${name} de ${profile}`,
       uninstallConfirmTitle: (name: string) => `¿Desinstalar ${name}?`,
@@ -3821,7 +3823,7 @@ export const esOverrides = {
       '/init': 'Generar o actualizar las instrucciones de proyecto AGENTS.md a partir de un análisis del repositorio',
       '/suggestions': 'Revisar las automatizaciones sugeridas (aceptar/descartar)',
       '/blueprint': 'Configurar una automatización a partir de una plantilla',
-      '/browser': 'Gestionar el navegador del agente [connect|disconnect|status|use]',
+      '/browser': 'Gestionar el navegador del agente [connect|disconnect|status]',
       '/palette': 'Abrir la paleta de comandos aproximada (también Ctrl+P)',
       '/usage':
         'Mostrar el uso de tokens y los límites de frecuencia; `reset` canjea un restablecimiento de límite de Codex acumulado',
@@ -4334,29 +4336,25 @@ export const esOverrides = {
     signIn: 'Iniciar sesión',
     signInHeading: 'Inicia sesión con una cuenta de Nous para desbloquear más modelos y herramientas.',
     settingUp: 'Configurando la inferencia gratuita…',
-    codeBody: 'Introduce este código en tu navegador para terminar de iniciar sesión.',
-    copyLink: 'Copiar enlace',
+    finishInBrowser: 'Termina en tu navegador',
     doNotShare: 'No compartas este código.',
+    openPageAgain: 'Abrir la página de nuevo',
     waiting: 'Esperando el inicio de sesión…',
     finishingHeading: 'Terminando el inicio de sesión…',
     finishingBody: 'Aprobado en el navegador. Obteniendo los tokens de tu cuenta.',
-    signedInAs: (email: string) => `Sesión iniciada como ${email}`,
+    signedInAsLabel: 'Sesión iniciada como',
     signedIn: 'Sesión iniciada.',
     completedBody: 'Tu cuenta ya incluye inferencia y herramientas.',
+    reconnect: 'Reconectar',
+    openConnectors: 'Abrir Conectores',
     defaultModel: 'Modelo predeterminado',
     change: 'Cambiar',
     done: 'Listo',
     notNow: 'Ahora no',
     tryAgain: 'Reintentar',
-    startAgain: 'Empezar de nuevo',
     didNotComplete: 'No se completó el inicio de sesión',
-    rejectedBody: 'No pasa nada, sigues en el servicio gratuito de Nous. Inicia sesión cuando quieras.',
-    supersededBody:
-      'Un código de inicio de sesión más reciente sustituyó a este. Usa el más reciente o empieza de nuevo.',
     timedOutHeading: 'Ese enlace de inicio de sesión caducó',
     timedOutBody: 'Empieza de nuevo cuando quieras. Sigues en el servicio gratuito de Nous.',
-    retiredBody:
-      'Tu sesión terminó antes de completar el inicio de sesión. Hermes iniciará una nueva; luego vuelve a iniciar sesión cuando quieras.',
     errorBody: 'No se completó el inicio de sesión. Vuelve a intentarlo cuando quieras.',
     busyHeading: 'Ya casi está',
     busyBody: (wait: string) =>

@@ -20,6 +20,7 @@ import { enModelSettings } from './en_model_settings'
 import { enNotices } from './en_notices'
 import { enNotifications } from './en_notifications'
 import { enOnboarding } from './en_onboarding'
+import { enPluginPreviewAccess } from './en_plugin_preview_access'
 import { enPluginUpdate } from './en_plugin_update'
 import { enProjects } from './en_projects'
 import { enSharedMetrics } from './en_shared_metrics'
@@ -2135,6 +2136,7 @@ export const en: Translations = {
         `Pinned to commit ${sha}. Updates are refused until it is reinstalled with a new pin.`,
       pinnedBadge: (sha: string) => `pinned @ ${sha}`,
       ...enPluginUpdate,
+      ...enPluginPreviewAccess,
       uninstall: 'Uninstall',
       uninstallTip: (name: string, profile: string) => `Uninstall ${name} from ${profile}`,
       uninstallConfirmTitle: (name: string) => `Uninstall ${name}?`,
@@ -3395,7 +3397,7 @@ export const en: Translations = {
       '/init': 'Generate or update AGENTS.md project instructions from a repo scan',
       '/suggestions': 'Review suggested automations (accept/dismiss)',
       '/blueprint': 'Set up an automation from a blueprint template',
-      '/browser': 'Manage the agent browser [connect|disconnect|status|use]',
+      '/browser': 'Manage the agent browser [connect|disconnect|status]',
       '/palette': 'Open the fuzzy command palette (also Ctrl+P)',
       '/usage': 'Show token usage and rate limits; `reset` redeems a banked Codex limit reset',
       '/subscription': 'View your Nous plan and change it in the browser',
@@ -3911,28 +3913,25 @@ export const en: Translations = {
     signIn: 'Sign in',
     signInHeading: 'Sign in with a Nous account to unlock more models and tools.',
     settingUp: 'Setting up free inference…',
-    codeBody: 'Enter this code in your browser to finish signing in.',
-    copyLink: 'Copy link',
-    doNotShare: 'Do not share this code.',
+    finishInBrowser: 'Finish in your browser',
+    doNotShare: 'Do not share it.',
+    openPageAgain: 'Open page again',
     waiting: 'Waiting for sign-in…',
     finishingHeading: 'Finishing sign-in…',
     finishingBody: 'Approved in the browser. Collecting your account tokens.',
-    signedInAs: email => `Signed in as ${email}`,
+    signedInAsLabel: 'Signed in as',
     signedIn: 'Signed in.',
     completedBody: 'Your account now carries inference and tools.',
+    reconnect: 'Reconnect',
+    openConnectors: 'Open Connectors',
     defaultModel: 'Default model',
     change: 'Change',
     done: 'Done',
     notNow: 'Not now',
     tryAgain: 'Try again',
-    startAgain: 'Start again',
     didNotComplete: "Sign-in didn't finish",
-    rejectedBody: "No problem, you're still on the free Nous service. Sign in whenever you're ready.",
-    supersededBody: 'A newer sign-in code replaced this one. Use the newest one, or start again.',
     timedOutHeading: 'That sign-in link has expired',
     timedOutBody: "Start again whenever you're ready. You're still on the free Nous service.",
-    retiredBody:
-      "Your session ended before the sign-in finished. Hermes will start a new one; then sign in again whenever you're ready.",
     errorBody: "Sign-in didn't finish. Try again whenever you're ready.",
     busyHeading: 'Almost there',
     busyBody: wait =>

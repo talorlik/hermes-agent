@@ -13,6 +13,7 @@ import { deModelSettings } from './de_model_settings'
 import { deNotices } from './de_notices'
 import { deNotifications } from './de_notifications'
 import { deOnboarding } from './de_onboarding'
+import { dePluginPreviewAccess } from './de_plugin_preview_access'
 import { dePluginUpdate } from './de_plugin_update'
 import { deProjects } from './de_projects'
 import { deSharedMetrics } from './de_shared_metrics'
@@ -2495,6 +2496,7 @@ export const deOverrides = {
         `An Commit ${sha} gepinnt. Updates werden abgelehnt, bis es mit einem neuen Pin neu installiert wird.`,
       pinnedBadge: sha => `gepinnt @ ${sha}`,
       ...dePluginUpdate,
+      ...dePluginPreviewAccess,
       uninstall: 'Deinstallieren',
       uninstallTip: (name: string, profile: string) => `${name} aus ${profile} deinstallieren`,
       uninstallConfirmTitle: (name: string) => `${name} deinstallieren?`,
@@ -3831,7 +3833,7 @@ export const deOverrides = {
       '/init': 'AGENTS.md-Projektanweisungen aus einem Repo-Scan erzeugen oder aktualisieren',
       '/suggestions': 'Vorgeschlagene Automatisierungen prüfen (annehmen/verwerfen)',
       '/blueprint': 'Eine Automatisierung aus einer Blueprint-Vorlage einrichten',
-      '/browser': 'Browser des Agenten verwalten [connect|disconnect|status|use]',
+      '/browser': 'Browser des Agenten verwalten [connect|disconnect|status]',
       '/palette': 'Die unscharfe Befehlspalette öffnen (auch Strg+P)',
       '/usage': 'Token-Nutzung und Ratenlimits anzeigen; `reset` löst ein angespartes Codex-Limit-Reset ein',
       '/subscription': 'Ihren Nous-Tarif ansehen und im Browser ändern',
@@ -4343,28 +4345,25 @@ export const deOverrides = {
     signIn: 'Anmelden',
     signInHeading: 'Melden Sie sich mit einem Nous-Konto an, um mehr Modelle und Tools freizuschalten.',
     settingUp: 'Kostenlose Inferenz wird eingerichtet…',
-    codeBody: 'Geben Sie diesen Code in Ihrem Browser ein, um die Anmeldung abzuschließen.',
-    copyLink: 'Link kopieren',
+    finishInBrowser: 'Im Browser abschließen',
     doNotShare: 'Diesen Code nicht weitergeben.',
+    openPageAgain: 'Seite erneut öffnen',
     waiting: 'Warten auf Anmeldung…',
     finishingHeading: 'Anmeldung wird abgeschlossen…',
     finishingBody: 'Im Browser bestätigt. Ihre Konto-Tokens werden abgerufen.',
-    signedInAs: email => `Angemeldet als ${email}`,
+    signedInAsLabel: 'Angemeldet als',
     signedIn: 'Angemeldet.',
     completedBody: 'Ihr Konto hat jetzt Zugriff auf Inferenz und Tools.',
+    reconnect: 'Neu verbinden',
+    openConnectors: 'Konnektoren öffnen',
     defaultModel: 'Standardmodell',
     change: 'Ändern',
     done: 'Fertig',
     notNow: 'Nicht jetzt',
     tryAgain: 'Erneut versuchen',
-    startAgain: 'Neu starten',
     didNotComplete: 'Anmeldung nicht abgeschlossen',
-    rejectedBody: 'Die Anmeldung wurde im Browser abgelehnt. Sie bleiben im kostenlosen Tarif.',
-    supersededBody: 'Ein neuerer Anmeldecode hat diesen ersetzt.',
     timedOutHeading: 'Anmeldung abgelaufen',
     timedOutBody: 'Der Code wurde nicht rechtzeitig verwendet. Sie bleiben im kostenlosen Tarif.',
-    retiredBody:
-      'Diese Gratis-Tarif-Identität wurde bereits verwendet oder ist abgelaufen; beim nächsten Start wird eine neue eingerichtet.',
     errorBody: 'Die Anmeldung wurde nicht abgeschlossen; starten Sie sie erneut.',
     busyHeading: 'Fast geschafft',
     busyBody: wait =>

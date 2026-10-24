@@ -14,6 +14,8 @@ import { zhModelSettings } from './zh_model_settings'
 import { zhNotices } from './zh_notices'
 import { zhNotifications } from './zh_notifications'
 import { zhOnboarding } from './zh_onboarding'
+import { zhPluginPreviewAccess } from './zh_plugin_preview_access'
+import { zhPluginUpdate } from './zh_plugin_update'
 import { zhProjects } from './zh_projects'
 import { zhSharedMetrics } from './zh_shared_metrics'
 import { zhThemePicker } from './zh_theme_picker'
@@ -2047,6 +2049,7 @@ export const zhOverrides = {
     skillArchivedMessage: '可通过 hermes curator restore 恢复。',
     tabPlugins: '插件',
     plugins: {
+      ...zhPluginPreviewAccess,
       agentTitle: 'Agent 插件',
       agentBlurb: '为所选配置扩展 agent — 工具、钩子、模型提供方。重启网关后生效。',
       pageBlurb: '插件可以扩展本应用、agent，或两者 — 每一半都有自己的开关。',
@@ -2079,9 +2082,7 @@ export const zhOverrides = {
       catalogProvenance: (sha: string) => `从 Hermes 目录安装${sha ? `，固定提交 ${sha}` : ''}。`,
       pinnedProvenance: (sha: string) => `已固定到提交 ${sha}。重新固定前将拒绝更新。`,
       pinnedBadge: (sha: string) => `固定 @ ${sha}`,
-      updateToPin: (sha: string) => `更新到 ${sha}`,
-      updateFailed: (name: string) => `无法更新 ${name}`,
-      updated: (name: string) => `${name} 已更新到当前目录固定提交。重启网关后生效。`,
+      ...zhPluginUpdate,
       uninstall: '卸载',
       uninstallTip: (name: string, profile: string) => `从 ${profile} 卸载 ${name}`,
       uninstallConfirmTitle: (name: string) => `卸载 ${name}？`,
@@ -3289,7 +3290,7 @@ export const zhOverrides = {
       '/init': '扫描仓库并生成或更新 AGENTS.md 项目指引',
       '/suggestions': '查看建议的自动化项目（接受或跳过）',
       '/blueprint': '使用 blueprint 模板设置自动化',
-      '/browser': '管理智能体浏览器 [connect|disconnect|status|use]',
+      '/browser': '管理智能体浏览器 [connect|disconnect|status]',
       '/palette': '打开模糊搜索命令面板（也可使用 Ctrl+P）',
       '/usage': '显示 Token 用量与速率限制；`reset` 可兑换保留的 Codex 限额重置',
       '/subscription': '查看你的 Nous 方案，并在浏览器中更改',
@@ -3783,27 +3784,25 @@ export const zhOverrides = {
     signIn: '登录',
     signInHeading: '登录 Nous 账户以解锁更多模型和工具。',
     settingUp: '正在设置免费推理…',
-    codeBody: '在浏览器中输入此代码以完成登录。',
-    copyLink: '复制链接',
+    finishInBrowser: '在浏览器中完成',
     doNotShare: '请勿分享此代码。',
+    openPageAgain: '重新打开页面',
     waiting: '等待登录…',
     finishingHeading: '正在完成登录…',
     finishingBody: '已在浏览器中批准。正在获取账户令牌。',
-    signedInAs: email => `已登录为 ${email}`,
+    signedInAsLabel: '已登录为',
     signedIn: '已登录。',
     completedBody: '现在由你的账户提供推理和工具。',
+    reconnect: '重新连接',
+    openConnectors: '打开连接器',
     defaultModel: '默认模型',
     change: '更改',
     done: '完成',
     notNow: '暂不',
     tryAgain: '重试',
-    startAgain: '重新开始',
     didNotComplete: '登录未完成',
-    rejectedBody: '登录在浏览器中被拒绝。你仍在免费层。',
-    supersededBody: '一个更新的登录代码替换了此代码。',
     timedOutHeading: '登录超时',
     timedOutBody: '代码未在有效期内使用。你仍在免费层。',
-    retiredBody: '此免费层身份已被使用或已过期；下次启动时会重新设置。',
     errorBody: '登录未完成；请重试。',
     alreadySignedInHeading: '已登录。',
     alreadySignedInBody: '此 Hermes 已登录 Nous 账户。',

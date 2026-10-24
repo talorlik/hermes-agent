@@ -14,6 +14,7 @@ import { frModelSettings } from './fr_model_settings'
 import { frNotices } from './fr_notices'
 import { frNotifications } from './fr_notifications'
 import { frOnboarding } from './fr_onboarding'
+import { frPluginPreviewAccess } from './fr_plugin_preview_access'
 import { frPluginUpdate } from './fr_plugin_update'
 import { frProjects } from './fr_projects'
 import { frSharedMetrics } from './fr_shared_metrics'
@@ -2502,6 +2503,7 @@ export const frOverrides = {
         `Épinglé au commit ${sha}. Les mises à jour sont refusées tant qu’il n’est pas réinstallé avec un nouvel épinglage.`,
       pinnedBadge: (sha: string) => `épinglé @ ${sha}`,
       ...frPluginUpdate,
+      ...frPluginPreviewAccess,
       uninstall: 'Désinstaller',
       uninstallTip: (name: string, profile: string) => `Désinstaller ${name} de ${profile}`,
       uninstallConfirmTitle: (name: string) => `Désinstaller ${name} ?`,
@@ -3838,7 +3840,7 @@ export const frOverrides = {
       '/init': 'Générer ou mettre à jour les instructions de projet AGENTS.md à partir d’une analyse du dépôt',
       '/suggestions': 'Examiner les automatisations suggérées (accepter/ignorer)',
       '/blueprint': 'Configurer une automatisation à partir d’un modèle',
-      '/browser': 'Gérer le navigateur de l’agent [connect|disconnect|status|use]',
+      '/browser': 'Gérer le navigateur de l’agent [connect|disconnect|status]',
       '/palette': 'Ouvrir la palette de commandes floue (aussi Ctrl+P)',
       '/usage':
         'Afficher l’utilisation des jetons et les limites de débit ; `reset` utilise une réinitialisation de limite Codex en réserve',
@@ -4351,28 +4353,25 @@ export const frOverrides = {
     signIn: 'Se connecter',
     signInHeading: 'Connectez-vous avec un compte Nous pour débloquer davantage de modèles et outils.',
     settingUp: "Configuration de l'inférence gratuite…",
-    codeBody: 'Saisissez ce code dans votre navigateur pour terminer la connexion.',
-    copyLink: 'Copier le lien',
+    finishInBrowser: 'Terminez dans votre navigateur',
     doNotShare: 'Ne partagez pas ce code.',
+    openPageAgain: 'Rouvrir la page',
     waiting: 'En attente de la connexion…',
     finishingHeading: 'Finalisation de la connexion…',
     finishingBody: 'Autorisation accordée dans le navigateur. Récupération des jetons de votre compte.',
-    signedInAs: email => `Connecté en tant que ${email}`,
+    signedInAsLabel: 'Connecté en tant que',
     signedIn: 'Connecté.',
     completedBody: "Votre compte donne maintenant accès à l'inférence et aux outils.",
+    reconnect: 'Reconnecter',
+    openConnectors: 'Ouvrir les connecteurs',
     defaultModel: 'Modèle par défaut',
     change: 'Modifier',
     done: 'Terminé',
     notNow: 'Pas maintenant',
     tryAgain: 'Réessayer',
-    startAgain: 'Recommencer',
     didNotComplete: "La connexion n'a pas abouti",
-    rejectedBody: "La connexion a été refusée dans le navigateur. Vous restez sur l'offre gratuite.",
-    supersededBody: 'Un code de connexion plus récent a remplacé celui-ci.',
     timedOutHeading: 'Délai de connexion dépassé',
     timedOutBody: "Le code n'a pas été utilisé à temps. Vous restez sur l'offre gratuite.",
-    retiredBody:
-      "Cette identité d'offre gratuite a déjà été utilisée ou a expiré ; une nouvelle sera créée au prochain démarrage.",
     errorBody: "La connexion n'a pas abouti ; relancez-la.",
     busyHeading: 'Presque terminé',
     busyBody: wait =>
