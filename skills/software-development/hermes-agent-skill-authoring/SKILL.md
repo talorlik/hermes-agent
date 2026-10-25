@@ -181,7 +181,7 @@ A skill exists to make the agent's process more predictable — the agent reliab
 - **Small fix:** `skill_manage(action='patch', ...)` works on in-repo skills, as does `patch`.
 - **Major rewrite:** `write_file` the whole SKILL.md.
 - **Supporting files:** `write_file` to `references/`, `templates/`, or `scripts/` under the skill dir.
-- **Always commit** — in-repo skills are source, not runtime state. Re-run the docs generator when frontmatter changed.
+- **Always commit** — in-repo skills are source, not runtime state. The docs generator copies the full SKILL.md into the per-skill page, so a body edit changes that page even when frontmatter did not. Regen or patch that one page in the same commit. Do not `skill_manage` a source-owned name into `~/.hermes/skills/`: that write is the installed-tree drift backup prepare fail-closes on.
 
 ## Common Pitfalls
 
