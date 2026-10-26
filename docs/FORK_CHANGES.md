@@ -346,7 +346,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: absorbed-upstream
 
 ## G-ELECTRON-PATCH: Electron patched-release bump
-- Commits: a511d303943b14105f53e31f5c134fee3b45ad0a, c5b7c978d0d500a243e616df8ff5c8f14904ce9a, a2e39e2bc738c38641611b758acfdc7f8f877bf8, 484b22f607136ed4b0b5acc5372d73a2fb5b40b0, 14c7cf5339a24990f7577997dcb49e512a3695b2, 767ae035f5d60915d1ecc10bbd28ab9caf9a0230, 3fc1aa30e454a47ec201cf49392ad9583bf6d60c, 89a9166599734e5b28d201efed8dbfa2de956a46, cc5c062a1ce51776745383502fc3b1f8ea8f117e, 9b77bfc460b6f51f617bae321a3b8104574579b2, 880cc5b1e442ce225c9e024349f403d59c86746e
+- Commits: a511d303943b14105f53e31f5c134fee3b45ad0a, c5b7c978d0d500a243e616df8ff5c8f14904ce9a, a2e39e2bc738c38641611b758acfdc7f8f877bf8, 484b22f607136ed4b0b5acc5372d73a2fb5b40b0, 14c7cf5339a24990f7577997dcb49e512a3695b2, 767ae035f5d60915d1ecc10bbd28ab9caf9a0230, 3fc1aa30e454a47ec201cf49392ad9583bf6d60c, 89a9166599734e5b28d201efed8dbfa2de956a46, cc5c062a1ce51776745383502fc3b1f8ea8f117e, 9b77bfc460b6f51f617bae321a3b8104574579b2, 880cc5b1e442ce225c9e024349f403d59c86746e, b2e8768d5a33ae5f59b3d8dad7105805ee165846
 - Owned-Files:
   - apps/desktop/package.json
   - apps/desktop/scripts/batch-sign-binaries.mjs
@@ -562,7 +562,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 72
+- Ledger-Revision: 73
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94, 74a6323447fce76dfbdc5bce84585683f447cd36
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
