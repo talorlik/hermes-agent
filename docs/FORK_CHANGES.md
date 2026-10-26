@@ -237,11 +237,11 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-SKILL-AUTHORING-PITFALLS: pin skill-authoring backup and review pitfalls
-- Commits: 462dbc4c64c02fcfd6debafdadb6d943bf6f6d84, 7f0f6ac6ef7ed53f7e532e5c408b4284944462c0, 9c5d8d58d458e0e6189cb3533ceb906a02d2172b
+- Commits: 462dbc4c64c02fcfd6debafdadb6d943bf6f6d84, 7f0f6ac6ef7ed53f7e532e5c408b4284944462c0, 9c5d8d58d458e0e6189cb3533ceb906a02d2172b, fda707b116fc4c39b9a5434b5ecb7a28892e6d06
 - Owned-Files:
   - skills/software-development/hermes-agent-skill-authoring/SKILL.md
   - website/docs/user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring.md
-- Intent: Source-owned hermes-agent-skill-authoring must match the installed copy. The skill records version 2.0.2 and the pitfalls that keep backup prepare, review dispatch, and source ownership from drifting. The owned copy keeps the installed 57-character trigger window, not the upstream 60-character description line. The website mirror of that skill is owned here so a generated copy cannot land unowned.
+- Intent: Source-owned hermes-agent-skill-authoring must match the installed copy. The skill records version 2.0.2 and the pitfalls that keep backup prepare, review dispatch, and source ownership from drifting. The website mirror of that skill is owned here so a generated copy cannot land unowned.
 - Protected-Invariant: Knowledge backup prepare fail-closes when this source-owned skill drifts; the owning bytes live in hermes-agent, not only the installed tree.
 - Tests: none (documentation-only; backup prepare is the live gate)
 - Retirement-Condition: Upstream skill documents the same backup-prepare and review-dispatch pitfalls.
@@ -538,7 +538,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-SKILL-CODEX-GATEWAY: match installed gateway commit review
-- Commits: 91779a2b0012dd42a0dfb6327b624623c1f25cac, f47471e79a00e4fd6d38ec30009cef31a6d2b776
+- Commits: 91779a2b0012dd42a0dfb6327b624623c1f25cac, f47471e79a00e4fd6d38ec30009cef31a6d2b776, f23ff796aa94c1d394e94105f9bee60366c83400
 - Owned-Files:
   - skills/autonomous-ai-agents/codex/SKILL.md
   - tests/skills/test_codex_skill.py
@@ -549,13 +549,24 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Retirement-Condition: Upstream skill documents the same gateway review invocation and the squash-deleted branch SHA.
 - Disposition: active
 
+
+## G-SKILL-DOCS-CATALOG: bundled skill catalog matches generator rows
+- Commits: d5b6750c670c95deb6c505a3f46d011853c40f77
+- Owned-Files:
+  - website/docs/reference/skills-catalog.md
+- Intent: The bundled skills catalog row for a changed source-owned skill must match website/scripts/generate-skill-docs.py. Do not commit unrelated generator drift in the same change.
+- Protected-Invariant: A description change in a bundled skill does not land while the catalog row still shows the old description.
+- Tests: none (docs CI regenerates and diffs website/docs)
+- Retirement-Condition: The docs check no longer compares this catalog to the generator.
+- Disposition: active
+
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 70
+- Ledger-Revision: 71
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94, 74a6323447fce76dfbdc5bce84585683f447cd36
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
-- Upstream-Line-Deletions: cron/scheduler.py removed-upstream-blobs 6276f9477279568c1dfb163e5dba4606b110ec6d+8a1f5827553dbbe509a362dee701024b70683014, cron/executions.py removed-upstream-blobs f64945e56081545a639079c36361f817c34646e7+4f40500bfc3aa322b28c3126f8712bbca4a2f5d2, hermes_cli/cron.py removed-upstream-blobs c73465fab94d9353470a476feeb3b6a378156722, agent/agent_init.py removed-upstream-blobs 65f5e3d7c25cd7296bb9b102970e1a4dd5804933, skills/autonomous-ai-agents/codex/SKILL.md removed-upstream-blobs 4cf94cf81d777ecf689901bb4a55d068b0c6a9b2, skills/software-development/hermes-agent-skill-authoring/SKILL.md removed-upstream-blobs b58f11809279e2ba4251ad9b35c3015dda7c2f40
+- Upstream-Line-Deletions: cron/scheduler.py removed-upstream-blobs 6276f9477279568c1dfb163e5dba4606b110ec6d+8a1f5827553dbbe509a362dee701024b70683014, cron/executions.py removed-upstream-blobs f64945e56081545a639079c36361f817c34646e7+4f40500bfc3aa322b28c3126f8712bbca4a2f5d2, hermes_cli/cron.py removed-upstream-blobs c73465fab94d9353470a476feeb3b6a378156722, agent/agent_init.py removed-upstream-blobs 65f5e3d7c25cd7296bb9b102970e1a4dd5804933, skills/autonomous-ai-agents/codex/SKILL.md removed-upstream-blobs 4cf94cf81d777ecf689901bb4a55d068b0c6a9b2
 - Owned-Files:
   - docs/FORK_CHANGES.md
   - website/docs/developer-guide/FORK_CHANGES.md
