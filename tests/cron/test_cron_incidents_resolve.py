@@ -49,3 +49,18 @@ def test_operator_ack_survives_a_successful_run(monkeypatch, tmp_path):
     assert inc.get_incident(inc_id)["state"] == "closed"
     _, reopened = inc.upsert_incident("job-1", "known flaky")
     assert reopened is False and inc.get_incident(inc_id)["state"] == "closed"
+
+
+def test_verified_recovery_resolves_an_ack_and_a_repeat_reopens_it(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    inc_id, _ = inc.upsert_incident("job-1", "known flaky")
+    inc.ack_incident(inc_id)
+    delivery_id, _ = inc.upsert_incident("job-1", "send failed", failure_type="delivery")
+    inc.ack_incident(delivery_id)
+
+    assert inc.close_incidents_for_recovered_job("job-1", include_acked=True) == 1
+    assert inc.get_incident(inc_id)["state"] == "resolved"
+    assert inc.get_incident(delivery_id)["state"] == "closed"
+    same_id, reopened = inc.upsert_incident("job-1", "known flaky")
+    assert same_id == inc_id and reopened is True
+    assert inc.get_incident(inc_id)["state"] == "detected"

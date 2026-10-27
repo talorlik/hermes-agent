@@ -351,25 +351,29 @@ def ack_incident(incident_id: str) -> bool:
     return set_incident_state(incident_id, "closed")
 
 
-def close_incidents_for_recovered_job(job_id: str) -> int:
-    """Mark every open incident for ``job_id`` ``resolved`` after a successful run; returns how many.
-    Without this the ledger only ever grows: a one-off failure (a config drift skip, a provider
-    outage) stayed ``detected``/``alerted`` forever after the job recovered, so ``hermes cron
-    incidents`` showed dozens of "open" incidents for jobs that had been green for weeks (32 of 32 on
-    one install). ``resolved`` is distinct from the operator's ``closed`` on purpose: a repeat of the
-    same error re-opens a resolved incident and alerts again (see ``upsert_incident``), whereas
-    ``closed`` keeps that signature silent."""
+def close_incidents_for_recovered_job(job_id: str, *, include_acked: bool = False) -> int:
+    """Mark recovered incidents for ``job_id`` ``resolved``; returns how many.
+
+    Without this the ledger only ever grows: a one-off failure stayed
+    ``detected``/``alerted`` after the job recovered. ``resolved`` re-opens on
+    the same error. The automatic success path leaves ``include_acked`` false,
+    so an operator ack stays silent. A verified later proof passes true: an
+    ack is not a heal, and a repeat must alert again. Delivery incidents are
+    never resolved here.
+    """
     now = _hermes_now().isoformat()
+    states = ("detected", "alerted", "closed") if include_acked else ("detected", "alerted")
+    placeholders = ",".join("?" for _ in states)
     with _transaction() as conn:
         # A successful RUN proves the execution healed, not the channel:
         # delivery incidents heal only when a send lands (the outbox calls
         # ``record_recovery(category='delivery')``). The categories recover
         # independently by design.
         cursor = conn.execute(
-            """UPDATE cron_incidents SET state='resolved', closed_at=?
-               WHERE job_id=? AND state IN ('detected', 'alerted')
+            f"""UPDATE cron_incidents SET state='resolved', closed_at=?
+               WHERE job_id=? AND state IN ({placeholders})
                  AND (failure_type IS NULL OR failure_type != 'delivery')""",
-            (now, str(job_id or "")),
+            (now, str(job_id or ""), *states),
         )
         return int(cursor.rowcount or 0)
 
