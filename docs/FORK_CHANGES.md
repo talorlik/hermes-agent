@@ -565,7 +565,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 
 ## G-FORK-LEDGER: fork change ledger and post-verify checker
 - Commits: self, 377bed46629a263ffaf541a624d013c00926fb9e
-- Ledger-Revision: 75
+- Ledger-Revision: 76
 - History-Reconciliations: 288f24682a67cdbca1ff00e011144cb961f65d5b
 - Cross-Owner-Commits: 291e8f48c6801453e4f0710c00336513ec8a6dc7, 43ed7d97c2fc3006e2de8ed25fb0494de1244465, 88e129f239bb8a1f610ad9ff25c63d2656f035e7, 19d7fe26b0efef91f031260eb52f0569458b2c58, 45ede46503b32dc3de89e154ffd7e1d2e6ebeabb, 96460687e993b30041ab1cee4b2104cd7f5c5a94, 74a6323447fce76dfbdc5bce84585683f447cd36
 - Repaired-Conflict-Merges: ba7235102d001f2d616be8f28df7400f0ae0c39a, ab70ac98d6f31d18217cdb2511fb681083157c62
@@ -583,7 +583,7 @@ change; entry is removed after the next clean sync shows no residual delta),
 - Disposition: active
 
 ## G-ORIGIN-WORKFLOWS: keep origin workflow files without workflow OAuth scope
-- Commits: da7ffffb626c4f8a30888ed8b520694328ff3779, 9140c01ac587b22a3080a2826c11945facaea92a
+- Commits: da7ffffb626c4f8a30888ed8b520694328ff3779, 9140c01ac587b22a3080a2826c11945facaea92a, d5267b41eee105ded19a7bb8fc474c7e3d16e745
 - Owned-Files:
   - .github/workflows/desktop-bundle-smoke.yml
   - .github/workflows/lint.yml
@@ -591,6 +591,8 @@ change; entry is removed after the next clean sync shows no residual delta),
   - .github/workflows/e2e-desktop-core.yml
   - .github/workflows/tests-os.yml
   - .github/workflows/tests.yml
+  - .github/workflows/deploy-site.yml
+  - .github/workflows/js-tests.yml
 - Intent: The gh token cannot update workflow files. This commit restores those files to the previous origin tip so the rest of the upstream sync can fast-forward.
 - Protected-Invariant: The commit changes only the listed workflow files. It does not force-publish and does not request a credential.
 - Tests: docs/FORK_CHANGES.md
