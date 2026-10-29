@@ -200,9 +200,8 @@ def cron_list(show_all: bool = False):
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {color(*badge)}")
         for label, value in _job_rows(job):
-            # Pad to 10 then one space: identical to the historical ``<11`` layout for every
             # short label, and still readable for the long "Script failure policy" row.
-            print(f"    {label + ':':<10} {value}")
+            print(f"    {label + ':':<11}{value}")
         for line in _job_warnings(job):
             print(f"    {line}")
         print()
@@ -245,12 +244,13 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
         ("Script", job.get("script")),
         # Stored policy, shown only for script jobs (it governs nothing without a script); the
         # value is displayed as recorded, never defaulted here.
-        ("Script failure policy", job.get("script_failure_policy") if job.get("script") else ""),
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
+        ("Timezone", job.get("timezone")),
+        ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
@@ -353,56 +353,8 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
         print(f"{record.get('id', '?')}  {record.get('status', '?'):<9}  "
               f"job={record.get('job_id', '?')}  source={record.get('source', '?')}  "
               f"{record.get('claimed_at', '?')}")
-        for line in _execution_evidence_lines(record):
-            print(f"    {line}")
-
-
-def _redact_execution_text(text: Any) -> str:
-    """Forced redaction for ledger error text shown on a terminal (the ledger stores it raw)."""
-    try:
-        from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(str(text), force=True, redact_url_credentials=True)
-    except Exception:
-        return "[REDACTED - error unavailable]"
-
-
-def _execution_evidence_lines(record: Dict[str, Any]) -> List[str]:
-    """Durable facts of one execution attempt, displayed as recorded: the occurrence outcome
-    (typed outcome, retry occurrence), the delivery outcome and the detached producer evidence.
-    Nothing is reclassified here; absent facts print nothing."""
-    lines: List[str] = []
-    outcome = record.get("outcome")
-    if outcome and outcome != record.get("status"):
-        lines.append(f"outcome: {outcome}")
-    if record.get("occurrence_key") or record.get("retry_at"):
-        parts = []
-        if record.get("occurrence_key"):
-            parts.append(f"occurrence={record['occurrence_key']}")
-        if record.get("retry_at"):
-            parts.append(f"retry_at={record['retry_at']}")
-        lines.append("occurrence: " + "  ".join(parts))
-    if record.get("error"):
-        lines.append(f"error: {_redact_execution_text(record['error'])}")
-    if (record.get("delivery_target") or record.get("delivery_status")
-            or record.get("delivery_attempts") or record.get("delivery_outcome")):
-        attempts = record.get("delivery_attempts") or 0
-        parts = [f"target={record.get('delivery_target') or '?'}",
-                 f"status={record.get('delivery_status') or '?'}",
-                 f"attempts={attempts}"]
-        if record.get("delivery_outcome"):
-            parts.append(f"outcome={record['delivery_outcome']}")
-        lines.append("delivery: " + "  ".join(parts))
-        if record.get("delivery_error"):
-            lines.append(f"delivery error: {_redact_execution_text(record['delivery_error'])}")
-    if record.get("detached_run_id") or record.get("detached_status"):
-        parts = [f"run={record.get('detached_run_id') or '?'}",
-                 f"status={record.get('detached_status') or '?'}"]
-        if record.get("detached_worker"):
-            parts.append(f"worker={record['detached_worker']}")
-        if record.get("lease_expires_at"):
-            parts.append(f"lease_expires_at={record['lease_expires_at']}")
-        lines.append("detached: " + "  ".join(parts))
-    return lines
+        if record.get("error"):
+            print(f"    {record['error']}")
 
 
 _INCIDENT_STATE_COLORS = {"detected": Colors.RED, "alerted": Colors.YELLOW, "resolved": Colors.GREEN,
@@ -785,6 +737,20 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     workdir = str(job.get("workdir") or "").strip()
     if workdir and not Path(workdir).expanduser().exists():
         issues.append(f"workdir not found: {workdir}")
+    if job.get("timezone"):
+        from cron.jobs_time import zone_for_job
+        if zone_for_job(job) is None:
+            issues.append(f"timezone {job['timezone']!r} is not a valid IANA zone; "
+                          "the job falls back to the profile timezone")
+    if job.get("grace_minutes") is not None:
+        from cron.jobs_time import normalize_grace_minutes
+        try:
+            normalize_grace_minutes(job.get("grace_minutes"))
+        except ValueError as exc:
+            issues.append(f"grace_minutes is unusable ({exc})")
+        else:
+            if (job.get("schedule") or {}).get("kind") != "cron":
+                issues.append("grace_minutes has no effect on a non-cron schedule")
     return issues
 
 
@@ -815,10 +781,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("interpreter", "interpreter"),
-                   # Parsed by `cron create/edit --script-failure-policy`; the create parser
-                   # defaults it to "continue", the edit parser to None (= leave stored value).
-                   ("script_failure_policy", "script_failure_policy"))
+                   ("interpreter", "interpreter"), ("timezone", "timezone"),
+                   ("grace_minutes", "grace_minutes"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -832,6 +796,7 @@ _JOB_DETAIL_LINES = (
     ("monitor_url", "  Monitor: {} (agent runs only on output change)"),
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
+    ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
     ("interpreter", "  Python: {}"))
 
@@ -841,16 +806,6 @@ def _print_job_details(job_data: dict[str, Any]) -> None:
     for key, template in _JOB_DETAIL_LINES:
         if job_data.get(key):
             print(template.format(job_data[key]))
-
-
-def _print_stored_script_policy(job_id: str) -> None:
-    """Print the persisted script failure policy for a script job, read back from the store
-    (the tool's formatted job echo does not carry it). Shown as recorded, never defaulted; a
-    prompt-only job prints nothing because the policy governs nothing without a script."""
-    from cron.jobs import get_job
-    stored = get_job(job_id) or {}
-    if stored.get("script") and stored.get("script_failure_policy"):
-        print(f"  Script failure policy: {stored['script_failure_policy']}")
 
 
 def cron_create(args):
@@ -1070,65 +1025,3 @@ def cron_command(args):
     print(f"Unknown cron command: {subcmd}\n"
           "Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
     sys.exit(1)
-
-def cron_finalize_detached(args) -> int:
-    """Finalize a detached cron run by correlation id."""
-    from cron.executions import finalize_detached_run, find_detached_run
-
-    run_id = str(getattr(args, "run_id", "") or "")
-    success = bool(getattr(args, "success", False))
-    error = getattr(args, "error", None)
-    record = finalize_detached_run(run_id, success=success, error=error)
-    if record is not None:
-        print(
-            f"Finalized detached run {run_id}: "
-            f"{record.get('detached_status')} "
-            f"(job {record.get('job_id')}, execution {record.get('id')})"
-        )
-        return 0
-    existing = find_detached_run(run_id)
-    if existing is None:
-        print(f"No detached run found for correlation id {run_id!r}")
-        return 2
-    current = str(existing.get("detached_status") or "")
-    desired = "succeeded" if success else "failed"
-    if current == desired:
-        print(
-            f"Detached run {run_id} already finalized as {current} "
-            "(idempotent no-op)"
-        )
-        return 0
-    print(
-        f"Detached run {run_id} is already {current!r}; refusing to "
-        f"rewrite it as {desired!r}"
-    )
-    return 1
-
-def _cron_resnap(args) -> int:
-    """Handle `hermes cron resnap [job_id] [--all]`."""
-    if bool(getattr(args, "all", False)):
-        result = _cron_api(action="resnap", all=True)
-        if not result.get("success"):
-            print(color(f"Failed to resnap: {result.get('error', 'unknown error')}", Colors.RED))
-            return 1
-        updated = result.get("updated_jobs", [])
-        print(color(f"Resnapped {len(updated)} unpinned job(s) to the current global resolution.", Colors.GREEN))
-        for job in updated:
-            print(f"  • {job.get('name', job.get('job_id'))} ({job.get('job_id')})")
-        if not updated:
-            print("  (no unpinned agent jobs found — nothing to refresh)")
-        return 0
-
-    job_id = getattr(args, "job_id", None)
-    if not job_id:
-        print(color("resnap requires either a <job_id> or --all.", Colors.RED))
-        print("Usage: hermes cron resnap <job_id> | hermes cron resnap --all")
-        return 1
-    result = _cron_api(action="resnap", job_id=job_id)
-    if not result.get("success"):
-        print(color(f"Failed to resnap job: {result.get('error', 'unknown error')}", Colors.RED))
-        return 1
-    job = result.get("job", {})
-    print(color(f"Resnapped job: {job.get('name', job_id)} ({job.get('job_id', job_id)})", Colors.GREEN))
-    print("  Adopted the current global inference resolution; the job remains unpinned and will track future global changes.")
-    return 0

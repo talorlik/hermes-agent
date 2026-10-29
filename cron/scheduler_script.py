@@ -530,6 +530,7 @@ def _run_job_script(
     try:
         from tools.environments.local import build_subprocess_env
         popen_kwargs: dict[str, Any] = {
+            # detached-spawn: ok — awaited; cancel and timeout tree-kill the group
             "start_new_session": True,
             # Lossy UTF-8 decode on POSIX too: text=True alone is errors='strict', so one stray
             # non-UTF-8 byte raised in communicate() and discarded the whole run (#105582).
