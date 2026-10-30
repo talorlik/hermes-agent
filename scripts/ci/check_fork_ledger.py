@@ -724,6 +724,181 @@ def _pin_has_bound(pin: dict) -> bool:
     return (isinstance(floor, str) and bool(floor)) or (isinstance(exact, str) and bool(exact))
 
 
+def _package_name(path: str, meta: dict) -> str | None:
+    name = meta.get("name")
+    if isinstance(name, str) and name:
+        return name
+    marker = "node_modules/"
+    if marker in path:
+        tail = path.rsplit(marker, 1)[1]
+        return tail or None
+    return None
+
+
+def _lock_installs(lock: dict) -> dict[str, tuple[str, str]]:
+    """Map each install identity to its package name and version."""
+    found: dict[str, tuple[str, str]] = {}
+    packages = lock.get("packages")
+    if isinstance(packages, dict):
+        for path, meta in packages.items():
+            if not isinstance(meta, dict):
+                continue
+            version = meta.get("version")
+            if not isinstance(version, str):
+                continue
+            name = _package_name(str(path), meta)
+            if name:
+                found[f"packages:{path}"] = (name, version)
+    def walk(node: object, prefix: str) -> None:
+        if not isinstance(node, dict):
+            return
+        for name, meta in node.items():
+            if not isinstance(meta, dict):
+                continue
+            version = meta.get("version")
+            ident = f"{prefix}:{name}"
+            if isinstance(version, str):
+                found[ident] = (str(name), version)
+            walk(meta.get("dependencies"), ident)
+    walk(lock.get("dependencies"), "dependencies")
+    return found
+
+
+def _merged_lock_installs(repo: Path, tree: str) -> dict[str, tuple[str, str]] | None:
+    found: dict[str, tuple[str, str]] = {}
+    for path in _tree_entries(repo, tree):
+        if not _is_generated_lock(path):
+            continue
+        text = _tree_file_text(repo, tree, path)
+        if text is None:
+            return None
+        try:
+            lock = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(lock, dict):
+            return None
+        for ident, pair in _lock_installs(lock).items():
+            found[f"{path}:{ident}"] = pair
+    return found
+
+
+def _lowered_cleared_install(
+    expected: dict[str, tuple[str, str]],
+    actual: dict[str, tuple[str, str]],
+    pins: list[dict],
+) -> bool:
+    """True when one cleared install is rewritten below its own pre-replay version."""
+    floors = {
+        pin["package"]: pin["floor"]
+        for pin in pins
+        if isinstance(pin.get("package"), str)
+        and pin.get("package")
+        and isinstance(pin.get("floor"), str)
+        and pin.get("floor")
+    }
+    for ident, (name, before_version) in expected.items():
+        floor = floors.get(name)
+        if floor is None or not _version_at_least(before_version, floor):
+            continue
+        after = actual.get(ident)
+        if after is None or after[0] != name or not _version_at_least(after[1], before_version):
+            return True
+    return False
+
+
+def _json_object(repo: Path, tree: str, path: str) -> dict | None:
+    text = _tree_file_text(repo, tree, path)
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _manifest_delta_is_pinned(expected: dict, actual: dict, pins: list[dict]) -> bool:
+    """True when a named manifest changes only the keys its pins name."""
+    allowed_overrides = {
+        pin["override"]
+        for pin in pins
+        if isinstance(pin.get("override"), str) and pin.get("override")
+    }
+    allowed_fields: dict[str, set[str]] = {}
+    for pin in pins:
+        field = pin.get("field")
+        package = pin.get("package")
+        if isinstance(field, str) and field and isinstance(package, str) and package:
+            allowed_fields.setdefault(field, set()).add(package)
+    if set(expected) != set(actual):
+        return False
+    for key, before in expected.items():
+        after = actual[key]
+        if before == after:
+            continue
+        if key == "overrides" and isinstance(before, dict) and isinstance(after, dict):
+            changed = {
+                name
+                for name in set(before) | set(after)
+                if before.get(name) != after.get(name)
+            }
+            if not changed <= allowed_overrides:
+                return False
+            continue
+        if key in allowed_fields and isinstance(before, dict) and isinstance(after, dict):
+            changed = {
+                name
+                for name in set(before) | set(after)
+                if before.get(name) != after.get(name)
+            }
+            if not changed <= allowed_fields[key]:
+                return False
+            continue
+        return False
+    return True
+
+
+def _changed_manifests_are_pin_only(
+    repo: Path,
+    expected_tree: str,
+    actual_tree: str,
+    pins: list[dict],
+    changed: set[str],
+) -> bool:
+    by_manifest: dict[str, list[dict]] = {}
+    for pin in pins:
+        target = pin.get("manifest") or "package.json"
+        if isinstance(target, str):
+            by_manifest.setdefault(target, []).append(pin)
+    for path, manifest_pins in by_manifest.items():
+        if path not in changed:
+            continue
+        expected = _json_object(repo, expected_tree, path)
+        actual = _json_object(repo, actual_tree, path)
+        if expected is None or actual is None:
+            return False
+        if not _manifest_delta_is_pinned(expected, actual, manifest_pins):
+            return False
+    return True
+
+
+def _unpinned_install_moved(
+    expected: dict[str, tuple[str, str]],
+    actual: dict[str, tuple[str, str]],
+    pinned_names: set[str],
+) -> bool:
+    for ident in set(expected) | set(actual):
+        before = expected.get(ident)
+        after = actual.get(ident)
+        if before == after:
+            continue
+        names = [pair[0] for pair in (before, after) if pair is not None]
+        if any(name not in pinned_names for name in names):
+            return True
+    return False
+
+
 def _pin_replay_delta_allowed(
     repo: Path,
     expected_tree: str,
@@ -774,11 +949,23 @@ def _pin_replay_delta_allowed(
         return False
     if not _locks_meet_pins(actual_versions, pins):
         return False
+    if not _changed_manifests_are_pin_only(
+        repo, expected_tree, actual_tree, pins, remaining
+    ):
+        return False
+    expected_installs = _merged_lock_installs(repo, expected_tree)
+    actual_installs = _merged_lock_installs(repo, actual_tree)
+    if expected_installs is None or actual_installs is None:
+        return False
     pinned_names = {
         pin["package"]
         for pin in pins
         if isinstance(pin.get("package"), str) and pin.get("package")
     }
+    if _lowered_cleared_install(expected_installs, actual_installs, pins):
+        return False
+    if _unpinned_install_moved(expected_installs, actual_installs, pinned_names):
+        return False
     names = set(expected_versions) | set(actual_versions)
     moved = {
         name
