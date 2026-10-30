@@ -585,26 +585,50 @@ def _version_at_least(value: object, floor: str) -> bool:
         return True
     if required[1] == "":
         return False
-    return parsed[1] >= required[1]
+    return _prerelease_key(parsed[1]) >= _prerelease_key(required[1])
+
+
+def _prerelease_key(value: str) -> tuple[tuple[int, int | str], ...]:
+    key: list[tuple[int, int | str]] = []
+    for part in value.split("."):
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return tuple(key)
 
 
 def _lock_versions(lock: dict) -> dict[str, set[str]]:
     found: dict[str, set[str]] = {}
     packages = lock.get("packages")
-    if not isinstance(packages, dict):
-        return found
-    for path, meta in packages.items():
-        if not isinstance(path, str) or not isinstance(meta, dict):
-            continue
-        name = meta.get("name")
-        if not isinstance(name, str) or not name:
-            if "node_modules/" not in path:
+    if isinstance(packages, dict):
+        for path, meta in packages.items():
+            if not isinstance(path, str) or not isinstance(meta, dict):
                 continue
-            name = path.split("node_modules/")[-1]
+            name = meta.get("name")
+            if not isinstance(name, str) or not name:
+                if "node_modules/" not in path:
+                    continue
+                name = path.split("node_modules/")[-1]
+            version = meta.get("version")
+            if isinstance(version, str) and version:
+                found.setdefault(name, set()).add(version)
+    dependencies = lock.get("dependencies")
+    if isinstance(dependencies, dict):
+        _walk_dependency_versions(dependencies, found)
+    return found
+
+
+def _walk_dependency_versions(node: dict, found: dict[str, set[str]]) -> None:
+    for name, meta in node.items():
+        if not isinstance(name, str) or not isinstance(meta, dict):
+            continue
         version = meta.get("version")
         if isinstance(version, str) and version:
             found.setdefault(name, set()).add(version)
-    return found
+        nested = meta.get("dependencies")
+        if isinstance(nested, dict):
+            _walk_dependency_versions(nested, found)
 
 
 def _merged_lock_versions(repo: Path, tree: str) -> dict[str, set[str]] | None:
@@ -647,9 +671,13 @@ def _manifests_meet_pins(repo: Path, tree: str, pins: list[dict]) -> bool:
             overrides = doc.get("overrides")
             current = overrides.get(override) if isinstance(overrides, dict) else None
             floor = pin.get("floor")
-            if isinstance(floor, str) and floor and _version_at_least(current, floor):
-                pass
-            elif current != pin.get("resolved"):
+            resolved = pin.get("resolved")
+            if isinstance(floor, str) and floor:
+                if not _version_at_least(current, floor) or (
+                    isinstance(resolved, str) and resolved and not _version_at_least(resolved, floor)
+                ):
+                    return False
+            elif current != resolved:
                 return False
         field = pin.get("field")
         if isinstance(field, str) and field:
@@ -661,9 +689,15 @@ def _manifests_meet_pins(repo: Path, tree: str, pins: list[dict]) -> bool:
                     return False
             else:
                 floor = pin.get("floor")
-                if isinstance(floor, str) and floor and _version_at_least(current, floor):
-                    pass
-                elif current != pin.get("resolved"):
+                resolved = pin.get("resolved")
+                if isinstance(floor, str) and floor:
+                    if not _version_at_least(current, floor) or (
+                        isinstance(resolved, str)
+                        and resolved
+                        and not _version_at_least(resolved, floor)
+                    ):
+                        return False
+                elif current != resolved:
                     return False
     return True
 
@@ -684,6 +718,12 @@ def _locks_meet_pins(resolved: dict[str, set[str]], pins: list[dict]) -> bool:
     return True
 
 
+def _pin_has_bound(pin: dict) -> bool:
+    floor = pin.get("floor")
+    exact = pin.get("exact")
+    return (isinstance(floor, str) and bool(floor)) or (isinstance(exact, str) and bool(exact))
+
+
 def _pin_replay_delta_allowed(
     repo: Path,
     expected_tree: str,
@@ -692,9 +732,7 @@ def _pin_replay_delta_allowed(
     already_allowed: set[str] | None = None,
 ) -> bool:
     """A sync may rewrite generated locks and pin manifests, and nothing else."""
-    spec_text = _tree_file_text(repo, actual_tree, PIN_SPEC_PATH)
-    if spec_text is None:
-        spec_text = _tree_file_text(repo, first_parent, PIN_SPEC_PATH)
+    spec_text = _tree_file_text(repo, first_parent, PIN_SPEC_PATH)
     if not spec_text:
         return False
     try:
@@ -704,6 +742,8 @@ def _pin_replay_delta_allowed(
     pins = spec.get("pins") if isinstance(spec, dict) else None
     if not isinstance(pins, list) or not pins or any(not isinstance(pin, dict) for pin in pins):
         return False
+    if any(not _pin_has_bound(pin) for pin in pins):
+        return False
     expected_entries = _tree_entries(repo, expected_tree)
     actual_entries = _tree_entries(repo, actual_tree)
     changed = {
@@ -712,7 +752,7 @@ def _pin_replay_delta_allowed(
         if expected_entries.get(path) != actual_entries.get(path)
     }
     remaining = changed - (already_allowed or set())
-    if not remaining:
+    if not remaining or PIN_SPEC_PATH in changed:
         return False
     manifest_paths = {
         pin.get("manifest") or "package.json"

@@ -1717,3 +1717,283 @@ def test_pin_replay_sync_merge_is_exempt_when_only_pinned_paths_move(tmp_path):
     assert code == 0, payload
     assert replay in payload["sync_merges"]
 
+
+def test_numeric_prerelease_below_the_floor_is_not_at_least() -> None:
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _version_at_least
+
+    assert _version_at_least("1.0.0-9", "1.0.0-10") is False
+
+
+def test_package_only_pin_does_not_exempt_a_lock_downgrade(tmp_path: Path) -> None:
+    repo = tmp_path / "fixture-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps({"version": 1, "pins": [{"package": "lodash"}]}) + "\n",
+        "chore: package-only pin",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {"lockfileVersion": 1, "dependencies": {"lodash": {"version": "4.18.0"}}}
+        )
+        + "\n",
+        "chore: upstream lock",
+    )
+    first_parent = _git(repo, "rev-parse", "HEAD")
+    expected_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {"lockfileVersion": 1, "dependencies": {"lodash": {"version": "0.0.1"}}}
+        )
+        + "\n",
+        "chore: downgrade",
+    )
+    actual_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert (
+        _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent)
+        is False
+    )
+
+
+def test_rewritten_pin_spec_does_not_authorize_extra_files(tmp_path: Path) -> None:
+    repo = tmp_path / "fixture-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    parent_spec = {
+        "version": 1,
+        "pins": [
+            {
+                "package": "undici",
+                "override": "undici@^6",
+                "floor": "6.29.1",
+                "resolved": "6.29.1",
+            }
+        ],
+    }
+    _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps(parent_spec) + "\n",
+        "chore: parent spec",
+    )
+    _commit_file(
+        repo,
+        "package.json",
+        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.1"}}) + "\n",
+        "chore: manifest",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/undici": {"version": "6.29.1"},
+                    "node_modules/lodash": {"version": "4.18.0"},
+                },
+            }
+        )
+        + "\n",
+        "chore: lock",
+    )
+    _commit_file(repo, "config/settings.json", "{}\n", "chore: settings")
+    first_parent = _git(repo, "rev-parse", "HEAD")
+    expected_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    rewritten = {
+        "deps": {"lodash": "0.0.1"},
+        "pins": [
+            {
+                "package": "lodash",
+                "manifest": "docs/fork-npm-pins.json",
+                "field": "deps",
+                "floor": "0.0.0",
+                "resolved": "0.0.1",
+            },
+            {
+                "package": "lodash",
+                "manifest": "config/settings.json",
+                "field": "deps",
+                "floor": "0.0.0",
+                "resolved": "0.0.1",
+            },
+        ],
+    }
+    _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps(rewritten) + "\n",
+        "chore: rewrite spec",
+    )
+    _commit_file(
+        repo,
+        "config/settings.json",
+        json.dumps({"deps": {"lodash": "0.0.1"}}) + "\n",
+        "chore: extra file",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/undici": {"version": "6.29.1"},
+                    "node_modules/lodash": {"version": "0.0.1"},
+                },
+            }
+        )
+        + "\n",
+        "chore: downgrade",
+    )
+    actual_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert (
+        _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent)
+        is False
+    )
+
+
+def test_resolved_below_the_floor_does_not_exempt_the_manifest(tmp_path: Path) -> None:
+    repo = tmp_path / "fixture-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps(
+            {
+                "version": 1,
+                "pins": [
+                    {
+                        "package": "undici",
+                        "override": "undici@^6",
+                        "floor": "6.29.1",
+                        "resolved": "6.29.0",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        "chore: spec",
+    )
+    _commit_file(
+        repo,
+        "package.json",
+        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.1"}}) + "\n",
+        "chore: expected manifest",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {"lockfileVersion": 3, "packages": {"node_modules/undici": {"version": "6.29.0"}}}
+        )
+        + "\n",
+        "chore: expected lock",
+    )
+    first_parent = _git(repo, "rev-parse", "HEAD")
+    expected_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _commit_file(
+        repo,
+        "package.json",
+        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.0"}}) + "\n",
+        "chore: manifest below floor",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {"lockfileVersion": 3, "packages": {"node_modules/undici": {"version": "6.29.1"}}}
+        )
+        + "\n",
+        "chore: lock meets floor",
+    )
+    actual_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert (
+        _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent)
+        is False
+    )
+
+
+def test_unpinned_dependency_move_is_not_exempt(tmp_path: Path) -> None:
+    repo = tmp_path / "fixture-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps(
+            {
+                "version": 1,
+                "pins": [
+                    {
+                        "package": "undici",
+                        "override": "undici@^6",
+                        "floor": "6.29.1",
+                        "resolved": "6.29.1",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        "chore: spec",
+    )
+    _commit_file(
+        repo,
+        "package.json",
+        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.1"}}) + "\n",
+        "chore: manifest",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {"node_modules/undici": {"version": "6.29.1"}},
+                "dependencies": {"lodash": {"version": "4.18.0"}},
+            }
+        )
+        + "\n",
+        "chore: expected nested lock",
+    )
+    first_parent = _git(repo, "rev-parse", "HEAD")
+    expected_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {"node_modules/undici": {"version": "6.29.1"}},
+                "dependencies": {"lodash": {"version": "0.0.1"}},
+            }
+        )
+        + "\n",
+        "chore: nested downgrade",
+    )
+    actual_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert (
+        _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent)
+        is False
+    )
+
