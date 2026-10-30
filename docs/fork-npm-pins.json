@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "pins": [
+    {
+      "package": "undici",
+      "override": "undici@^6",
+      "floor": "6.29.1",
+      "resolved": "6.29.1"
+    },
+    {
+      "package": "undici",
+      "manifest": "ui-tui/package.json",
+      "field": "dependencies",
+      "floor": "6.29.1",
+      "resolved": "6.29.1"
+    },
+    {
+      "package": "zod",
+      "override": "zod@^4",
+      "floor": "4.6.7",
+      "resolved": "4.6.7"
+    },
+    {
+      "package": "zod",
+      "manifest": "tests-js/package.json",
+      "field": "dependencies",
+      "floor": "4.6.7",
+      "resolved": "4.6.7"
+    },
+    {
+      "package": "electron-builder",
+      "manifest": "apps/desktop/package.json",
+      "field": "devDependencies",
+      "exact": "26.15.3"
+    },
+    {
+      "package": "electron",
+      "manifest": "apps/desktop/package.json",
+      "field": "devDependencies",
+      "floor": "44.9.3",
+      "resolved": "44.9.3"
+    }
+  ]
+}
