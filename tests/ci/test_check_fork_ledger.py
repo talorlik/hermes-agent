@@ -1600,3 +1600,120 @@ def test_restored_conflict_merge_stays_unmapped_when_unlisted(tmp_path):
     code, payload = _run_checker(repo)
     assert code == 1, payload
     assert fx["bad"] in {item["sha"] for item in payload["unmapped_commits"]}
+
+
+def test_pin_replay_sync_merge_is_exempt_when_only_pinned_paths_move(tmp_path):
+    repo = tmp_path / "fixture-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(
+        repo,
+        "package.json",
+        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.0"}}) + "\n",
+        "chore: base manifest",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/undici": {"version": "6.29.0"},
+                    "node_modules/lodash": {"version": "4.18.0"},
+                },
+            }
+        )
+        + "\n",
+        "chore: base lock",
+    )
+    _git(repo, "checkout", "-b", "fork-main")
+    pin_commit = _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps(
+            {
+                "version": 1,
+                "pins": [
+                    {
+                        "package": "undici",
+                        "override": "undici@^6",
+                        "floor": "6.29.1",
+                        "resolved": "6.29.1",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        "feat(fork): declare undici floor",
+    )
+    fork_tip = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/undici": {"version": "6.29.0"},
+                    "node_modules/lodash": {"version": "4.18.1"},
+                },
+            }
+        )
+        + "\n",
+        "feat: upstream lock",
+    )
+    upstream_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "fork-main")
+    _git(repo, "merge", "--no-ff", "-m", "chore: merge upstream", "upstream-main")
+    (repo / "package.json").write_text(
+        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.1"}}) + "\n",
+        encoding="utf-8",
+    )
+    (repo / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/undici": {"version": "6.29.1"},
+                    "node_modules/lodash": {"version": "4.18.1"},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "package.json", "package-lock.json")
+    tree = _git(repo, "write-tree")
+    replay = _git(
+        repo,
+        "commit-tree",
+        tree,
+        "-p",
+        fork_tip,
+        "-p",
+        upstream_sha,
+        "-m",
+        "chore: merge upstream and replay npm pins",
+    )
+    _git(repo, "update-ref", "refs/heads/fork-main", replay)
+    _write_ledger(
+        repo,
+        _entry(
+            "G-NPM-PIN-REPLAY",
+            "fork npm pin spec",
+            commits=pin_commit,
+            owned_files=["docs/fork-npm-pins.json"],
+        )
+        + _entry(
+            "G-LOCK",
+            "lock path owner",
+            commits="none",
+            owned_files=["package.json", "package-lock.json"],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert replay in payload["sync_merges"]
+

@@ -12,7 +12,10 @@ Mapping methodology
 Both refs resolve once to immutable OIDs. Fork-only commits are
 `git rev-list <upstream-oid>..<fork-oid>`. A merge is exempt as upstream sync
 only when it has exactly two parents in fork/upstream order and its committed
-tree equals the clean `git merge-tree --write-tree` result. G-FORK-LEDGER may
+tree equals the clean `git merge-tree --write-tree` result, or differs from that
+result only by a `docs/fork-npm-pins.json` replay: generated lockfiles and the
+manifests the spec names, with every floor and exact pin met and no unpinned
+package version moved. G-FORK-LEDGER may
 also authorize zero-tree history-reconciliation merges and their retired
 second-parent-only ancestry; the remaining commits are mapped work. These
 work, sync, and retired-history sets must form an exact disjoint partition.
@@ -540,6 +543,211 @@ def _conflict_fit_allowed(
     )
 
 
+PIN_SPEC_PATH = "docs/fork-npm-pins.json"
+
+
+def _is_generated_lock(path: str) -> bool:
+    return path == "package-lock.json" or path.endswith("/package-lock.json")
+
+
+def _tree_file_text(repo: Path, tree: str, path: str) -> str | None:
+    proc = _run_git(repo, "show", f"{tree}:{path}")
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8")
+
+
+def _parse_version(value: object) -> tuple[tuple[int, ...], str] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    main, sep, pre = value.partition("-")
+    parts: list[int] = []
+    for piece in main.split("."):
+        if not piece.isdigit():
+            return None
+        parts.append(int(piece))
+    if not parts:
+        return None
+    return (tuple(parts), pre if sep else "")
+
+
+def _version_at_least(value: object, floor: str) -> bool:
+    parsed = _parse_version(value)
+    required = _parse_version(floor)
+    if parsed is None or required is None:
+        return False
+    length = max(len(parsed[0]), len(required[0]))
+    left = parsed[0] + (0,) * (length - len(parsed[0]))
+    right = required[0] + (0,) * (length - len(required[0]))
+    if left != right:
+        return left > right
+    if parsed[1] == required[1] or parsed[1] == "":
+        return True
+    if required[1] == "":
+        return False
+    return parsed[1] >= required[1]
+
+
+def _lock_versions(lock: dict) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        return found
+    for path, meta in packages.items():
+        if not isinstance(path, str) or not isinstance(meta, dict):
+            continue
+        name = meta.get("name")
+        if not isinstance(name, str) or not name:
+            if "node_modules/" not in path:
+                continue
+            name = path.split("node_modules/")[-1]
+        version = meta.get("version")
+        if isinstance(version, str) and version:
+            found.setdefault(name, set()).add(version)
+    return found
+
+
+def _merged_lock_versions(repo: Path, tree: str) -> dict[str, set[str]] | None:
+    found: dict[str, set[str]] = {}
+    for path in _tree_entries(repo, tree):
+        if not _is_generated_lock(path):
+            continue
+        text = _tree_file_text(repo, tree, path)
+        if text is None:
+            return None
+        try:
+            lock = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(lock, dict):
+            return None
+        for name, versions in _lock_versions(lock).items():
+            found.setdefault(name, set()).update(versions)
+    return found
+
+
+def _manifests_meet_pins(repo: Path, tree: str, pins: list[dict]) -> bool:
+    for pin in pins:
+        target = pin.get("manifest") or "package.json"
+        if not isinstance(target, str):
+            return False
+        if not (pin.get("override") or pin.get("field")):
+            continue
+        text = _tree_file_text(repo, tree, target)
+        if text is None:
+            return False
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(doc, dict):
+            return False
+        override = pin.get("override")
+        if isinstance(override, str) and override:
+            overrides = doc.get("overrides")
+            current = overrides.get(override) if isinstance(overrides, dict) else None
+            floor = pin.get("floor")
+            if isinstance(floor, str) and floor and _version_at_least(current, floor):
+                pass
+            elif current != pin.get("resolved"):
+                return False
+        field = pin.get("field")
+        if isinstance(field, str) and field:
+            block = doc.get(field)
+            current = block.get(pin.get("package")) if isinstance(block, dict) else None
+            exact = pin.get("exact")
+            if isinstance(exact, str) and exact:
+                if current != exact:
+                    return False
+            else:
+                floor = pin.get("floor")
+                if isinstance(floor, str) and floor and _version_at_least(current, floor):
+                    pass
+                elif current != pin.get("resolved"):
+                    return False
+    return True
+
+
+def _locks_meet_pins(resolved: dict[str, set[str]], pins: list[dict]) -> bool:
+    for pin in pins:
+        package = pin.get("package")
+        if not isinstance(package, str) or not package:
+            return False
+        versions = resolved.get(package) or set()
+        exact = pin.get("exact")
+        if isinstance(exact, str) and exact and versions != {exact}:
+            return False
+        floor = pin.get("floor")
+        if isinstance(floor, str) and floor:
+            if not versions or any(not _version_at_least(item, floor) for item in versions):
+                return False
+    return True
+
+
+def _pin_replay_delta_allowed(
+    repo: Path,
+    expected_tree: str,
+    actual_tree: str,
+    first_parent: str,
+    already_allowed: set[str] | None = None,
+) -> bool:
+    """A sync may rewrite generated locks and pin manifests, and nothing else."""
+    spec_text = _tree_file_text(repo, actual_tree, PIN_SPEC_PATH)
+    if spec_text is None:
+        spec_text = _tree_file_text(repo, first_parent, PIN_SPEC_PATH)
+    if not spec_text:
+        return False
+    try:
+        spec = json.loads(spec_text)
+    except json.JSONDecodeError:
+        return False
+    pins = spec.get("pins") if isinstance(spec, dict) else None
+    if not isinstance(pins, list) or not pins or any(not isinstance(pin, dict) for pin in pins):
+        return False
+    expected_entries = _tree_entries(repo, expected_tree)
+    actual_entries = _tree_entries(repo, actual_tree)
+    changed = {
+        path
+        for path in expected_entries.keys() | actual_entries.keys()
+        if expected_entries.get(path) != actual_entries.get(path)
+    }
+    remaining = changed - (already_allowed or set())
+    if not remaining:
+        return False
+    manifest_paths = {
+        pin.get("manifest") or "package.json"
+        for pin in pins
+        if pin.get("override") or pin.get("field")
+    }
+    if any(not isinstance(path, str) for path in manifest_paths):
+        return False
+    allowed_extra = {path for path in remaining if _is_generated_lock(path)} | (
+        manifest_paths & remaining
+    )
+    if remaining != allowed_extra:
+        return False
+    if not _manifests_meet_pins(repo, actual_tree, pins):
+        return False
+    expected_versions = _merged_lock_versions(repo, expected_tree)
+    actual_versions = _merged_lock_versions(repo, actual_tree)
+    if expected_versions is None or actual_versions is None:
+        return False
+    if not _locks_meet_pins(actual_versions, pins):
+        return False
+    pinned_names = {
+        pin["package"]
+        for pin in pins
+        if isinstance(pin.get("package"), str) and pin.get("package")
+    }
+    names = set(expected_versions) | set(actual_versions)
+    moved = {
+        name
+        for name in names
+        if expected_versions.get(name, set()) != actual_versions.get(name, set())
+    }
+    return moved <= pinned_names
+
+
 def _is_clean_upstream_sync(
     repo: Path, sha: str, parents: list[str], upstream_oid: str
 ) -> bool:
@@ -571,7 +779,11 @@ def _is_clean_upstream_sync(
     expected_tree = expected_tree_raw.decode("ascii")
     actual_tree = _git(repo, "rev-parse", f"{sha}^{{tree}}")
     if proc.returncode == 0:
-        return expected_tree == actual_tree
+        if expected_tree == actual_tree:
+            return True
+        return _pin_replay_delta_allowed(
+            repo, expected_tree, actual_tree, first_parent
+        )
     if not separator:
         return False
 
@@ -669,7 +881,15 @@ def _is_clean_upstream_sync(
             return False
         allowed.add(source)
 
-    return changed <= allowed
+    if changed <= allowed:
+        return True
+    return _pin_replay_delta_allowed(
+        repo,
+        expected_tree,
+        actual_tree,
+        first_parent,
+        already_allowed=allowed,
+    )
 
 
 def _tree_entries(repo: Path, treeish: str) -> dict[str, tuple[str, str, str]]:
