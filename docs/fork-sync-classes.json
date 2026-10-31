@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "generated_unspecified": {
+    "action": "take-upstream",
+    "paths": [
+      "uv.lock",
+      "pm/uv.lock",
+      "pm/lock.json",
+      "flake.lock",
+      "nix/pythonLock.nix",
+      "nix/npm-pinned.nix"
+    ]
+  },
+  "build_output": {
+    "action": "regenerate-or-stop",
+    "generator": null,
+    "paths": [
+      "plugins/kanban/dashboard/dist/index.js",
+      "plugins/kanban/dashboard/dist/style.css"
+    ]
+  },
+  "auth_hold": {
+    "action": "hold-previous-blob",
+    "ledger_entry": "G-ORIGIN-WORKFLOWS",
+    "reason": "token cannot update workflow files",
+    "paths": [
+      ".github/workflows/bootstrap-installer-build.yml",
+      ".github/workflows/deploy-site.yml",
+      ".github/workflows/desktop-bundle-smoke.yml",
+      ".github/workflows/e2e-desktop-core.yml",
+      ".github/workflows/js-tests.yml",
+      ".github/workflows/lint.yml",
+      ".github/workflows/tests-os.yml",
+      ".github/workflows/tests.yml"
+    ]
+  },
+  "structured_pin_contract": [
+    {
+      "manifest": "apps/desktop/package.json",
+      "package": "electron-builder",
+      "field": "devDependencies",
+      "constants": [
+        "apps/desktop/scripts/builder-arch-targets.mjs",
+        "apps/desktop/scripts/builder-config-26.mjs"
+      ]
+    }
+  ]
+}

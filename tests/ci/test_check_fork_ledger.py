@@ -766,6 +766,7 @@ def test_deleted_quoted_path_must_be_owned_and_is_parsed_raw(tmp_path):
         "chore: merge upstream into fork",
         "upstream-main",
     )
+    add_merge = _git(cast(Path, repo), "rev-parse", "HEAD")
     _git(repo, "rm", "--", quoted)
     _git(repo, "commit", "-m", "fix(fork): delete quoted mutex junk")
     delete_sha = _git(repo, "rev-parse", "HEAD")
@@ -794,9 +795,11 @@ def test_deleted_quoted_path_must_be_owned_and_is_parsed_raw(tmp_path):
         ),
     )
     code, payload = _run_checker(repo)
-    assert code == 0, payload
+    assert code == 1, payload
     assert payload["unowned_paths"] == []
     assert quoted not in payload.get("unowned_paths", [])
+    assert not any(path.startswith('"') for path in payload["unowned_paths"])
+    assert add_merge in {item["sha"] for item in payload["unmapped_commits"]}
 
 
 def _run_checker_raw(
@@ -946,6 +949,14 @@ def test_fitted_conflict_sync_merge_is_exempt(tmp_path):
     repo.mkdir()
     _git(repo, "init", "-b", "upstream-main")
     _commit_file(repo, "shared.py", "VALUE = 'base'\n", "base")
+    _commit_file(
+        repo,
+        "docs/fork-sync-classes.json",
+        '{"version": 1, "generated_unspecified": {"paths": []}, '
+        '"build_output": {"paths": []}, "auth_hold": {"paths": []}, '
+        '"structured_pin_contract": []}\n',
+        "docs: declare sync classes",
+    )
     _git(repo, "checkout", "-b", "fork-main")
     pre_resolved = _commit_file(
         repo,
@@ -1041,7 +1052,17 @@ def test_pre_resolved_directory_rename_keeps_first_parent_path(tmp_path):
     parents = _git(repo, "show", "-s", "--format=%P", sync_merge).split()
 
     mod = _load_checker_module()
-    assert mod._is_clean_upstream_sync(repo, sync_merge, parents, upstream)
+    spec_sha = _commit_file(
+        repo,
+        "docs/fork-sync-classes.json",
+        '{"version": 1, "generated_unspecified": {"paths": []}, '
+        '"build_output": {"paths": []}, "auth_hold": {"paths": []}, '
+        '"structured_pin_contract": []}\n',
+        "docs: declare sync classes",
+    )
+    assert mod._is_clean_upstream_sync(
+        repo, sync_merge, parents, upstream, fork_tree=spec_sha
+    )
 
 
 def test_repo_ledger_exists_and_every_entry_is_well_formed():
@@ -1626,6 +1647,14 @@ def test_pin_replay_sync_merge_is_exempt_when_only_pinned_paths_move(tmp_path):
         )
         + "\n",
         "chore: base lock",
+    )
+    _commit_file(
+        repo,
+        "docs/fork-sync-classes.json",
+        '{"version": 1, "generated_unspecified": {"paths": []}, '
+        '"build_output": {"paths": []}, "auth_hold": {"paths": []}, '
+        '"structured_pin_contract": []}\n',
+        "docs: declare sync classes",
     )
     _git(repo, "checkout", "-b", "fork-main")
     pin_commit = _commit_file(
