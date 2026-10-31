@@ -348,6 +348,8 @@ If you catch yourself thinking:
 - Proposing solutions before tracing data flow
 - **"One more fix attempt" (when already tried 2+)**
 - **Each fix reveals a new problem in a different place**
+- **Each new failure is the case the last condition excluded** (next token, next sibling path, the branch you skipped). That is one incomplete decision. Replace the decision. Do not extend the exception list. A review prompt that appends each finding as a new required sentence cannot terminate: the next reviewer is graded against a larger homemade spec. Close the predicate. A finding outside it is out of scope, not a defect to implement.
+- **Empty prefix membership is true.** `s[:1] in "+-*/"` is true when `s` is empty, because the empty string is a substring of every string. Test `s and s[0] in charset` before treating a missing next line as an operator.
 
 **ALL of these mean: STOP. Return to Phase 1.**
 

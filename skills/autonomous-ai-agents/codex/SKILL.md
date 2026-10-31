@@ -153,6 +153,16 @@ codex exec -m gpt-6-astra -s danger-full-access --ephemeral --ignore-rules -o <o
 
 Put the commit SHA, the defect, and the proof in the prompt. Tell the reviewer a missing ledger claim is not a code defect when that claim is a later commit: a squash deletes the branch SHA, so the claim cannot exist on the reviewed commit.
 
+## Structured output reviews
+
+`codex exec review --base <branch>` rejects a prompt argument. Do not combine `--base` with a quoted prompt. For a fail-closed JSON verdict, run from the worktree and let the prompt tell the reviewer to run `git diff main...HEAD`:
+
+```
+codex exec -m gpt-6-astra -s read-only --ephemeral --ignore-rules --output-schema <schema.json> -o <out.json> "$(cat prompt.txt)"
+```
+
+Give each in-flight exec its own `-o` path. An older exec that finishes later and shares the path overwrites the current verdict file; bind the completion to the process, not the file. Every key under `properties` must also be in `required`, including nested item fields. An optional `line` fails with `required is required to include every key in properties`. Use integer `0` when the line is unknown. No schema-valid output file means fail. Do not land.
+
 ## Auth status is not a live call
 
 `codex login status` only reads `~/.codex/auth.json`. "Logged in using ChatGPT"

@@ -106,9 +106,11 @@ Confirm:
 - Failure message is expected
 - Fails because the feature is missing
 
-**Test passes immediately?** You're testing existing behavior. Fix the test.
+**Test passes immediately?** You're testing existing behavior, or a negative test is green because an unrelated predicate failed (missing version, invalid JSON, empty list, checker error before classification, merge not recognized as a sync). A forbidden-success test must make the current code return the bad result before you write the fix. A missing ledger, or a merge whose first parent is an ancestor of upstream because the fork has no unique commit, makes "not exempt" pass without reaching the class rule. Fix the fixture until the assertion fails for that reason.
 
-**Test errors?** Fix the error, re-run until it fails correctly.
+**Test errors?** Fix typos and fixture errors, re-run until it fails correctly. A contract exception from the code under test is the expected RED even when the runner labels it ERROR; do not weaken the assertion just to get a FAIL label.
+
+**Inserting a test with patch:** do not replace only the next function's `def` line. The old body stays and the new test swallows it. Include the next `def` in both sides, then read the insertion and the following function before running. A duplicate setup line or a missing `def` means the match ate the neighbor. A file that still parses can assert the wrong behavior.
 
 ### GREEN — Minimal Code
 
