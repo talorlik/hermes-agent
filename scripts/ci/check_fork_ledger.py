@@ -680,6 +680,38 @@ def _merged_lock_versions(repo: Path, tree: str) -> dict[str, set[str]] | None:
     return found
 
 
+def _versions_for_named_locks(
+    repo: Path, tree: str, pins: list[dict]
+) -> dict[str, set[str]] | None:
+    """Versions from locks a pin names.
+
+    An unnamed lock must equal upstream. Its older copy is not a pin violation.
+    """
+    named: set[str] = set()
+    for pin in pins:
+        if not isinstance(pin, dict):
+            return None
+        lock = pin.get("lock")
+        named.add(lock if isinstance(lock, str) and lock else "package-lock.json")
+    found: dict[str, set[str]] = {}
+    entries = _tree_entries(repo, tree)
+    for path in named:
+        if path not in entries:
+            continue
+        text = _tree_file_text(repo, tree, path)
+        if text is None:
+            return None
+        try:
+            lock = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(lock, dict):
+            return None
+        for name, versions in _lock_versions(lock).items():
+            found.setdefault(name, set()).update(versions)
+    return found
+
+
 def _manifests_meet_pins(repo: Path, tree: str, pins: list[dict]) -> bool:
     for pin in pins:
         target = pin.get("manifest") or "package.json"
@@ -1154,7 +1186,8 @@ def _pin_replay_delta_allowed(
     actual_versions = _merged_lock_versions(repo, actual_tree)
     if expected_versions is None or actual_versions is None:
         return False
-    if not _locks_meet_pins(actual_versions, pins):
+    named_versions = _versions_for_named_locks(repo, actual_tree, pins)
+    if named_versions is None or not _locks_meet_pins(named_versions, pins):
         return False
     if not _changed_manifests_are_pin_only(
         repo, expected_tree, actual_tree, pins, remaining
@@ -4886,7 +4919,7 @@ def _clean_class_holds(
     if named_present:
         if not pins or any(not _pin_has_bound(pin) for pin in pins):
             return False
-        versions = _merged_lock_versions(repo, tree)
+        versions = _versions_for_named_locks(repo, tree, pins)
         if versions is None or not _locks_meet_pins(versions, pins):
             return False
     hold = spec.get("auth_hold")
