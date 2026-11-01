@@ -2358,3 +2358,149 @@ def test_unpinned_install_rename_is_not_exempt(tmp_path: Path) -> None:
     from check_fork_ledger import _pin_replay_delta_allowed
 
     assert _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent) is False
+
+
+def _exact_supplier_fixture(
+    tmp_path: Path, expected_lock: dict, actual_lock: dict
+) -> tuple[Path, str, str, str]:
+    repo = tmp_path / "supplier-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _commit_file(
+        repo,
+        "docs/fork-npm-pins.json",
+        json.dumps(
+            {
+                "version": 1,
+                "pins": [
+                    {
+                        "package": "electron-builder",
+                        "manifest": "package.json",
+                        "field": "devDependencies",
+                        "exact": "26.15.3",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        "chore: spec",
+    )
+    _commit_file(
+        repo,
+        "package.json",
+        json.dumps(
+            {"name": "root", "devDependencies": {"electron-builder": "26.15.3"}}
+        )
+        + "\n",
+        "chore: manifest",
+    )
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(expected_lock) + "\n",
+        "chore: expected lock",
+    )
+    first_parent = _git(repo, "rev-parse", "HEAD")
+    expected_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    _commit_file(
+        repo,
+        "package-lock.json",
+        json.dumps(actual_lock) + "\n",
+        "chore: actual lock",
+    )
+    actual_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    return repo, expected_tree, actual_tree, first_parent
+
+
+def test_exact_pin_supplier_closure_may_change(tmp_path: Path) -> None:
+    repo, expected_tree, actual_tree, first_parent = _exact_supplier_fixture(
+        tmp_path,
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/electron-builder": {
+                    "version": "27.0.0",
+                    "dependencies": {"left-pad": "2.0.0"},
+                },
+                "node_modules/left-pad": {"version": "2.0.0"},
+            },
+        },
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/electron-builder": {
+                    "version": "26.15.3",
+                    "dependencies": {"left-pad": "1.0.0"},
+                },
+                "node_modules/left-pad": {"version": "1.0.0"},
+            },
+        },
+    )
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent) is True
+
+
+def test_exact_pin_does_not_exempt_an_outside_install(tmp_path: Path) -> None:
+    repo, expected_tree, actual_tree, first_parent = _exact_supplier_fixture(
+        tmp_path,
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/electron-builder": {
+                    "version": "27.0.0",
+                    "dependencies": {"left-pad": "2.0.0"},
+                },
+                "node_modules/left-pad": {"version": "2.0.0"},
+                "node_modules/lodash": {"version": "1.0.0"},
+            },
+        },
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/electron-builder": {
+                    "version": "26.15.3",
+                    "dependencies": {"left-pad": "1.0.0"},
+                },
+                "node_modules/left-pad": {"version": "1.0.0"},
+                "node_modules/lodash": {"version": "2.0.0"},
+            },
+        },
+    )
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent) is False
+
+
+def test_exact_pin_does_not_exempt_a_walk_only_version(tmp_path: Path) -> None:
+    repo, expected_tree, actual_tree, first_parent = _exact_supplier_fixture(
+        tmp_path,
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/electron-builder": {
+                    "version": "27.0.0",
+                    "dependencies": {"left-pad": "2.0.0"},
+                },
+                "node_modules/left-pad": {"version": "2.0.0"},
+            },
+            "dependencies": {"left-pad": {"version": "2.0.0"}},
+        },
+        {
+            "lockfileVersion": 3,
+            "packages": {
+                "node_modules/electron-builder": {
+                    "version": "26.15.3",
+                    "dependencies": {"left-pad": "1.0.0"},
+                },
+                "node_modules/left-pad": {"version": "1.0.0"},
+            },
+            "dependencies": {"left-pad": {"version": "9.9.9"}},
+        },
+    )
+    sys.path.insert(0, str(SCRIPT.parent))
+    from check_fork_ledger import _pin_replay_delta_allowed
+
+    assert _pin_replay_delta_allowed(repo, expected_tree, actual_tree, first_parent) is False

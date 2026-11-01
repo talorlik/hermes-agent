@@ -913,6 +913,180 @@ def _changed_manifests_are_pin_only(
     return True
 
 
+
+def _resolve_supplier_install(packages: dict, start: str, dep: str) -> str | None:
+    """Resolve one dependency the way Node does, including a nested copy."""
+    cursor = start
+    while True:
+        candidate = f"{cursor}/node_modules/{dep}" if cursor else f"node_modules/{dep}"
+        if candidate in packages:
+            return candidate
+        if not cursor or "/node_modules/" not in cursor:
+            root = f"node_modules/{dep}"
+            return root if root in packages and root != candidate else None
+        cursor = cursor.rsplit("/node_modules/", 1)[0]
+
+
+def _exact_pin_closure_paths(lock: dict, exact_names: set[str]) -> set[str]:
+    """Install paths reachable from an exact pin, including the pin itself."""
+    packages = lock.get("packages")
+    if not isinstance(packages, dict) or not exact_names:
+        return set()
+    roots = [
+        str(path)
+        for path, meta in packages.items()
+        if isinstance(meta, dict) and _package_name(str(path), meta) in exact_names
+    ]
+    seen: set[str] = set()
+    stack = list(roots)
+    while stack:
+        path = stack.pop()
+        meta = packages.get(path)
+        if path in seen or not isinstance(meta, dict):
+            continue
+        seen.add(path)
+        deps: dict = {}
+        for key in ("dependencies", "optionalDependencies", "peerDependencies"):
+            block = meta.get(key)
+            if isinstance(block, dict):
+                deps.update(block)
+        for dep in deps:
+            found = _resolve_supplier_install(packages, path, dep)
+            if found and found not in seen:
+                stack.append(found)
+    return seen
+
+
+def _lock_install_paths(lock: dict) -> dict[str, tuple[str, str]]:
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        return {}
+    found: dict[str, tuple[str, str]] = {}
+    for path, meta in packages.items():
+        if not isinstance(meta, dict):
+            continue
+        version = meta.get("version")
+        name = _package_name(str(path), meta)
+        if name and isinstance(version, str) and version:
+            found[str(path)] = (name, version)
+    return found
+
+
+
+def _closure_versions(installs: dict[str, tuple[str, str]], closure: set[str], name: str) -> set[str]:
+    return {pair[1] for path, pair in installs.items() if path in closure and pair[0] == name}
+
+
+def _lock_version_sets(lock: dict) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
+    for name, version in _lock_install_paths(lock).values():
+        found.setdefault(name, set()).add(version)
+
+    def walk(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        for name, meta in node.items():
+            if not isinstance(name, str) or not isinstance(meta, dict):
+                continue
+            version = meta.get("version")
+            if isinstance(version, str) and version:
+                found.setdefault(name, set()).add(version)
+            walk(meta.get("dependencies"))
+
+    walk(lock.get("dependencies"))
+    return found
+
+
+def _supplier_delta_covered(
+    name: str,
+    before_versions: dict[str, set[str]],
+    after_versions: dict[str, set[str]],
+    before_installs: dict[str, tuple[str, str]],
+    after_installs: dict[str, tuple[str, str]],
+    closure: set[str],
+) -> bool:
+    """A supplier version change must appear on a closure install, not only in the walk."""
+    before_set = before_versions.get(name, set())
+    after_set = after_versions.get(name, set())
+    return (after_set - before_set) <= _closure_versions(after_installs, closure, name) and (
+        before_set - after_set
+    ) <= _closure_versions(before_installs, closure, name)
+
+
+def _exact_supplier_names(repo: Path, expected_tree: str, actual_tree: str, pins: list[dict]) -> set[str] | None:
+    """Names whose changed installs all sit in an exact pin's dependency closure.
+
+    A floor pin grants no exemption. A missing or unreadable lock fails closed.
+    A name with any changed install outside the closure is omitted.
+    """
+    exact_names = {
+        pin["package"]
+        for pin in pins
+        if isinstance(pin.get("package"), str)
+        and pin.get("package")
+        and isinstance(pin.get("exact"), str)
+        and pin.get("exact")
+    }
+    if not exact_names:
+        return set()
+    paths = [
+        path
+        for path in set(_tree_entries(repo, expected_tree)) | set(_tree_entries(repo, actual_tree))
+        if _is_generated_lock(path)
+    ]
+    allowed: set[str] = set()
+    illegal: set[str] = set()
+    for path in paths:
+        before_text = _tree_file_text(repo, expected_tree, path)
+        after_text = _tree_file_text(repo, actual_tree, path)
+        if before_text is None or after_text is None:
+            return None
+        try:
+            before = json.loads(before_text)
+            after = json.loads(after_text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return None
+        closure = _exact_pin_closure_paths(before, exact_names) | _exact_pin_closure_paths(after, exact_names)
+        before_installs = _lock_install_paths(before)
+        after_installs = _lock_install_paths(after)
+        before_versions = _lock_version_sets(before)
+        after_versions = _lock_version_sets(after)
+        changed: dict[str, set[str]] = {}
+        for install in set(before_installs) | set(after_installs):
+            if before_installs.get(install) == after_installs.get(install):
+                continue
+            names = [
+                pair[0]
+                for pair in (before_installs.get(install), after_installs.get(install))
+                if pair is not None
+            ]
+            for name in names:
+                changed.setdefault(name, set()).add(install)
+        seen: set[str] = set()
+        for name, installs in changed.items():
+            if name in exact_names:
+                continue
+            seen.add(name)
+            if (
+                installs
+                and installs <= closure
+                and _supplier_delta_covered(
+                    name, before_versions, after_versions, before_installs, after_installs, closure
+                )
+            ):
+                allowed.add(name)
+            else:
+                illegal.add(name)
+        for name in set(before_versions) | set(after_versions):
+            if name in exact_names or name in seen:
+                continue
+            if before_versions.get(name, set()) != after_versions.get(name, set()):
+                illegal.add(name)
+    return allowed - illegal
+
+
 def _unpinned_install_moved(
     expected: dict[str, tuple[str, str]],
     actual: dict[str, tuple[str, str]],
@@ -997,7 +1171,11 @@ def _pin_replay_delta_allowed(
     }
     if _lowered_cleared_install(expected_installs, actual_installs, pins):
         return False
-    if _unpinned_install_moved(expected_installs, actual_installs, pinned_names):
+    supplier_names = _exact_supplier_names(repo, expected_tree, actual_tree, pins)
+    if supplier_names is None:
+        return False
+    exempt = pinned_names | supplier_names
+    if _unpinned_install_moved(expected_installs, actual_installs, exempt):
         return False
     names = set(expected_versions) | set(actual_versions)
     moved = {
@@ -1005,7 +1183,7 @@ def _pin_replay_delta_allowed(
         for name in names
         if expected_versions.get(name, set()) != actual_versions.get(name, set())
     }
-    return moved <= pinned_names
+    return moved <= exempt
 
 
 SYNC_CLASS_SPEC = "docs/fork-sync-classes.json"
