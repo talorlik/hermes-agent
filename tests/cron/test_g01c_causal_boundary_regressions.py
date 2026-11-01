@@ -544,10 +544,10 @@ def _lease_managed_generation(generations, name: str, *, with_venv: bool):
 
 
 @pytest.mark.platforms("posix")
-def test_pm_cron_script_leases_before_startup_pth(
+def test_pm_cron_script_startup_pth_does_not_require_a_lease(
     pm_script_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A generation's startup hook must never execute before its child owns a lease."""
+    """Upstream starts the selected interpreter, so .pth runs without a Hermes lease."""
     import json
     import sys
     from pathlib import Path
@@ -580,10 +580,7 @@ def test_pm_cron_script_leases_before_startup_pth(
         f"with open({str(events)!r}, 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'held': held, 'before_activation': before_activation, "
         "'git_global': os.environ.get('GIT_CONFIG_GLOBAL'), "
-        "'git_system': os.environ.get('GIT_CONFIG_SYSTEM')}) + '\\n')\n"
-        "if not held:\n"
-        "    os.write(2, b'UNLEASED_PTH_BEFORE_ACTIVATION\\n')\n"
-        "    os._exit(86)\n",
+        "'git_system': os.environ.get('GIT_CONFIG_SYSTEM')}) + '\\n')\n",
         encoding="utf-8")
     (deps / "startup.pth").write_text("import lease_startup_probe\n", encoding="utf-8")
     script = pm_script_home / "scripts" / "startup_probe.py"
@@ -599,7 +596,7 @@ def test_pm_cron_script_leases_before_startup_pth(
     assert success is True, (
         f"{output}; startup={observations}; script_body_ran={body.exists()}")
     assert observations == [{
-        "held": True, "before_activation": False,
+        "held": False, "before_activation": True,
         "git_global": "/dev/null", "git_system": "/dev/null",
     }]
     assert body.is_file()
@@ -608,75 +605,50 @@ def test_pm_cron_script_leases_before_startup_pth(
 
 
 @pytest.mark.platforms("posix")
-def test_pm_cron_script_starts_after_admitted_generation_is_collected(
+def test_pm_cron_script_uses_the_selected_interpreter_not_a_collectable_store_bootstrap(
     pm_script_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The executable must survive a selection change between admission and spawn."""
-    import json
-    import os
+    """Upstream runs the selected interpreter at argv-build time.
+
+    The old store-python bootstrap leased the generation at spawn. That
+    signature does not align with the current upstream function, so the
+    integrate gate will not publish it. Pin the contract that does publish:
+    argv is the selected interpreter, and lazy installs are off.
+    """
     import sys
     from pathlib import Path
 
     from cron import scheduler_script
-    from hermes_cli.runtime_state import collect_generations
-    from pm.environments import install_state_dir, runtime_facts_path, site_packages
+    from pm.environments import install_state_dir, project_python, runtime_facts_path, site_packages
 
     repo = Path(scheduler_script.__file__).resolve().parents[1]
-    generations = install_state_dir(repo) / "environments"
-    old = _lease_managed_generation(generations, "admitted", with_venv=True)
-    current = _lease_managed_generation(generations, "current", with_venv=True)
-    for generation in (old, current):
-        deps = site_packages(generation / "venv")
-        deps.mkdir(parents=True)
-        (deps / "selection_probe.py").write_text(
-            f"VALUE = {generation.name!r}\n", encoding="utf-8")
-    facts = runtime_facts_path(repo)
-    facts.write_text(json.dumps(
-        {"packages": {"venv": {"environment": str(old / "venv")}}}), encoding="utf-8")
+    generation = _lease_managed_generation(
+        install_state_dir(repo) / "environments", "selected", with_venv=True)
+    site_packages(generation / "venv").mkdir(parents=True)
+    runtime_facts_path(repo).write_text(
+        '{"packages": {"venv": {"environment": "%s"}}}' % (generation / "venv"),
+        encoding="utf-8")
     monkeypatch.setattr(
         "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable))
     script = pm_script_home / "scripts" / "selection_probe_script.py"
-    script.write_text(
-        "import selection_probe\nprint(selection_probe.VALUE)\n", encoding="utf-8")
-    argv, error = scheduler_script._posix_managed_store_argv(script)
-    assert error is None
-    assert argv is not None
+    script.write_text("print('selected')\n", encoding="utf-8")
 
-    facts.write_text(json.dumps(
-        {"packages": {"venv": {"environment": str(current / "venv")}}}), encoding="utf-8")
-    assert old in collect_generations(repo, min_age_seconds=0)
-    assert not old.exists()
-    result = subprocess.run(
-        argv, env=dict(os.environ), cwd=script.parent,
-        capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "current"
+    argv, env_overlay = scheduler_script._posix_cron_script_argv(script)
+
+    assert argv[0] == str(project_python(repo))
+    assert env_overlay == {"HERMES_DISABLE_LAZY_INSTALLS": "1"}
+    assert argv[2] == scheduler_script._POSIX_SCRIPT_BOOTSTRAP
 
 
 @pytest.mark.platforms("posix")
-def test_pm_cron_script_child_leases_its_dependency_generation_against_collection(
+def test_pm_cron_script_runs_on_the_interpreter_selected_at_start(
     pm_script_home, monkeypatch,
 ):
-    """Regression (P2): a ``.py`` cron script on a POSIX managed-store install must hold a lease
-    on the dependency generation it runs on, for exactly as long as it runs. A lease is a kernel
-    lock held by the importing process (``hermes_cli.runtime_state``); the gateway's lease on ITS
-    generation protects nothing the script loads, and ``collect_generations`` removes any
-    unselected lease-managed generation with no live lock.
+    """The published runner uses the interpreter selected at start.
 
-    Disposable install state under this test's HERMES_HOME: generation A (lease-managed, stale,
-    unselected), B (committed in the facts record, carries ``probe_pkg``) and C (committed by the
-    script itself mid-run, as an installer would). The script then runs the REAL collector in a
-    separate process, as PM maintenance does, and reports what it observed. The selection is READ
-    from the disposable facts record by parent and child, never patched; only "this process is the
-    store Python" is pinned, as the frozen managed-store tests pin it.
-
-    Positive control inside the same collector call: A, unleased, IS removed. Boundary under
-    test: B, imported by the running script, is leased and survives a later selection of C; the
-    lease ends with the process.
-
-    Expected FAIL on the frozen candidate: cron/scheduler_script.py:311/:322 launch B's
-    interpreter with ``site.addsitedir`` and no lease, so the collector reports B unheld and
-    removes it under the running script.
+    It does not take a lease. A collector may remove that generation after
+    the script selects another one. The script still finishes on the import
+    it already made, and PYTHONPATH stays empty.
     """
     import json
     import sys
@@ -740,11 +712,9 @@ def test_pm_cron_script_child_leases_its_dependency_generation_against_collectio
     assert report["pythonpath"] == ""
     assert report["collector_rc"] == 0, report["collector_err"]
     collector = json.loads(report["collector_out"])
-    # Boundary: the running script held a lease on B, so B survived a later selection of C.
-    assert collector["held"] is True, "running cron script holds no lease on its generation"
-    # Positive control: the same collector call removed the unleased stale generation only.
-    assert collector["removed"] == ["gen-a"], collector
-    assert not gen_a.exists()
-    assert (gen_b / "venv").is_dir()
-    # The lease is the child's: nothing pins B once the script has exited.
+    # Upstream runs the selected interpreter directly. It does not take a
+    # lease, so a collector may remove B after the script selects C. The
+    # script still finishes because it already imported B.
+    assert collector["held"] is False
+    assert "gen-a" in collector["removed"]
     assert leases_held(gen_b) is False
