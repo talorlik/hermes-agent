@@ -92,11 +92,33 @@ from enum import Enum
 from pathlib import Path
 
 _CI_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _CI_DIR.parents[1]
+
+
+def _ledger_import_roots() -> tuple[Path, Path]:
+    """Return the helper directory and its repository root.
+
+    The in-repo checker finds ``sync_class_gate`` beside itself. A shipped
+    copy does not. It imports from ``HERMES_LEDGER_HELPER_DIR`` so the
+    repository being checked cannot supply the validator.
+    """
+    if (_CI_DIR / "sync_class_gate.py").is_file():
+        helper = _CI_DIR
+    else:
+        raw = os.environ.get("HERMES_LEDGER_HELPER_DIR")
+        if not raw:
+            raise SystemExit("shipped ledger checker requires HERMES_LEDGER_HELPER_DIR")
+        helper = Path(raw).resolve()
+        if not (helper / "sync_class_gate.py").is_file():
+            raise SystemExit(f"ledger helper dir is missing sync_class_gate.py: {helper}")
+    repo_root = helper.parents[1] if helper.name == "ci" else helper
+    return helper, repo_root
+
+
+_HELPER_DIR, _REPO_ROOT = _ledger_import_roots()
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-if str(_CI_DIR) not in sys.path:
-    sys.path.insert(0, str(_CI_DIR))
+if str(_HELPER_DIR) not in sys.path:
+    sys.path.insert(0, str(_HELPER_DIR))
 from sync_class_gate import delta_allowed
 from scripts.ci.sync_note_line import is_note_line
 

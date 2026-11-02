@@ -2607,3 +2607,18 @@ def test_exact_pin_does_not_exempt_another_locks_supplier(tmp_path: Path) -> Non
         [{"package": "electron-builder", "exact": "26.15.3", "lock": "package-lock.json"}],
     )
     assert names == set()
+
+
+def test_shipped_copy_imports_helpers_from_the_trusted_dir(tmp_path: Path) -> None:
+    shipped = tmp_path / "check_fork_ledger.py"
+    shipped.write_bytes(SCRIPT.read_bytes())
+    proc = subprocess.run(
+        [sys.executable, str(shipped), "--help"],
+        cwd=tmp_path,
+        env={**os.environ, "HERMES_LEDGER_HELPER_DIR": str(SCRIPT.parent)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "usage:" in proc.stdout.lower()
