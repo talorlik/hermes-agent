@@ -5080,6 +5080,29 @@ def _clean_class_holds(
     return True
 
 
+def _current_ownership_holds(
+    repo: Path,
+    tree: str,
+    first_parent: str,
+    current_entries: list[LedgerEntry] | None,
+) -> bool:
+    """A later ledger still rejects a sync that moves a path it now owns.
+
+    The class spec is the one that existed at the sync. Current ownership is
+    separate: a path the checked tip owns must still equal the fork parent.
+    """
+    if not current_entries:
+        return True
+    published = _tree_entries(repo, tree)
+    fork_entries = _tree_entries(repo, first_parent)
+    for path in set(published) | set(fork_entries):
+        if not _path_owned_by_active(path, current_entries):
+            continue
+        if not _same_or_both_absent(published, fork_entries, path):
+            return False
+    return True
+
+
 def _is_clean_upstream_sync(
     repo: Path,
     sha: str,
@@ -5088,6 +5111,7 @@ def _is_clean_upstream_sync(
     *,
     fork_tree: str | None = None,
     ledger_entries: list[LedgerEntry] | None = None,
+    current_entries: list[LedgerEntry] | None = None,
 ) -> bool:
     if len(parents) != 2:
         return False
@@ -5117,27 +5141,35 @@ def _is_clean_upstream_sync(
     expected_tree = expected_tree_raw.decode("ascii")
     actual_tree = _git(repo, "rev-parse", f"{sha}^{{tree}}")
     spec_tree = fork_tree or sha
+
+    def _accepted(ok: bool) -> bool:
+        return ok and _current_ownership_holds(
+            repo, actual_tree, first_parent, current_entries
+        )
+
     if proc.returncode == 0:
         if expected_tree == actual_tree:
-            return _clean_class_holds(
+            return _accepted(
+                _clean_class_holds(
+                    repo,
+                    actual_tree,
+                    first_parent,
+                    upstream_parent,
+                    fork_tree=spec_tree,
+                    ledger_entries=ledger_entries,
+                )
+            )
+        return _sync_delta_permitted(
                 repo,
+                expected_tree,
                 actual_tree,
                 first_parent,
                 upstream_parent,
                 fork_tree=spec_tree,
                 ledger_entries=ledger_entries,
+                conflict_paths=set(),
+                rename_paths=set(),
             )
-        return _sync_delta_permitted(
-            repo,
-            expected_tree,
-            actual_tree,
-            first_parent,
-            upstream_parent,
-            fork_tree=spec_tree,
-            ledger_entries=ledger_entries,
-            conflict_paths=set(),
-            rename_paths=set(),
-        )
     if not separator:
         return False
 
@@ -5219,16 +5251,16 @@ def _is_clean_upstream_sync(
             return False
 
     return _sync_delta_permitted(
-        repo,
-        expected_tree,
-        actual_tree,
-        first_parent,
-        upstream_parent,
-        fork_tree=spec_tree,
-        ledger_entries=ledger_entries,
-        conflict_paths=conflict_paths,
-        rename_paths=rename_paths,
-    )
+            repo,
+            expected_tree,
+            actual_tree,
+            first_parent,
+            upstream_parent,
+            fork_tree=spec_tree,
+            ledger_entries=ledger_entries,
+            conflict_paths=conflict_paths,
+            rename_paths=rename_paths,
+        )
 
 
 def _tree_entries(repo: Path, treeish: str) -> dict[str, tuple[str, str, str]]:
@@ -5723,8 +5755,8 @@ def _partition_range(
             sha,
             parents,
             upstream_oid,
-            fork_tree=fork_oid,
-            ledger_entries=entries,
+            fork_tree=sha,
+            current_entries=entries,
         )
     ]
     sync = set(sync_order)
@@ -5758,6 +5790,7 @@ def classify_range(
         f"{upstream_ref}..{fork_ref}",
     )
     fork_oid = _git(repo, "rev-parse", "--verify", f"{fork_ref}^{{commit}}")
+    current_entries = _ledger_entries_from_tree(repo, fork_oid)
     work: list[dict[str, str]] = []
     sync_merges: list[str] = []
     for line in out.splitlines():
@@ -5766,7 +5799,12 @@ def classify_range(
         sha, parents_raw, subject = line.split("\x00", 2)
         parents = parents_raw.split()
         if _is_clean_upstream_sync(
-            repo, sha, parents, upstream_ref, fork_tree=fork_oid
+            repo,
+            sha,
+            parents,
+            upstream_ref,
+            fork_tree=sha,
+            current_entries=current_entries,
         ):
             sync_merges.append(sha)
             continue

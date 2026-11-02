@@ -419,6 +419,60 @@ def test_missing_required_field_fails_with_named_field(tmp_path):
     assert any("Protected-Invariant" in p for p in invalid[0]["problems"])
 
 
+def test_later_class_spec_does_not_unmap_a_historical_clean_sync(tmp_path):
+    """A spec added after a clean sync must not reclassify that sync as work."""
+    repo = tmp_path / "historical-sync"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "package-lock.json", "upstream-lock\n", "chore: upstream lock")
+    _commit_file(repo, "core.py", "BASE = 1\n", "chore: upstream base")
+    _git(repo, "checkout", "-b", "fork-main")
+    lock_commit = _commit_file(
+        repo, "package-lock.json", "fork-lock\n", "feat(fork): keep fork lock"
+    )
+    _commit_file(
+        repo,
+        "docs/FORK_CHANGES.md",
+        "# Fork Change Ledger\n\n"
+        + _entry(
+            "G-LOCK",
+            "historical lock owner",
+            commits="none",
+            owned_files=["package-lock.json", "docs/FORK_CHANGES.md"],
+        ),
+        "docs(ledger): own the historical lock",
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "core.py", "BASE = 2\n", "feat: upstream advance")
+    _git(repo, "checkout", "fork-main")
+    _git(repo, "merge", "--no-ff", "-m", "sync(upstream): merge upstream", "upstream-main")
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    spec_commit = _commit_file(
+        repo,
+        "docs/fork-sync-classes.json",
+        '{"version": 1, "generated_unspecified": {"paths": []}, '
+        '"build_output": {"paths": []}, "auth_hold": {"paths": []}, '
+        '"structured_pin_contract": []}\n',
+        "docs: declare sync classes",
+    )
+    _write_ledger(
+        repo,
+        _entry(
+            "G-LOCK",
+            "historical lock owner",
+            commits=f"self, {lock_commit}, {spec_commit}",
+            owned_files=[
+                "package-lock.json",
+                "docs/FORK_CHANGES.md",
+                "docs/fork-sync-classes.json",
+            ],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert sync_merge in payload["sync_merges"]
+
+
 def test_sync_merge_commits_are_exempt_from_mapping(tmp_path):
     fx = _make_fork_repo(tmp_path)
     repo = fx["repo"]
