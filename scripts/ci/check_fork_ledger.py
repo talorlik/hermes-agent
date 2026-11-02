@@ -14,7 +14,12 @@ Both refs resolve once to immutable OIDs. Fork-only commits are
 only when it has exactly two parents in fork/upstream order and its committed
 tree equals the clean `git merge-tree --write-tree` result, or differs from that
 result only by a file-class rule from `docs/fork-sync-classes.json` (version
-1; a missing or wrong-version spec fails that check). Unspecified generated
+1; a missing or wrong-version spec fails that class-rule check, not a
+tree-equal merge). A later ledger rejects a tree-equal merge only when every
+path that differs from the fork parent is one that ledger now owns and the
+sync's own ledger did not. That keeps a one-path introduction from being
+laundered by a later claim. It does not unmap an upstream sync that also
+merged other files. Unspecified generated
 files are taken from upstream. Pin-named locks stay on the existing
 `docs/fork-npm-pins.json` replay: those locks and the manifests the spec names
 may differ only when every floor and exact pin is met and no unpinned package
@@ -51,8 +56,11 @@ already claims.
 dropped upstream lines only when the checked tip still keeps every current
 upstream line of each conflict path, in upstream order. Listing the SHA is not
 enough. A tip that drops a line leaves the commit unmapped and names the path.
-A later edit of the file is not a waiver: ownership attributes the edit, it does
-not prove the upstream lines survived it. A drop that is intentional belongs in
+A later edit is a waiver only when another owner holds the path and a later
+non-merge first-parent commit that changed it is already claimed by that
+owner. An unmapped later commit or an unowned path still fails. A conflict
+path current upstream no longer has is not a dropped line when an active
+owner holds the path. A drop that is intentional belongs in
 `Upstream-Line-Deletions`, which names the path and the blob of the upstream
 version whose lines were removed, so the deletion is audited text rather than an
 inferred consequence of some other commit.
@@ -5007,17 +5015,20 @@ def _clean_class_holds(
         dynamic = _pin_classified_paths(pins)
         touched = set(published) | set(fork_entries) | set(upstream_entries)
         for path in touched:
+            classified = path in dynamic or _classified_without_spec(path)
             owned = _path_owned_by_active(path, entries)
-            if path not in dynamic and not _classified_without_spec(path) and not owned:
+            if not classified and not owned:
                 continue
-            if owned:
+            if classified:
+                if owned and _same_or_both_absent(published, fork_entries, path):
+                    continue
                 if not _same_or_both_absent(published, fork_entries, path):
                     return False
+                if not _same_or_both_absent(published, upstream_entries, path):
+                    return False
                 continue
-            if not _same_or_both_absent(published, fork_entries, path):
-                return False
-            if not _same_or_both_absent(published, upstream_entries, path):
-                return False
+            # Owned source with no class spec: the caller already proved this
+            # tree is git's merge-tree. Movement is the merge, not a splice.
         return True
     entries = ledger_entries if ledger_entries is not None else _ledger_entries_from_tree(repo, fork_tree)
     pins = _pins_from_tree(repo, first_parent)
@@ -5085,22 +5096,33 @@ def _current_ownership_holds(
     tree: str,
     first_parent: str,
     current_entries: list[LedgerEntry] | None,
+    historical_entries: list[LedgerEntry] | None,
 ) -> bool:
-    """A later ledger still rejects a sync that moves a path it now owns.
+    """A later ledger rejects a sync that introduces a path it now owns.
 
-    The class spec is the one that existed at the sync. Current ownership is
-    separate: a path the checked tip owns must still equal the fork parent.
+    A path the sync's own ledger already owned is not that introduction.
+    Git's merge of an already-owned file stays a sync.
     """
     if not current_entries:
         return True
     published = _tree_entries(repo, tree)
     fork_entries = _tree_entries(repo, first_parent)
+    introduced: list[str] = []
+    other_moves: list[str] = []
     for path in set(published) | set(fork_entries):
-        if not _path_owned_by_active(path, current_entries):
+        if _same_or_both_absent(published, fork_entries, path):
             continue
-        if not _same_or_both_absent(published, fork_entries, path):
-            return False
-    return True
+        if (
+            _path_owned_by_active(path, current_entries)
+            and not (
+                historical_entries
+                and _path_owned_by_active(path, historical_entries)
+            )
+        ):
+            introduced.append(path)
+            continue
+        other_moves.append(path)
+    return not introduced or bool(other_moves)
 
 
 def _is_clean_upstream_sync(
@@ -5141,23 +5163,16 @@ def _is_clean_upstream_sync(
     expected_tree = expected_tree_raw.decode("ascii")
     actual_tree = _git(repo, "rev-parse", f"{sha}^{{tree}}")
     spec_tree = fork_tree or sha
-
-    def _accepted(ok: bool) -> bool:
-        return ok and _current_ownership_holds(
-            repo, actual_tree, first_parent, current_entries
-        )
+    historical_entries = (
+        ledger_entries
+        if ledger_entries is not None
+        else _ledger_entries_from_tree(repo, spec_tree)
+    )
 
     if proc.returncode == 0:
         if expected_tree == actual_tree:
-            return _accepted(
-                _clean_class_holds(
-                    repo,
-                    actual_tree,
-                    first_parent,
-                    upstream_parent,
-                    fork_tree=spec_tree,
-                    ledger_entries=ledger_entries,
-                )
+            return _current_ownership_holds(
+                repo, actual_tree, first_parent, current_entries, historical_entries
             )
         return _sync_delta_permitted(
                 repo,
@@ -5441,6 +5456,57 @@ def _classify_upstream_line_deletions(
     return waivers
 
 
+def _owner_claimed_shas(entry: LedgerEntry) -> set[str]:
+    claimed: set[str] = set()
+    for token in _SPEC_SPLIT.split(entry.fields.get("Commits", "")):
+        if _FULL_SHA.fullmatch(token):
+            claimed.add(token)
+    return claimed
+
+
+def _mapped_later_owner_rewrite(
+    repo: Path,
+    path: str,
+    merge_sha: str,
+    fork_oid: str,
+    entries: list[LedgerEntry],
+) -> bool:
+    """An owned later rewrite audits the conflict path. An unmapped one does not."""
+    owners = [
+        entry
+        for entry in entries
+        if entry.entry_id != "G-FORK-LEDGER" and _path_owned_by_active(path, [entry])
+    ]
+    claimed = set().union(*(_owner_claimed_shas(entry) for entry in owners)) if owners else set()
+    if not claimed:
+        return False
+    listed = _git(
+        repo,
+        "rev-list",
+        "--first-parent",
+        "--no-merges",
+        f"{merge_sha}..{fork_oid}",
+        "--",
+        path,
+    ).split()
+    return any(sha in claimed for sha in listed)
+
+
+def _owned_upstream_absence(
+    repo: Path,
+    path: str,
+    upstream_oid: str,
+    entries: list[LedgerEntry],
+) -> bool:
+    """An owned file upstream removed is a fork hold, not a dropped line."""
+    if _tree_entries(repo, upstream_oid).get(path) is not None:
+        return False
+    return any(
+        entry.entry_id != "G-FORK-LEDGER" and _path_owned_by_active(path, [entry])
+        for entry in entries
+    )
+
+
 def _classify_repaired_conflict_merges(
     repo: Path,
     entries: list[LedgerEntry],
@@ -5454,8 +5520,9 @@ def _classify_repaired_conflict_merges(
 
     The listing does not waive the commit. Verification uses the checked tip
     and the current upstream ref, so a later drop of those lines fails closed.
-    A later owned edit of the file is not a waiver: ownership attributes the
-    edit, it does not prove the upstream lines survived it.
+    A later edit covers a path only when its owner already claims a later
+    non-merge first-parent rewrite. An owned file upstream removed is a hold,
+    not a dropped line.
     """
     declarers = [
         entry for entry in entries if "Repaired-Conflict-Merges" in entry.fields
@@ -5544,6 +5611,12 @@ def _classify_repaired_conflict_merges(
                 repo, conflict_paths, upstream_oid, fork_oid
             )
             if path not in deleted_upstream_blobs
+            and not _mapped_later_owner_rewrite(
+                repo, path, token, fork_oid, entries
+            )
+            and not _owned_upstream_absence(
+                repo, path, upstream_oid, entries
+            )
         ]
         if missing:
             entry.problems.append(

@@ -473,6 +473,151 @@ def test_later_class_spec_does_not_unmap_a_historical_clean_sync(tmp_path):
     assert sync_merge in payload["sync_merges"]
 
 
+def test_mechanical_merge_of_owned_source_stays_a_sync_without_a_spec(tmp_path):
+    """Git's own merge of owned source is a sync. A later owner must not unmap it."""
+    repo = tmp_path / "mechanical-owned"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "owned.py", "A = 1\n\n\n\nB = 1\n", "chore: base")
+    _git(repo, "checkout", "-b", "fork-main")
+    owned_commit = _commit_file(
+        repo, "owned.py", "A = 1\n\n\n\nB = 2\n", "feat(fork): fork line"
+    )
+    _commit_file(
+        repo,
+        "docs/FORK_CHANGES.md",
+        "# Fork Change Ledger\n\n"
+        + _entry(
+            "G-OWNED",
+            "owned source",
+            commits=owned_commit,
+            owned_files=["owned.py", "docs/FORK_CHANGES.md"],
+        ),
+        "docs(ledger): own the source",
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "owned.py", "A = 2\n\n\n\nB = 1\n", "feat: upstream line")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-m",
+        "sync(upstream): merge upstream",
+        "upstream-main",
+    )
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(
+        repo,
+        _entry(
+            "G-OWNED",
+            "owned source",
+            commits=f"self, {owned_commit}",
+            owned_files=["owned.py", "docs/FORK_CHANGES.md"],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert sync_merge in payload["sync_merges"]
+
+
+def test_hand_edit_of_owned_source_is_not_a_clean_sync(tmp_path):
+    """A result that is not git's merge-tree stays unmapped work."""
+    repo = tmp_path / "spliced-owned"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "owned.py", "A = 1\n\n\n\nB = 1\n", "chore: base")
+    _git(repo, "checkout", "-b", "fork-main")
+    owned_commit = _commit_file(
+        repo, "owned.py", "A = 1\n\n\n\nB = 2\n", "feat(fork): fork line"
+    )
+    _commit_file(
+        repo,
+        "docs/FORK_CHANGES.md",
+        "# Fork Change Ledger\n\n"
+        + _entry(
+            "G-OWNED",
+            "owned source",
+            commits=owned_commit,
+            owned_files=["owned.py", "docs/FORK_CHANGES.md"],
+        ),
+        "docs(ledger): own the source",
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "owned.py", "A = 2\n\n\n\nB = 1\n", "feat: upstream line")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-m",
+        "sync(upstream): merge upstream",
+        "upstream-main",
+    )
+    (repo / "owned.py").write_text("A = 9\n\n\n\nB = 9\n", encoding="utf-8")
+    _git(repo, "add", "owned.py")
+    _git(repo, "commit", "--amend", "--no-edit")
+    spliced = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(
+        repo,
+        _entry(
+            "G-OWNED",
+            "owned source",
+            commits=f"self, {owned_commit}",
+            owned_files=["owned.py", "docs/FORK_CHANGES.md"],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 1
+    assert spliced not in payload.get("sync_merges", [])
+
+
+def test_mechanical_merge_of_unnamed_lock_is_still_a_sync(tmp_path):
+    """A tree-equal merge is a sync. Class rules apply when the tree differs."""
+    repo = tmp_path / "mechanical-lock"
+    repo.mkdir()
+    _git(repo, "init", "-b", "upstream-main")
+    _commit_file(repo, "package-lock.json", "A\n\n\n\nB\n", "chore: base lock")
+    _git(repo, "checkout", "-b", "fork-main")
+    owned = _commit_file(repo, "package-lock.json", "A\n\n\n\nB2\n", "feat(fork): fork lock")
+    _commit_file(
+        repo,
+        "docs/FORK_CHANGES.md",
+        "# Fork Change Ledger\n\n"
+        + _entry(
+            "G-LOCK",
+            "lock owner",
+            commits=owned,
+            owned_files=["package-lock.json", "docs/FORK_CHANGES.md"],
+        ),
+        "docs(ledger): own the lock",
+    )
+    _git(repo, "checkout", "upstream-main")
+    _commit_file(repo, "package-lock.json", "A2\n\n\n\nB\n", "feat: upstream lock")
+    _git(repo, "checkout", "fork-main")
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        "-m",
+        "sync(upstream): merge upstream",
+        "upstream-main",
+    )
+    sync_merge = _git(repo, "rev-parse", "HEAD")
+    _write_ledger(
+        repo,
+        _entry(
+            "G-LOCK",
+            "lock owner",
+            commits=f"self, {owned}",
+            owned_files=["package-lock.json", "docs/FORK_CHANGES.md"],
+        ),
+    )
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert sync_merge in payload["sync_merges"]
+
+
 def test_sync_merge_commits_are_exempt_from_mapping(tmp_path):
     fx = _make_fork_repo(tmp_path)
     repo = fx["repo"]
@@ -1651,6 +1796,36 @@ def test_repaired_conflict_merge_ignores_a_later_edit_of_an_unowned_path(tmp_pat
         for problem in entry["problems"]
     )
     assert "does not keep current upstream lines: shared.py" in problems
+
+
+def test_repaired_conflict_accepts_a_mapped_later_owned_rewrite(tmp_path):
+    """A listed conflict stays mapped when the owner later rewrote the path."""
+    fx = _conflict_drop_repo(tmp_path, "mapped-rewrite")
+    repo = Path(fx["repo"])
+    rewrite = _commit_file(
+        repo,
+        "shared.py",
+        "VALUE = 'fork-rewrite'\nEXTRA = 'fork'\n",
+        "owned rewrite of the shared module",
+    )
+    _write_ledger(repo, _repaired_ledger(f"{fx['custom']}, {rewrite}", fx["bad"]))
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert fx["bad"] in payload["repaired_conflict_merges"]
+
+
+def test_repaired_conflict_accepts_an_owned_file_upstream_deleted(tmp_path):
+    """An owned file upstream removed is not a dropped upstream line."""
+    fx = _conflict_drop_repo(tmp_path, "owned-absence")
+    repo = Path(fx["repo"])
+    _git(repo, "checkout", "upstream-main")
+    _git(repo, "rm", "shared.py")
+    _git(repo, "commit", "-m", "upstream deletes shared")
+    _git(repo, "checkout", "fork-main")
+    _write_ledger(repo, _repaired_ledger(fx["custom"], fx["bad"]))
+    code, payload = _run_checker(repo)
+    assert code == 0, payload
+    assert fx["bad"] in payload["repaired_conflict_merges"]
 
 
 def test_restored_conflict_merge_stays_unmapped_when_unlisted(tmp_path):
