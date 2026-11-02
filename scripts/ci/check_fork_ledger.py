@@ -1045,6 +1045,59 @@ def _supplier_delta_covered(
     ) <= _closure_versions(before_installs, closure, name)
 
 
+def _legacy_dependency_nodes(lock: dict) -> dict[str, tuple[str, str]]:
+    """Map each legacy dependency-tree node to its name and version."""
+    found: dict[str, tuple[str, str]] = {}
+
+    def walk(node: object, prefix: str) -> None:
+        if not isinstance(node, dict):
+            return
+        for name, meta in node.items():
+            if not isinstance(name, str) or not isinstance(meta, dict):
+                continue
+            path = f"{prefix}/{name}" if prefix else name
+            version = meta.get("version")
+            if isinstance(version, str) and version:
+                found[path] = (name, version)
+            nested = meta.get("dependencies")
+            if isinstance(nested, dict):
+                walk(nested, f"{path}/dependencies")
+
+    walk(lock.get("dependencies"), "dependencies")
+    return found
+
+
+def _legacy_node_in_closure(
+    path: str,
+    lock: dict,
+    nodes: dict[str, tuple[str, str]],
+    installs: dict[str, tuple[str, str]],
+    closure: set[str],
+) -> bool:
+    """A legacy node is covered only when it resolves to that closure install."""
+    pair = nodes.get(path)
+    if pair is None:
+        return False
+    name, version = pair
+    packages = lock.get("packages")
+    if not isinstance(packages, dict):
+        return False
+    parent = path.rsplit("/dependencies/", 1)[0] if "/dependencies/" in path else ""
+    if parent in ("", "dependencies"):
+        resolved = _resolve_supplier_install(packages, "", name)
+    else:
+        parent_name = parent.rsplit("/", 1)[-1]
+        parent_installs = [
+            install for install, installed in installs.items() if installed[0] == parent_name
+        ]
+        if len(parent_installs) != 1:
+            return False
+        resolved = _resolve_supplier_install(packages, parent_installs[0], name)
+    if resolved is None or resolved not in closure:
+        return False
+    return installs.get(resolved) == (name, version)
+
+
 def _exact_supplier_names(repo: Path, expected_tree: str, actual_tree: str, pins: list[dict]) -> set[str] | None:
     """Names whose changed installs all sit in an exact pin's dependency closure.
 
@@ -1080,6 +1133,22 @@ def _exact_supplier_names(repo: Path, expected_tree: str, actual_tree: str, pins
             return None
         if not isinstance(before, dict) or not isinstance(after, dict):
             return None
+        exact_names = _exact_names_for_lock(pins, path)
+        if not exact_names:
+            before_installs = _lock_install_paths(before)
+            after_installs = _lock_install_paths(after)
+            for install in set(before_installs) | set(after_installs):
+                if before_installs.get(install) == after_installs.get(install):
+                    continue
+                for pair in (before_installs.get(install), after_installs.get(install)):
+                    if pair is not None:
+                        illegal.add(pair[0])
+            before_versions = _lock_version_sets(before)
+            after_versions = _lock_version_sets(after)
+            for name in set(before_versions) | set(after_versions):
+                if before_versions.get(name, set()) != after_versions.get(name, set()):
+                    illegal.add(name)
+            continue
         closure = _exact_pin_closure_paths(before, exact_names) | _exact_pin_closure_paths(after, exact_names)
         before_installs = _lock_install_paths(before)
         after_installs = _lock_install_paths(after)
@@ -1116,6 +1185,22 @@ def _exact_supplier_names(repo: Path, expected_tree: str, actual_tree: str, pins
                 continue
             if before_versions.get(name, set()) != after_versions.get(name, set()):
                 illegal.add(name)
+        before_legacy = _legacy_dependency_nodes(before)
+        after_legacy = _legacy_dependency_nodes(after)
+        for path in set(before_legacy) | set(after_legacy):
+            if before_legacy.get(path) == after_legacy.get(path):
+                continue
+            before_ok = path not in before_legacy or _legacy_node_in_closure(
+                path, before, before_legacy, before_installs, closure
+            )
+            after_ok = path not in after_legacy or _legacy_node_in_closure(
+                path, after, after_legacy, after_installs, closure
+            )
+            if before_ok and after_ok:
+                continue
+            for pair in (before_legacy.get(path), after_legacy.get(path)):
+                if pair is not None:
+                    illegal.add(pair[0])
     return allowed - illegal
 
 
@@ -4043,6 +4128,24 @@ def _named_lock_paths(pins: list[dict[str, object]]) -> set[str]:
         else:
             named.add("package-lock.json")
     return named
+
+
+def _exact_names_for_lock(pins: list[dict], lock_path: str) -> set[str]:
+    """Exact pin names assigned to this lock. A missing lock field names package-lock.json."""
+    return {
+        pin["package"]
+        for pin in pins
+        if isinstance(pin.get("package"), str)
+        and pin.get("package")
+        and isinstance(pin.get("exact"), str)
+        and pin.get("exact")
+        and (
+            pin.get("lock")
+            if isinstance(pin.get("lock"), str) and pin.get("lock")
+            else "package-lock.json"
+        )
+        == lock_path
+    }
 
 
 def _pin_classified_paths(pins: list[dict[str, object]]) -> set[str]:
