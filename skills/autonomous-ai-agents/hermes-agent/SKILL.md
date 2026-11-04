@@ -107,6 +107,7 @@ Profiles use `~/.hermes/profiles/<name>/` with the same layout. When a profile i
 | Windows-specific issues (keybinds, WinError 10106, BOM) | `references/windows-quirks.md` |
 | Debugging: voice, tools missing, gateway, aux models, defunct kernel child | `references/troubleshooting.md` |
 | Stop another local desktop session without killing the gateway | `references/troubleshooting.md` |
+| Save state before host shutdown or power-off | `references/host-shutdown-state-flush.md` |
 | Contributing code: adding tools, slash commands, tests | `references/contributor-guide.md` |
 | delegate_task "capped at N" reports | `references/delegate-task-concurrency-diagnosis.md` |
 | "Can app X use my Nous Portal subscription/OAuth?" | `references/portal-auth-for-third-party-apps.md` |
