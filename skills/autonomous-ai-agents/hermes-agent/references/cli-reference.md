@@ -128,6 +128,7 @@ hermes memory setup|status|off|reset   Memory provider
 hermes secrets bitwarden|onepassword   External secret stores
 hermes moa                  Mixture-of-Agents slots
 hermes hooks / security / backup / import / checkpoints / console
+# host power-off flush: hermes backup -q  (see references/host-shutdown-state-flush.md)
 hermes logs [-f] [errors]   View agent/error logs
 hermes send                 One-off message through a gateway platform
 hermes pairing / plugins / insights / journey / computer-use
