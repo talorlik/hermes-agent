@@ -791,6 +791,7 @@ from hermes_cli.web_routers import (
     config_env as _config_env_routes,
     models as _models_routes,
     messaging as _messaging_routes,
+    messaging_relay as _messaging_relay_routes,
     oauth as _oauth_routes,
     cron as _cron_routes,
     mcp as _mcp_routes,
@@ -832,6 +833,7 @@ app.include_router(_config_env_routes.config_router)
 app.include_router(_models_routes.router)
 app.include_router(_config_env_routes.router)
 app.include_router(_messaging_routes.router)
+app.include_router(_messaging_relay_routes.router)
 app.include_router(_oauth_routes.router)
 app.include_router(_sessions_routes.manage_router)
 app.include_router(_status_routes.logs_router)
@@ -1524,7 +1526,6 @@ def start_server(
                 await server.shutdown()
 
     _run_serve(_serve, config, host, port)
-
 _PLUGIN_COMPAT_LAZY = {
     'AudioTranscriptionRequest': ('hermes_cli.web_models', 'AudioTranscriptionRequest'),
     'AutomationBlueprintInstantiate': ('hermes_cli.web_models', 'AutomationBlueprintInstantiate'),
@@ -1889,8 +1890,6 @@ _PLUGIN_COMPAT_LAZY = {
     'windows_hide_flags': ('hermes_cli._subprocess_compat', 'windows_hide_flags'),
     'write_platform_config_field': ('hermes_cli.config', 'write_platform_config_field'),
 }
-
-
 def __getattr__(name):  # PEP 562 — lazy so no import cycles
     target = _PLUGIN_COMPAT_LAZY.get(name)
     if target is None:

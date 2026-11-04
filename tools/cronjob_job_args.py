@@ -177,7 +177,7 @@ def _mode_guidance_notes(job: dict[str, Any], user_deliver: Optional[str]) -> li
             parts = target.strip().split(":")
             if (
                 len(parts) == 2
-                and parts[0] not in ("bot-chat", "sms")
+                and parts[0] not in ("bot-chat", "room", "sms")
                 and parts[1]
                 and not parts[1].startswith("#")):
                 notes.append(
@@ -514,8 +514,6 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]
-    if job.get("script"):
-            "script_failure_policy", "continue"
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]
