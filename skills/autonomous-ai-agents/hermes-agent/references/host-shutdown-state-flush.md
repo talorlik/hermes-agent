@@ -22,3 +22,5 @@ Use when the user is about to power off, shut the computer, or otherwise cut the
 6. Tell the user they can cut power after the confirmation is on screen. The final reply commits after delivery, so a checkpoint taken during the turn does not include it. If synchronous is `FULL`, WAL replay recovers that commit. If it is not, schedule a delayed `TRUNCATE` plus `sync` a few seconds after the reply with `terminal(background=true)`. A foreground command that ends in `&` is rejected; do not use that form.
 
 Do not kill OpenViking as part of the save. The host stop tears it down. Checkpoint its sqlite and sync.
+
+A planned host restart is a different ceremony. Load `references/planned-restart-durability.md`. Do not infer schedule pause or resume from this flush.

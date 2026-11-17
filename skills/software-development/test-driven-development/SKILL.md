@@ -362,3 +362,31 @@ Otherwise → not TDD
 ```
 
 No exceptions without the user's explicit permission.
+
+## Adversarial tests for preservation and non-deletion contracts
+
+DDA-2026-11-12-02 did not choose between the testing skill and the code-review skill. Both carry this procedure. Do not create a parallel skill. Generalize the method. Do not retain repository commits, branch names, worktree paths, policy version strings, or temporary test state. This complements the existing independent-verification rule. Do not record an unproven claim as established fact.
+
+DDA-2026-11-12-02 — Adversarial tests for preservation and non-deletion contracts**
+  - Classification: skill
+  - Proposal: when a change promises both fallback behavior and preservation, require tests that independently prove each constraint:
+    1. Construct a fixture where the expected fitted result differs from the raw upstream input.
+    2. Include a valid, non-conflicting local addition and assert that it survives.
+    3. Assert that every required upstream line remains present.
+    4. Assert that malformed or contradictory material is recorded but not published.
+    5. Assert that safety artifacts required to remain, such as seals or markers, still exist after policy mismatch handling.
+    6. Update test names and comments when policy versions change.
+  - Evidence: the independent review found that the JSON test would also pass if the implementation replaced fitted text with the upstream blob, that seal retention was not asserted, and that one test name still described the previous policy transition.
+  - Rationale: passing tests are insufficient when their fixtures cannot distinguish the intended implementation from a forbidden shortcut. This complements the existing independent-verification rule.
+  - Promotion constraint: generalize the method; do not retain repository commits, branch names, worktree paths, policy version strings, or temporary test state.
+
+When a change promises both fallback behavior and preservation, require tests that independently prove each constraint:
+
+1. Construct a fixture where the expected fitted result differs from the raw upstream input. A test that still passes if fitted text is replaced by the raw upstream input does not prove the fallback.
+2. Include a valid, non-conflicting local addition and assert that it survives.
+3. Assert that every required upstream line remains present.
+4. Assert that malformed or contradictory material is recorded but not published.
+5. Assert that safety artifacts required to remain, such as seals or markers, still exist after policy mismatch handling.
+6. Update test names and comments when policy versions change. Do not keep a name or comment that describes a previous policy transition.
+
+Passing tests are insufficient when their fixtures cannot distinguish the intended implementation from a forbidden shortcut.
