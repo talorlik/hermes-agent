@@ -1005,10 +1005,6 @@ def _install_rebuilt_desktop_app(desktop_dir: Path, candidates: list[Path]) -> t
     if rebuilt_exe is None:
         return [], []
     # .../Hermes.app/Contents/MacOS/Hermes -> .../Hermes.app
-    # A checkout that does not own the installed app must not scan running
-    # bundles either: that scan resolves the live Hermes.app under the home.
-    if not _installed_desktop_apps():
-        return [], []
     return _install_rebuilt_macos_bundles(
         rebuilt_exe.parents[2], candidates, running=_running_macos_app_bundles())
 

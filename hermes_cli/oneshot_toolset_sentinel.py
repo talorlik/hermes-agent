@@ -7,6 +7,8 @@ and an upstream rewrite of it merges without a conflict.
 
 from __future__ import annotations
 
+import sys
+
 
 # Reserved oneshot-only sentinel. Exact lowercase "none" is an explicit empty
 # tool set. It is not a toolset name. The TUI also calls _normalize_toolsets,
@@ -61,3 +63,18 @@ def _precheck_explicit_toolsets(
             "'all' alone, or list specific toolsets.\n"
         )
     return None
+
+
+def refuse_malformed_oneshot_toolsets(toolsets: object = None) -> None:
+    """Exit 2 with the refusal text when a oneshot toolset list misuses a reserved name.
+
+    The single call site is ``hermes_cli.gateway_chat._requested_policy``. An
+    accepted ``none`` returns silently and is sent as written: the gateway maps
+    exact ``["none"]`` to the empty tool set, and the frozen launch request must
+    stay equal to what ``hermes chat -t none`` and earlier sessions sent, or
+    resume refuses.
+    """
+    decision = _precheck_explicit_toolsets(toolsets)
+    if decision is not None and decision[1]:
+        sys.stderr.write(decision[1])
+        raise SystemExit(2)

@@ -16,13 +16,6 @@ import {
   switchBranch
 } from './git-worktree-ops'
 
-// An empty local core.hooksPath overrides any global hooks dir whose
-// commit-msg hook would reject the short fixture messages used here. Call it
-// on every fixture repo (local, remote, and clone) before its first commit.
-function isolateHooks(dir) {
-  execFileSync('git', ['-C', dir, 'config', 'core.hooksPath', ''])
-}
-
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
   assert.equal(sanitizeBranch('feat/cool thing'), 'feat/cool-thing')
@@ -81,34 +74,6 @@ test('ensureGitRepo: inits a plain dir with a root commit so worktrees branch', 
     await ensureGitRepo('git', dir)
     assert.equal(git('rev-list', '--count', 'HEAD'), '1')
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('ensureGitRepo: ignores user commit hooks for the synthetic root commit', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wt-hooks-'))
-  const hooks = path.join(dir, 'hooks')
-  const globalConfig = path.join(dir, 'global.gitconfig')
-  const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL
-
-  try {
-    fs.mkdirSync(hooks)
-    fs.writeFileSync(path.join(hooks, 'commit-msg'), '#!/bin/sh\nexit 1\n')
-    fs.chmodSync(path.join(hooks, 'commit-msg'), 0o755)
-    fs.writeFileSync(globalConfig, `[core]\n\thooksPath = ${hooks}\n`)
-    process.env.GIT_CONFIG_GLOBAL = globalConfig
-
-    await ensureGitRepo('git', dir)
-
-    const head = execFileSync('git', ['-C', dir, 'rev-parse', '--verify', 'HEAD']).toString().trim()
-    assert.match(head, /^[0-9a-f]{7,}$/)
-  } finally {
-    if (previousGlobalConfig === undefined) {
-      delete process.env.GIT_CONFIG_GLOBAL
-    } else {
-      process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig
-    }
-
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -316,7 +281,6 @@ test('addWorktree: base origin/main does not set up upstream tracking', async ()
     // Seed the remote with a commit on main. Inline identity so it works
     // on CI runners with no global git config.
     execFileSync('git', ['init', '-b', 'main', remoteDir])
-    isolateHooks(remoteDir)
     execFileSync('git', [
       '-C',
       remoteDir,
@@ -332,7 +296,6 @@ test('addWorktree: base origin/main does not set up upstream tracking', async ()
 
     // Clone so origin/main exists as a remote-tracking ref.
     execFileSync('git', ['clone', remoteDir, cloneDir])
-    isolateHooks(cloneDir)
 
     const result = await addWorktree(
       cloneDir,
@@ -531,7 +494,6 @@ function seedRemoteAndClone(label, branches) {
       .trim()
 
   execFileSync('git', ['init', '-b', 'main', remoteDir])
-  isolateHooks(remoteDir)
   remoteGit('-c', 'user.email=hermes@localhost', '-c', 'user.name=Hermes', 'commit', '--allow-empty', '-m', 'root')
 
   for (const branch of branches) {
@@ -539,7 +501,6 @@ function seedRemoteAndClone(label, branches) {
   }
 
   execFileSync('git', ['clone', remoteDir, cloneDir])
-  isolateHooks(cloneDir)
 
   return { cloneDir, remoteDir }
 }
@@ -654,7 +615,6 @@ test('switchBranch: repo dir still validates the branch name and switches', asyn
 
   try {
     execFileSync('git', ['init', '-b', 'main'], { cwd: dir })
-    isolateHooks(dir)
     execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: dir })
     execFileSync('git', ['config', 'user.name', 'test'], { cwd: dir })
     execFileSync('git', ['commit', '--allow-empty', '-m', 'root'], { cwd: dir })

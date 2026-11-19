@@ -26,7 +26,6 @@ from hermes_cli.config import (
     reload_env,
     redact_key,
     OPTIONAL_ENV_VARS,
-    DEFAULT_CONFIG,
 )
 from hermes_cli.config_secret_refs import provider_name_key_env
 import gateway.status as _gw_status

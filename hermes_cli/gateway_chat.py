@@ -281,19 +281,11 @@ def _launch_flags(args):
 
 def _requested_policy(args):
     policy = _launch_flags(args)
-    if getattr(args, "oneshot", None) and "toolsets" in policy:
-        from hermes_cli.oneshot_toolset_sentinel import _precheck_explicit_toolsets
-
-        early = _precheck_explicit_toolsets(policy["toolsets"])
-        if early is not None and early[1]:
-            sys.stderr.write(early[1])
-            raise SystemExit(2)
-        # An accepted "none" is sent as written. The gateway maps exact ["none"]
-        # to the empty tool set, and the frozen launch request must stay equal to
-        # what `hermes chat -t none` and earlier sessions sent, or resume refuses.
-    toolsets = policy.get("toolsets")
-    if isinstance(toolsets, str):
-        policy["toolsets"] = [name.strip() for name in toolsets.split(",") if name.strip()]
+    if getattr(args, "oneshot", None) and "toolsets" in policy:  # fork: G-ONESHOT-ISOLATION
+        from hermes_cli.oneshot_toolset_sentinel import refuse_malformed_oneshot_toolsets
+        refuse_malformed_oneshot_toolsets(policy["toolsets"])
+    if isinstance(policy.get("toolsets"), str):
+        policy["toolsets"] = [name.strip() for name in policy["toolsets"].split(",") if name.strip()]
     if "skills" in policy:
         # `-s a,b -s c` (argparse append) or cli.main's comma string: one deduplicated list.
         raw = policy["skills"] if isinstance(policy["skills"], (list, tuple)) else [policy["skills"]]

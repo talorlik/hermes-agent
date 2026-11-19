@@ -809,11 +809,7 @@ def _pop_exited_kernels() -> list[SessionKernel]:
         proc = kernel.proc
         if proc is None:
             continue
-        try:
-            exited = proc.poll() is not None
-        except Exception:
-            continue
-        if exited and kernel.attached == 0:
+        if proc.poll() is not None and kernel.attached == 0:
             doomed.append(_KERNELS.pop(key))
     return doomed
 
