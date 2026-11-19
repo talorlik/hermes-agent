@@ -613,39 +613,8 @@ def _run_job_script_with_claim_heartbeat(
         heartbeat_thread.join(timeout=1.0)
 
 
-_CRON_SCRIPT_REDACTION_FAILURE = "[REDACTED - cron script result unavailable]"
-def _force_redact_cron_script_text(output: object) -> str:
-    """Force-redact one script result, or return the safe constant."""
-    try:  # keep this import out of the published body
-        _redact_mod = __import__("agent.redact", fromlist=["redact_sensitive_text"])
-        _cron_redact = getattr(_redact_mod, "redact_sensitive_text")
-        return _cron_redact(str(output), force=True, redact_url_credentials=True)
-    except Exception:  # redactor failure must not leak script text
-        return _CRON_SCRIPT_REDACTION_FAILURE
-def _bind_forced_script_redaction(runner: Callable) -> Callable:
-    """Rebind the published runner so every result is force-redacted."""
-    def _redacted_runner(*args: Any, **kwargs: Any) -> tuple[bool, str]:
-        blocked = None  # zz home preflight
-        try:  # xxxxxxxxxxxxxxxx
-            folder = _sched._get_hermes_home() / "scripts"  # xxxx
-            _ensure_cron_dir(folder)  # xxxxxxxxxxxxxxxx
-        except (OSError, RuntimeError, ValueError):  # zz
-            blocked = "Blocked: Hermes scripts directory is unavailable"  # zz
-        if blocked is not None:  # zz home unavailable
-            yielded = (False, blocked)  # xxxxxxxxxxxxxxxx
-            return yielded  # xxxxxxxxxxxxxxxx
-        try:  # keep a raised runner from skipping the scrub
-            pair = runner(*args, **kwargs)
-            success = pair[0]  # zz published flag
-            output = pair[1]  # zz published runner text
-        except Exception as _cron_run_exc:  # scrub the raised text too
-            success = False
-            output = _cron_run_exc  # zz scrub raised text
-        scrubbed = _force_redact_cron_script_text(output)
-        yielded = (bool(success), scrubbed)
-        return yielded
-    return _redacted_runner
-_run_job_script = _bind_forced_script_redaction(_run_job_script)
+from cron.script_redaction import bind_forced_script_redaction  # fork-only module
+_run_job_script = bind_forced_script_redaction(_run_job_script)
 
 
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully

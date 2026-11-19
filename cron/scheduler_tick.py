@@ -123,8 +123,6 @@ def _tick_admitted(
             return 0
 
         _pre_dispatch_housekeeping(_sched, headless)
-        # Durable delivery backlog (outbox) replays BEFORE any new run: a healed channel drains
-        # yesterday's pending notices ahead of today's, and an idle tick still retries them.
         # Periodic worktree GC (6h, threaded) — the only sweep gateway-only boxes get.
         try:
             _sched._maybe_run_worktree_maintenance()

@@ -28,7 +28,6 @@ All of this is available to Hermes itself through the `cronjob_manage` tool, so 
 
 - **Per-job pin** — a job that carries its own model. Set it to a specific model via the dashboard, `hermes cron create/edit --model … --provider …`, or by editing `~/.hermes/cron/jobs.json`; or **lock in the current main model** with `hermes cron create/edit --pin` (the agent's `cronjob_manage` tool can do this too with `pinned=true`, but only when you ask it to). `--unpin` (`pinned=false`) releases the lock. The agent cannot point a job at a *different* model — inference pins are user-owned.
 - **`cron.model` / `cron.model_provider`** — a cron-fleet default: every unpinned job runs on this model, independent of your chat model. Set it once (`hermes config set cron.model <name>`) and switching your chat model with `hermes model` or `/model` never touches your cron fleet.
-- **Global default** — only when neither of the above is set does a job follow `hermes model`. Hermes **snapshots** the provider and model at creation, and that snapshot is the job's effective pin: if you later switch the global default (`hermes model`, `/model`, `hermes config set model.default …`), the job **keeps running on the model and provider it was created under** and logs one INFO line per run noting the difference. A global model change never stops a scheduled job, and an unattended job never silently inherits a switch to a paid provider/model (#44585). To move a job to the new default, **resnap** it (`hermes cron resnap <job_id>`, or `--all` for every unpinned job) so it adopts the current default while staying unpinned, pin it (`hermes cron edit <job_id> --provider <provider> --model <model>`), or set `cron.model` to move the whole fleet at once. Jobs created before snapshots existed keep following the live global default.
 - **Main agent model** — when neither of the above is set, a job runs on whatever `hermes model` / `/model` is set to **at the moment it fires**. Change your main model and every unpinned job follows on its next run.
 
 Whichever provider a job resolves to, its provider-specific request settings (e.g. `request_overrides` such as `extra_body`/`extra_headers` for custom providers) carry into the scheduled run just like an interactive session.
@@ -136,7 +135,6 @@ Or: `hermes config set cron.preflight false`
 
 ## Moving unpinned jobs to a new global default
 
-An unpinned job stays on the provider/model it was created under, so changing your chat model
 An unpinned job follows the main agent model, so `hermes model` moves your cron fleet with it.
 When you want a job to *stay* on a model:
 
@@ -148,10 +146,6 @@ hermes config set cron.model <model>                              # every unpinn
 ```
 
 `hermes cron list` and the `cronjob_manage` tool report `pinned` per job.
-keep their original model so you can decide deliberately. Stored snapshots are refreshed whenever
-you edit a job's provider, model, or base URL.
-pinning it, so it keeps tracking future changes:
-The agent-facing `cronjob` tool accepts the same action (`action=resnap job_id=<id>` or
 
 ## Skill-backed cron jobs
 
@@ -1166,7 +1160,6 @@ If the primary API key is rate-limited or the provider returns an error, the cro
 - **Rotate to the next credential** in your [credential pool](../configuration.md#credential-pool-strategies) for the same provider. This applies to every job, pinned or not.
 - **Fall back to an alternate provider** from `fallback_providers` (or the legacy `fallback_model`) in `config.yaml` — **unpinned jobs only**. That covers a failure while resolving credentials before the run starts and a provider error mid-run.
 
-This means cron jobs that run at high frequency or during peak hours are more resilient — a single rate-limited key won't fail the entire run.
 A job with its own `provider`, `model` or `base_url` (set with `--provider` / `--model`, `--pin`, the dashboard, or `jobs.json`) never falls back to the global chain. The pin says which route the job runs on, and a fallback entry is a different provider and usually a different model, so when the pinned route fails the run fails and the failure alert says so. This is the same rule [subagent delegation](./delegation.md) applies to a pinned child. To keep fallback for a job, leave it unpinned: it follows `cron.model` / `cron.model_provider` (or the main model) and walks the chain like any other unpinned job.
 
 Before this rule, a pinned job whose provider failed could run on the first working `fallback_providers` entry instead, with a one-line notice in its output. If you relied on that, unpin the job (`hermes cron edit <job_id> --unpin`) and set the model through `cron.model` instead.
@@ -1416,23 +1409,6 @@ print(json.dumps({"wakeAgent": True, "context": {"new_issues": latest - prev}}))
 
 When `wakeAgent` is omitted, the default is `true` (wake the agent as usual).
 
-#### Failing closed when the pre-check breaks
-Agent-backed scripts default to `script_failure_policy="continue"` for backward
-compatibility. If the script is missing, unreadable, cannot launch, times out, or
-exits non-zero, Hermes injects the script error into the agent prompt and lets
-the agent report it.
-Set `script_failure_policy="fail_closed"` when the script is a safety gate whose
-failure must prevent the agent from running. In this mode, any pre-run script
-failure records a failed cron run and returns before prompt construction, model
-resolution, or agent startup. Failure details are redacted and bounded. A
-successful script behaves normally, including a successful
-`{"wakeAgent": false}` result remaining a silent successful skip.
-  --script feed-safety-gate.py \
-  --script-failure-policy fail_closed
-        script="feed-safety-gate.py",
-        script_failure_policy="fail_closed",
-        prompt="Process the feed only after the gate succeeds.")
-hermes cron edit <job_id> --script "" --script-failure-policy continue
 #### Recipes: cheap pre-run gates
 
 The `wakeAgent` gate gives you a $0 way to decide whether a scheduled job should spend any LLM tokens at all. Three patterns cover most use cases.

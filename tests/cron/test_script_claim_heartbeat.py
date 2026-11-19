@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 import contextlib
-import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -15,7 +14,6 @@ import pytest
 @pytest.mark.parametrize("trigger", ["cancel", "timeout"])
 @pytest.mark.parametrize("topology", ["detached", "stubborn-pipe"])
 def test_script_termination_reaps_descendants(tmp_path, monkeypatch, trigger, topology):
-    """Losing a fire claim must stop both the script and its descendants."""
     import os
     import psutil
     from cron import scheduler, scheduler_script
@@ -51,8 +49,6 @@ def test_script_termination_reaps_descendants(tmp_path, monkeypatch, trigger, to
     thread = threading.Thread(target=run)
     thread.start()
     pid = None
-    # TERM grace (1s) + KILL + bounded drain (5s) + margin: must return well
-    # before the unbounded-communicate hang this regresses against.
     try:
         deadline = time.monotonic() + 10
         while not ready.exists() and not errors and time.monotonic() < deadline:
