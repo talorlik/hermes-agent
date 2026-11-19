@@ -11,7 +11,6 @@ import types
 
 import pytest
 
-import cli as cli_mod
 from hermes_cli import main as main_mod
 from hermes_cli import mcp_startup
 
@@ -445,9 +444,6 @@ def test_lazy_only_discovery_counts_as_usable_at_both_startup_sites(monkeypatch,
     assert any("retrying discovery thread" in w for w in warnings) is retried
 
 
-def _emit(payload):
-    sys.stdout.write("EVT " + json.dumps(payload) + "\n")
-    sys.stdout.flush()
 def test_server_added_after_discovery_is_connected_by_the_next_agent_build(monkeypatch, tmp_path):
     """#76954: ``hermes mcp add`` against a running Desktop backend. Discovery already ran and left
     ``github`` live, so the re-entry every agent build makes returned early and the new server's
@@ -478,7 +474,6 @@ def test_server_added_after_discovery_is_connected_by_the_next_agent_build(monke
     build_agent()  # new session, config unchanged: github is live, nothing to do
     assert len(runs) == 1
 
-def _cap(name):
     configured["linear"] = {"url": "https://mcp.example.test/linear"}  # hermes mcp add linear
     build_agent()
     assert len(runs) == 2

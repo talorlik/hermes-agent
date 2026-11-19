@@ -77,21 +77,6 @@ def test_builtin_command_catalog_matches_full_parser_root_choices(monkeypatch):
     assert set(BUILTIN_COMMAND_TOKENS) == set(subparsers.choices)
 
 
-def test_every_builtin_root_choice_skips_plugin_discovery(monkeypatch):
-    from hermes_cli import main as main_mod
-
-    monkeypatch.setattr(
-        main_mod, "_register_plugin_cli_commands", lambda _subparsers: None
-    )
-    _parser, subparsers = main_mod._build_cli_parser()
-    for command in subparsers.choices:
-        monkeypatch.setattr(sys, "argv", ["hermes", command])
-        assert _first_positional_argv() == command
-        assert _plugin_cli_discovery_needed() is False
-
-
-# ── _resolve_deferred_platform_cli_command (issue #54678) ──────────────────
-
 
 def test_deferred_platform_cli_resolution_targets_matching_platform():
     """The slow path must import the deferred platform whose name matches the

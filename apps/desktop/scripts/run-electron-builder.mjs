@@ -7,7 +7,6 @@ import { isMain } from './utils.mjs'
 import { readPackagingInputs, preparationRequired } from './prepared-packaging.mjs'
 import { readNativeInputs } from './prepared-native-deps.mjs'
 import { pinnedPackageRoot } from './prepare-packaging-tools.mjs'
-import { installedBuilderVersion, toolsetOverridesForBuilder, writeAdaptedConfig } from './builder-config-26.mjs'
 
 const source = path.resolve(import.meta.dirname, '../../..')
 const app = path.join(source, 'apps/desktop')
@@ -77,13 +76,13 @@ function toolsetArguments(inputs) {
   const config = require(path.join(app, 'electron-builder.config.cjs'))
   const tools = path.join(app, config.directories?.buildResources || 'build', 'prepared-packaging-tools')
   fs.mkdirSync(tools, { recursive: true })
-  for (const [name, directory] of Object.entries(inputs.toolsets)) {
+  return Object.entries(inputs.toolsets).map(([name, directory]) => {
     const destination = path.join(tools, name)
     fs.rmSync(destination, { recursive: true, force: true })
     fs.cpSync(directory, destination, { recursive: true, verbatimSymlinks: true })
-  }
-  // 26.15.3 rejects file:// toolset URLs. The builder downloads its own tools.
-  return toolsetOverridesForBuilder(installedBuilderVersion(app))
+    // Upstream parses this as a literal path after slicing file:// (not URL decoding).
+    return `-c.toolsets.${name}.url=file://${destination}`
+  })
 }
 
 /**
@@ -160,10 +159,8 @@ export function runElectronBuilder(args, { spawn = spawnSync } = {}) {
     HERMES_PREPARED_NATIVE_DEPS: nativeDeps, HERMES_PREPARED_TARGET: inputs.target }
   if (inputs.dmgbuild) env.CUSTOM_DMGBUILD_PATH = inputs.dmgbuild
   if (inputs.windows?.dotnetRoot) env.DOTNET_ROOT = inputs.windows.dotnetRoot
-  const builderVersion = installedBuilderVersion(app)
-  const adaptedConfig = writeAdaptedConfig(path.join(app, 'electron-builder.config.cjs'), builderVersion, path.dirname(manifest))
   const result = spawn(process.execPath, [...preloads, path.join(builder, bin), ...args,
-    '--config', adaptedConfig, '--publish', 'never', `-c.electronDist=${inputs.electron}`,
+    '--config', 'electron-builder.config.cjs', '--publish', 'never', `-c.electronDist=${inputs.electron}`,
     ...toolsetArguments(inputs)], { cwd: app, stdio: 'inherit', env })
   if (result.error) throw result.error
   return result.status ?? 1

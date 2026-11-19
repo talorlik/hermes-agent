@@ -200,7 +200,6 @@ def cron_list(show_all: bool = False):
             ("[active]", Colors.GREEN) if job.get("enabled", True) else ("[disabled]", Colors.RED))
         print(f"  {color(job.get('id', '?'), Colors.YELLOW)} {color(*badge)}")
         for label, value in _job_rows(job):
-            # short label, and still readable for the long "Script failure policy" row.
             print(f"    {label + ':':<11}{value}")
         for line in _job_warnings(job):
             print(f"    {line}")
@@ -242,8 +241,6 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
-        # Stored policy, shown only for script jobs (it governs nothing without a script); the
-        # value is displayed as recorded, never defaulted here.
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
@@ -827,7 +824,6 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     _print_job_details(result.get("job", {}))
-    _print_stored_script_policy(result["job_id"])
     if not result.get("job", {}).get("enabled", True):
         print("  Created PAUSED — resume to schedule, or explicitly run now.")
     else:

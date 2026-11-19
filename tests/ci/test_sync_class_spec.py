@@ -97,17 +97,9 @@ def test_fork_sync_classes_declares_version_one_classes() -> None:
     ]
     assert document["auth_hold"]["ledger_entry"] == "G-ORIGIN-WORKFLOWS"
     assert document["auth_hold"]["reason"] == "token cannot update workflow files"
-    assert document["structured_pin_contract"] == [
-        {
-            "manifest": "apps/desktop/package.json",
-            "package": "electron-builder",
-            "field": "devDependencies",
-            "constants": [
-                "apps/desktop/scripts/builder-arch-targets.mjs",
-                "apps/desktop/scripts/builder-config-26.mjs",
-            ],
-        }
-    ]
+    # The electron-builder exact pin is retired: upstream's pnpm lock resolves
+    # the version the desktop packaging scripts need, so no manifest is pinned.
+    assert document["structured_pin_contract"] == []
 
 
 def test_load_sync_classes_rejects_version_two(tmp_path: Path) -> None:

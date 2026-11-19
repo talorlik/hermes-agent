@@ -42,7 +42,7 @@ import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { Arch } from 'app-builder-lib'
-import { loadArchTargetMap } from './builder-arch-targets.mjs'
+import { computeArchToTargetNamesMap } from 'app-builder-lib/internal'
 import { isMain } from './utils.mjs'
 import { createPayloadSignCache } from './payload-sign-cache.mjs'
 import { ensureWindowsBundleTools } from './windows-bundle-tools.mjs'
@@ -385,7 +385,6 @@ function isProductExe(file, packager) {
   // before doBuild can invoke this hook (the public input types are optional).
   const targets = /** @type {Map<Arch, string[]>} */ (packager.packagerOptions.targets?.get(packager.platform))
   const output = /** @type {string} */ (packager.config.directories?.output)
-  const computeArchToTargetNamesMap = loadArchTargetMap(import.meta.url)
   const arches = computeArchToTargetNamesMap(targets, packager, packager.platform)
   const resolved = path.resolve(file).toLowerCase()
   for (const arch of arches.keys()) {

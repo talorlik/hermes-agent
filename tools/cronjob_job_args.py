@@ -488,7 +488,6 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
         "model": job.get("model"),
         "provider": job.get("provider"),
-        # Derived, never stored: ``pinned`` is the per-job model pin (cron.jobs._apply_pin_update
         # Locked to its own model; unpinned jobs follow cron.model, then the main agent model.
         "pinned": bool(str(job.get("model") or "").strip()),
         "base_url": job.get("base_url"),
@@ -498,7 +497,6 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
-        "latest_execution": _format_latest_execution(job_id),
         "last_delivery_error": job.get("last_delivery_error"),
         "last_delivery_unverified": job.get("last_delivery_unverified"),
         "last_fire_error": job.get("last_fire_error"),
