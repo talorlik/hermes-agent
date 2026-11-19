@@ -1,6 +1,6 @@
 ---
 name: codex
-description: "Use when delegating to Codex CLI or checking its auth."
+description: "Delegate coding to OpenAI Codex CLI (features, PRs)."
 version: 1.0.1
 author: Hermes Agent
 license: MIT
@@ -29,17 +29,14 @@ Requires the codex CLI and a git repository.
 - Codex installed: `npm install -g @openai/codex`
 - OpenAI auth configured: either `OPENAI_API_KEY` or Codex OAuth credentials
   from the Codex CLI login flow
-- Building and review run inside a git repository. An auth probe outside one
-  needs `--skip-git-repo-check`. "Not inside a trusted directory" is a trust
-  refusal, not an auth failure.
-- Use `pty=true` for interactive or long Codex sessions. A short `codex exec`
-  one-shot can finish without a PTY.
+- **Must run inside a git repository** — Codex refuses to run outside one
+- Use `pty=true` in terminal calls — Codex is an interactive terminal app
 
 For Hermes itself, `model.provider: openai-codex` uses Hermes-managed Codex
-OAuth from `~/.hermes/auth.json` after `hermes auth add openai-codex`. The
-standalone CLI uses `~/.codex/auth.json`. Status on one store does not prove
-the other, and neither local status proves the responses API accepts the token.
-Do not treat a missing `OPENAI_API_KEY` alone as proof that Codex auth is missing.
+OAuth from `~/.hermes/auth.json` after `hermes auth add openai-codex`. For the
+standalone Codex CLI, a valid CLI OAuth session may live under
+`~/.codex/auth.json`; do not treat a missing `OPENAI_API_KEY` alone as proof
+that Codex auth is missing.
 
 ## One-Shot Tasks
 
@@ -143,51 +140,10 @@ terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ```
 
-## Commit review from a gateway
-
-`codex exec review --commit` rejects `--sandbox`. Do not pass that flag to the review subcommand. From a gateway session, review in the worktree with `pty=true`:
-
-```
-codex exec -m gpt-6-astra -s danger-full-access --ephemeral --ignore-rules -o <outfile> "<prompt>"
-```
-
-Put the commit SHA, the defect, and the proof in the prompt. Tell the reviewer a missing ledger claim is not a code defect when that claim is a later commit: a squash deletes the branch SHA, so the claim cannot exist on the reviewed commit.
-
-## Structured output reviews
-
-`codex exec review --base <branch>` rejects a prompt argument. Do not combine `--base` with a quoted prompt. For a fail-closed JSON verdict, run from the worktree and let the prompt tell the reviewer to run `git diff main...HEAD`:
-
-```
-codex exec -m gpt-6-astra -s read-only --ephemeral --ignore-rules --output-schema <schema.json> -o <out.json> "$(cat prompt.txt)"
-```
-
-Give each in-flight exec its own `-o` path. An older exec that finishes later and shares the path overwrites the current verdict file; bind the completion to the process, not the file. Every key under `properties` must also be in `required`, including nested item fields. An optional `line` fails with `required is required to include every key in properties`. Use integer `0` when the line is unknown. No schema-valid output file means fail. Do not land.
-
-## Auth status is not a live call
-
-`codex login status` only reads `~/.codex/auth.json`. "Logged in using ChatGPT"
-can coexist with `HTTP 401` on `wss://api.openai.com/v1/responses`. Do not report
-Codex signed out from that status line, from a compaction summary of an older
-401, or from a desktop activity line such as "used Codex unauthenticated": the
-activity summarizer echoes a search query as the thing that was used.
-
-Before telling the user to run `codex login`, or before repeating an
-unauthenticated claim, run a harmless exact-response probe:
-
-```
-codex exec -m gpt-6-astra -s read-only --ephemeral --ignore-rules --skip-git-repo-check 'Respond with OK only.'
-```
-
-Require exit 0 and the exact token `OK`. Do not print tokens. If the probe
-succeeds, say Codex is authenticated. Do not delete `~/.codex/auth.json`, and
-do not treat a stale id-token subscription date as a dead account. If a later
-exec returns 401, recovery is `codex login` and the user approving the ChatGPT
-browser prompt. Do not delete the auth file first.
-
 ## Rules
 
-1. **PTY for interactive sessions** — long or interactive Codex hangs without a PTY. A short `codex exec` probe does not need one.
-2. **Git repo for build and review** — use `mktemp -d && git init` for scratch work. An auth probe outside a trusted directory must pass `--skip-git-repo-check`; that refusal is not an auth failure.
+1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
+2. **Git repo required** — Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch
 3. **Use `exec` for one-shots** — `codex exec "prompt"` runs and exits cleanly
 4. **`--sandbox workspace-write` for building** — auto-approves changes within the sandbox (`--full-auto` is deprecated for this)
 5. **Background for long tasks** — use `background=true` and monitor with `process` tool

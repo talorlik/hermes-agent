@@ -57,7 +57,6 @@ Blunt instruments: `web.cache_ttl_minutes: 1` (min) or
 Check logs first: `read_file` the last page of `~/.hermes/logs/gateway.log` (offset from `total_lines`), or `search_files` it for `[Ff]ailed to send|[Ee]rror` and read the newest hits.
 
 Common gateway problems:
-- **Defunct kernel child**: state Z means the child already exited. `kill -9` does not reap it; only the parent `wait` or `poll` does. After SIGKILL, wait. On stdout EOF, poll. An attached count does not mean the process is still alive, so collect exited kernels even when attached.
 - **Gateway dies on SSH logout**: Enable linger: `sudo loginctl enable-linger $USER`
 - **Gateway dies on WSL2 close**: WSL2 requires `systemd=true` in `/etc/wsl.conf` for systemd services to work. Without it, gateway falls back to `nohup` (dies when session closes).
 - **Gateway crash loop**: Reset the failed state: `systemctl --user reset-failed hermes-gateway`
@@ -76,13 +75,4 @@ hermes config set auxiliary.vision.model <model_name>
 
 ### "Reset permissions" / auto-approving everything
 See `references/security-privacy.md` — wipe the "Always allow" stores, don't touch yolo mode.
-
-### Stop another local desktop session
-Do not kill the gateway process. It hosts every local session, including the one doing the stop.
-
-`~/.hermes/gateway.sock` answers `identify`, `status`, and `active-work` only. `session.interrupt` is a gateway websocket RPC. Call `hermes_cli.gateway_client.connect_gateway` as an async context manager from the repo `.venv` python (`$HERMES_HOME/hermes-agent/.venv/bin/python`). The tools python often lacks `websockets`.
-
-`prompt.cancel` of a started admission interrupts that generation. Also cancel queued admissions. A queue of background-process completion notices restarts the loop as soon as the current turn ends.
-
-`session.interrupt` does not kill `terminal(background=true)` children. SIGTERM those tool processes after the cancel, then cancel any completion admissions they enqueue. Confirm with `active-work` that the target session is no longer an active agent, and that `session_admissions` has no `started` or `queued` row for it.
 

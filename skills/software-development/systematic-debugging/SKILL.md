@@ -118,22 +118,6 @@ python scripts/repro_bug.py
 for i in {1..100}; do pytest tests/test_flake.py::test_name -q || break; done
 ```
 
-### Python unittest discovery and sibling imports
-
-When the production command is `python -m unittest discover`, reproduce the failure with that exact command, including `-s` and `-t`. Do not substitute `python -m unittest scripts.tests.<name>` or a different top-level directory. A green run under a different invocation does not prove the production discovery path.
-
-`python -m unittest discover -s scripts/tests -t .` sets the top-level directory to `.`. That may not put `scripts/` on `sys.path`. A bare `from <sibling> import ...` in a repository-local sibling-module test then fails as an import error before any assertion. The suite log can also be a stale full-discover run that never names the module; require this command's own output.
-
-For those sibling-module tests, bootstrap the resolved parent scripts directory before importing the sibling module, matching the repository's existing sibling tests. When the test file lives in `scripts/tests/`, that parent is `scripts/`:
-
-```python
-SCRIPTS_DIR = Path(__file__).resolve().parents[1]
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-```
-
-Do not move the discovery root to hide one file, and do not insert a machine-local absolute path. Verify with the same discovery invocation, then the broader validation suite, an independent fail-closed review, and a real proving run. Keep incident-specific history in the owning project; this section is only the diagnostic method.
-
 ### 3. Check Recent Changes
 
 - What changed that could cause this?
@@ -348,8 +332,6 @@ If you catch yourself thinking:
 - Proposing solutions before tracing data flow
 - **"One more fix attempt" (when already tried 2+)**
 - **Each fix reveals a new problem in a different place**
-- **Each new failure is the case the last condition excluded** (next token, next sibling path, the branch you skipped). That is one incomplete decision. Replace the decision. Do not extend the exception list. A review prompt that appends each finding as a new required sentence cannot terminate: the next reviewer is graded against a larger homemade spec. Close the predicate. A finding outside it is out of scope, not a defect to implement.
-- **Empty prefix membership is true.** `s[:1] in "+-*/"` is true when `s` is empty, because the empty string is a substring of every string. Test `s and s[0] in charset` before treating a missing next line as an operator.
 
 **ALL of these mean: STOP. Return to Phase 1.**
 
