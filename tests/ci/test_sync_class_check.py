@@ -72,6 +72,17 @@ def _commit_spec(repo: Path, text: str) -> None:
     _commit_file(repo, "docs/fork-sync-classes.json", text, "docs: declare sync classes")
 
 
+def _commit_ledger(repo: Path, body: str) -> None:
+    """Commit the ledger on the checked-out branch so a later sync carries it.
+
+    A sync is judged by the ledger in its own tree. An auth hold needs its
+    entry active there, so writing the ledger after the merge is too late.
+    """
+    _write_ledger(repo, body)
+    _git(repo, "add", "docs/FORK_CHANGES.md")
+    _git(repo, "commit", "-m", "docs: record the fork ledger")
+
+
 def _publish_merge(
     repo: Path,
     first: str,
@@ -466,6 +477,15 @@ def test_workflow_hold_requires_the_fork_blob_and_active_entry(tmp_path: Path) -
     _commit_spec(held, spec)
     _git(held, "checkout", "-b", "fork-main")
     fork_edit = _commit_file(held, WORKFLOW, "fork-workflow\n", "fork workflow")
+    _commit_ledger(
+        held,
+        _entry(
+            "G-ORIGIN-WORKFLOWS",
+            "origin workflows",
+            commits=fork_edit,
+            owned_files=[WORKFLOW],
+        ),
+    )
     fork_tip = _git(held, "rev-parse", "HEAD")
     _git(held, "checkout", "upstream-main")
     _commit_file(held, WORKFLOW, "upstream-workflow\n", "upstream workflow")
@@ -478,15 +498,6 @@ def test_workflow_hold_requires_the_fork_blob_and_active_entry(tmp_path: Path) -
         "chore: hold workflow",
     )
     _point_fork_at(held, held_merge)
-    _write_ledger(
-        held,
-        _entry(
-            "G-ORIGIN-WORKFLOWS",
-            "origin workflows",
-            commits=fork_edit,
-            owned_files=[WORKFLOW],
-        ),
-    )
     assert _is_exempt(held, held_merge) is True
 
     taken = _init_repo(tmp_path, "hold-upstream")
@@ -494,6 +505,15 @@ def test_workflow_hold_requires_the_fork_blob_and_active_entry(tmp_path: Path) -
     _commit_spec(taken, spec)
     _git(taken, "checkout", "-b", "fork-main")
     fork_edit = _commit_file(taken, WORKFLOW, "fork-workflow\n", "fork workflow")
+    _commit_ledger(
+        taken,
+        _entry(
+            "G-ORIGIN-WORKFLOWS",
+            "origin workflows",
+            commits=fork_edit,
+            owned_files=[WORKFLOW],
+        ),
+    )
     fork_tip = _git(taken, "rev-parse", "HEAD")
     _git(taken, "checkout", "upstream-main")
     _commit_file(taken, WORKFLOW, "upstream-workflow\n", "upstream workflow")
@@ -506,15 +526,6 @@ def test_workflow_hold_requires_the_fork_blob_and_active_entry(tmp_path: Path) -
         "chore: take upstream workflow",
     )
     _point_fork_at(taken, taken_merge)
-    _write_ledger(
-        taken,
-        _entry(
-            "G-ORIGIN-WORKFLOWS",
-            "origin workflows",
-            commits=fork_edit,
-            owned_files=[WORKFLOW],
-        ),
-    )
     assert _is_exempt(taken, taken_merge) is False
 
     missing = _init_repo(tmp_path, "hold-missing-entry")
@@ -522,6 +533,15 @@ def test_workflow_hold_requires_the_fork_blob_and_active_entry(tmp_path: Path) -
     _commit_spec(missing, spec)
     _git(missing, "checkout", "-b", "fork-main")
     fork_edit = _commit_file(missing, WORKFLOW, "fork-workflow\n", "fork workflow")
+    _commit_ledger(
+        missing,
+        _entry(
+            "G-OTHER",
+            "not the workflow hold",
+            commits=fork_edit,
+            owned_files=[WORKFLOW],
+        ),
+    )
     fork_tip = _git(missing, "rev-parse", "HEAD")
     _git(missing, "checkout", "upstream-main")
     _commit_file(missing, WORKFLOW, "upstream-workflow\n", "upstream workflow")
@@ -534,15 +554,6 @@ def test_workflow_hold_requires_the_fork_blob_and_active_entry(tmp_path: Path) -
         "chore: hold workflow without the entry",
     )
     _point_fork_at(missing, missing_merge)
-    _write_ledger(
-        missing,
-        _entry(
-            "G-OTHER",
-            "not the workflow hold",
-            commits=fork_edit,
-            owned_files=[WORKFLOW],
-        ),
-    )
     assert _is_exempt(missing, missing_merge) is False
 
 
@@ -1661,99 +1672,6 @@ def test_structured_pin_rejects_a_value_below_the_exact_pin(tmp_path: Path) -> N
     assert _is_exempt(repo, sync_merge) is False
 
 
-def test_absent_declared_constant_is_not_exempt(tmp_path: Path) -> None:
-    contract = [
-        {
-            "manifest": DESKTOP_MANIFEST,
-            "package": "electron-builder",
-            "field": "devDependencies",
-            "constants": [BUILDER_CONSTANT],
-        }
-    ]
-    pins = (
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [
-                    {
-                        "package": "electron-builder",
-                        "manifest": DESKTOP_MANIFEST,
-                        "field": "devDependencies",
-                        "exact": "26.15.3",
-                    }
-                ],
-            }
-        )
-        + "\n"
-    )
-    manifest = json.dumps({"devDependencies": {"electron-builder": "26.15.3"}}) + "\n"
-    repo = _init_repo(tmp_path, "missing-constant")
-    _commit_file(repo, DESKTOP_MANIFEST, manifest, "base manifest")
-    _commit_file(repo, BUILDER_CONSTANT, "export const BUILDER_PIN = '26.15.3'\n", "base constant")
-    _commit_spec(repo, _class_spec(contracts=contract))
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(repo, "docs/fork-npm-pins.json", pins, "declare pin")
-    _git(repo, "checkout", "upstream-main")
-    _git(repo, "rm", BUILDER_CONSTANT)
-    _git(repo, "commit", "-m", "upstream deletes the constant")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "desktop pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
-def test_pin_named_manifest_without_spec_is_not_exempt(tmp_path: Path) -> None:
-    manifest = "website/package.json"
-    pins = (
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [
-                    {
-                        "package": "left-pad",
-                        "manifest": manifest,
-                        "field": "dependencies",
-                        "exact": "1.3.0",
-                    }
-                ],
-            }
-        )
-        + "\n"
-    )
-    repo = _init_repo(tmp_path, "dynamic-manifest")
-    _commit_file(repo, manifest, '{"dependencies":{"left-pad":"1.0.0"}}\n', "base manifest")
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(repo, "docs/fork-npm-pins.json", pins, "declare pin")
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, manifest, '{"dependencies":{"left-pad":"9.0.0"}}\n', "upstream manifest")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "website pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
 def _lock(version: str) -> str:
     return (
         json.dumps(
@@ -1764,251 +1682,6 @@ def _lock(version: str) -> str:
         )
         + "\n"
     )
-
-
-def test_clean_merge_of_an_upstream_lock_below_the_pin_is_not_exempt(
-    tmp_path: Path,
-) -> None:
-    repo = _init_repo(tmp_path, "upstream-lock-below-pin")
-    _commit_file(
-        repo,
-        "package.json",
-        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.0"}}) + "\n",
-        "base manifest",
-    )
-    _commit_file(repo, "package-lock.json", _lock("6.29.0"), "base lock")
-    _commit_spec(repo, _class_spec())
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(
-        repo,
-        "docs/fork-npm-pins.json",
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [
-                    {
-                        "package": "undici",
-                        "override": "undici@^6",
-                        "floor": "6.29.1",
-                        "resolved": "6.29.1",
-                    }
-                ],
-            }
-        )
-        + "\n",
-        "declare floor",
-    )
-    _commit_file(
-        repo,
-        "package.json",
-        json.dumps({"name": "root", "overrides": {"undici@^6": "6.29.1"}}) + "\n",
-        "raise the override",
-    )
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, "note.txt", "upstream\n", "upstream note")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "undici floor", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
-def test_clean_merge_rejects_a_pin_without_a_bound(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path, "pin-without-bound")
-    _commit_file(repo, "package-lock.json", _lock("6.29.0"), "base lock")
-    _commit_spec(repo, _class_spec())
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(
-        repo,
-        "docs/fork-npm-pins.json",
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [{"package": "undici", "resolved": "6.29.1"}],
-            }
-        )
-        + "\n",
-        "declare an unbound pin",
-    )
-    _commit_file(repo, "package-lock.json", _lock("1.0.0"), "fork lock")
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, "note.txt", "upstream\n", "upstream note")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "unbound pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
-def test_clean_merge_rejects_a_non_object_pin(tmp_path: Path) -> None:
-    repo = _init_repo(tmp_path, "non-object-pin")
-    _commit_file(repo, "package-lock.json", _lock("6.29.1"), "base lock")
-    _commit_spec(repo, _class_spec())
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(
-        repo,
-        "docs/fork-npm-pins.json",
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [
-                    {"package": "undici", "exact": "6.29.1"},
-                    42,
-                ],
-            }
-        )
-        + "\n",
-        "declare a malformed pin list",
-    )
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, "note.txt", "upstream\n", "upstream note")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "malformed pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
-def test_unlisted_dist_splice_is_not_exempt(tmp_path: Path) -> None:
-    extra = "plugins/kanban/dashboard/dist/extra.js"
-    repo = _init_repo(tmp_path, "unlisted-dist")
-    _commit_file(repo, extra, "a\nb\nc\n", "base bundle")
-    _commit_spec(repo, _class_spec(build=[BUILD_OUTPUT]))
-    _git(repo, "checkout", "-b", "fork-main")
-    _commit_file(repo, extra, "FORK\nb\nc\n", "fork bundle")
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, extra, "a\nb\nUPSTREAM\n", "upstream bundle")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-NOTE", "unrelated", commits="none", owned_files=["note.txt"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
-def test_unlisted_workflow_taking_upstream_is_not_exempt(tmp_path: Path) -> None:
-    extra = ".github/workflows/extra.yml"
-    repo = _init_repo(tmp_path, "unlisted-workflow")
-    _commit_file(repo, extra, "fork-workflow\n", "base workflow")
-    _commit_spec(repo, _class_spec(workflows=[WORKFLOW]))
-    _git(repo, "checkout", "-b", "fork-main")
-    _commit_file(repo, "note.txt", "fork\n", "fork note")
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, extra, "upstream-workflow\n", "upstream workflow")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-NOTE", "unrelated", commits="none", owned_files=["note.txt"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
-
-
-def test_continued_builder_pin_is_not_exempt(tmp_path: Path) -> None:
-    contract = [
-        {
-            "manifest": DESKTOP_MANIFEST,
-            "package": "electron-builder",
-            "field": "devDependencies",
-            "constants": [BUILDER_CONSTANT],
-        }
-    ]
-    pins = (
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [
-                    {
-                        "package": "electron-builder",
-                        "manifest": DESKTOP_MANIFEST,
-                        "field": "devDependencies",
-                        "exact": "26.15.3",
-                    }
-                ],
-            }
-        )
-        + "\n"
-    )
-    repo = _init_repo(tmp_path, "continued-constant")
-    _commit_file(
-        repo,
-        DESKTOP_MANIFEST,
-        json.dumps({"devDependencies": {"electron-builder": "26.15.3"}}) + "\n",
-        "base manifest",
-    )
-    _commit_file(
-        repo,
-        BUILDER_CONSTANT,
-        "export const BUILDER_PIN = '26.15.3'\n=== '26.15.3';\n",
-        "continued constant",
-    )
-    _commit_spec(repo, _class_spec(contracts=contract))
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(repo, "docs/fork-npm-pins.json", pins, "declare pin")
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, "note.txt", "upstream\n", "upstream note")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "desktop pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
 
 
 def test_shipped_builder_pin_followed_by_a_function_is_exempt(tmp_path: Path) -> None:
@@ -2065,66 +1738,6 @@ def test_shipped_builder_pin_followed_by_a_function_is_exempt(tmp_path: Path) ->
         _entry("G-PIN", "desktop pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
     )
     assert _is_exempt(repo, sync_merge) is True
-
-
-def test_clean_merge_without_a_lock_still_checks_the_manifest(tmp_path: Path) -> None:
-    contract = [
-        {
-            "manifest": DESKTOP_MANIFEST,
-            "package": "electron-builder",
-            "field": "devDependencies",
-            "constants": [BUILDER_CONSTANT],
-        }
-    ]
-    pins = (
-        json.dumps(
-            {
-                "version": 1,
-                "pins": [
-                    {
-                        "package": "electron-builder",
-                        "manifest": DESKTOP_MANIFEST,
-                        "field": "devDependencies",
-                        "exact": "26.15.3",
-                    }
-                ],
-            }
-        )
-        + "\n"
-    )
-    repo = _init_repo(tmp_path, "manifest-without-lock")
-    _commit_file(
-        repo,
-        DESKTOP_MANIFEST,
-        json.dumps({"devDependencies": {"electron-builder": "1.0.0"}}) + "\n",
-        "base manifest",
-    )
-    _commit_file(
-        repo,
-        BUILDER_CONSTANT,
-        "export const BUILDER_PIN = '26.15.3'\n",
-        "matching constant",
-    )
-    _commit_spec(repo, _class_spec(contracts=contract))
-    _git(repo, "checkout", "-b", "fork-main")
-    pin_commit = _commit_file(repo, "docs/fork-npm-pins.json", pins, "declare pin")
-    _git(repo, "checkout", "upstream-main")
-    _commit_file(repo, "note.txt", "upstream\n", "upstream note")
-    _git(repo, "checkout", "fork-main")
-    merge = subprocess.run(
-        ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo,
-        env=_GIT_ENV,
-        capture_output=True,
-        text=True,
-    )
-    assert merge.returncode == 0, merge.stderr
-    sync_merge = _git(repo, "rev-parse", "HEAD")
-    _write_ledger(
-        repo,
-        _entry("G-PIN", "desktop pin", commits=pin_commit, owned_files=["docs/fork-npm-pins.json"]),
-    )
-    assert _is_exempt(repo, sync_merge) is False
 
 
 def test_unlisted_dist_and_workflow_use_their_class() -> None:

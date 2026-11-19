@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# health: allow FILE_LINES -- this checker ships to Central Command as one byte-identical file, so the absent-hold, deleted-lock and conflicted-pin rules land here; splitting it needs a loader shim per sibling on that side
 """Verify the fork change ledger maps every fork-only commit to an entry.
 
 This is the deterministic post_verify gate behind the fork change ledger
@@ -89,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import importlib.util
 import json
 import os
 import re
@@ -128,7 +130,26 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_HELPER_DIR) not in sys.path:
     sys.path.insert(0, str(_HELPER_DIR))
 from sync_class_gate import delta_allowed
-from scripts.ci.sync_note_line import is_note_line
+
+
+def _load_is_note_line():
+    """Load the note-line rule from beside this checker.
+
+    The shipped copy does not live in a ``scripts/ci`` package. A path import
+    keeps that copy a byte match of this file.
+    """
+    path = _HELPER_DIR / "sync_note_line.py"
+    spec = importlib.util.spec_from_file_location("hermes_sync_note_line", path)
+    # A spec is returned for a path that does not exist; the load would then
+    # raise FileNotFoundError instead of naming the missing helper.
+    if spec is None or spec.loader is None or not path.is_file():
+        raise SystemExit(f"ledger helper dir is missing sync_note_line.py: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.is_note_line
+
+
+is_note_line = _load_is_note_line()
 
 REQUIRED_FIELDS = (
     "Commits",
@@ -910,19 +931,110 @@ def _json_object(repo: Path, tree: str, path: str) -> dict | None:
     return doc if isinstance(doc, dict) else None
 
 
-def _manifest_delta_is_pinned(expected: dict, actual: dict, pins: list[dict]) -> bool:
-    """True when a named manifest changes only the keys its pins name."""
-    allowed_overrides = {
+@dataclass(frozen=True)
+class _SyncTake:
+    """The three commits a sync is judged against, and where merge-tree conflicted."""
+
+    fork_tree: str
+    upstream_tree: str
+    base_tree: str
+    conflict_paths: frozenset[str]
+
+
+_CONFLICT_MARKER = re.compile(r"^(?:<{7} |={7}$|>{7} )", re.MULTILINE)
+_ABSENT = object()
+
+
+def _pin_baseline_object(
+    repo: Path,
+    expected_tree: str,
+    path: str,
+    pins: list[dict],
+    take: _SyncTake | None = None,
+) -> dict | None:
+    """The document a pinned manifest is compared against.
+
+    merge-tree writes conflict markers into a manifest both parents edited.
+    That text is not JSON, so it cannot say which keys moved. The upstream
+    parent is then the take: the pinned keys may differ from it and nothing
+    else may.
+
+    Only a real conflict earns that. The path must be one merge-tree reported,
+    the text must carry markers, and the fork parent must hold nothing beyond
+    its pins that upstream does not also have. Otherwise reading against
+    upstream would bless dropping fork content, or rewriting a manifest the
+    fork merely broke. A manifest the merge tree lacks has no baseline.
+    """
+    text = _tree_file_text(repo, expected_tree, path)
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        if take is None or path not in take.conflict_paths:
+            return None
+        if not _CONFLICT_MARKER.search(text):
+            return None
+        upstream_doc = _json_object(repo, take.upstream_tree, path)
+        fork_doc = _json_object(repo, take.fork_tree, path)
+        base_doc = _json_object(repo, take.base_tree, path)
+        if upstream_doc is None or fork_doc is None:
+            return None
+        if not _fork_manifest_adds_only_pins(base_doc or {}, fork_doc, upstream_doc, pins):
+            return None
+        return upstream_doc
+    return doc if isinstance(doc, dict) else None
+
+
+def _pinned_manifest_keys(pins: list[dict]) -> tuple[set[str], dict[str, set[str]]]:
+    """Override names and per-field package names the pins may rewrite."""
+    overrides = {
         pin["override"]
         for pin in pins
         if isinstance(pin.get("override"), str) and pin.get("override")
     }
-    allowed_fields: dict[str, set[str]] = {}
+    fields: dict[str, set[str]] = {}
     for pin in pins:
-        field = pin.get("field")
+        field_name = pin.get("field")
         package = pin.get("package")
-        if isinstance(field, str) and field and isinstance(package, str) and package:
-            allowed_fields.setdefault(field, set()).add(package)
+        if isinstance(field_name, str) and field_name and isinstance(package, str) and package:
+            fields.setdefault(field_name, set()).add(package)
+    return overrides, fields
+
+
+def _fork_manifest_adds_only_pins(
+    base: dict, fork: dict, upstream: dict, pins: list[dict]
+) -> bool:
+    """True when taking upstream plus the pins drops no fork content.
+
+    A fork value that equals the merge base was never a fork change, so
+    upstream's value wins. A fork value that equals upstream is kept by the
+    take. Any other fork value is fork content, and only a pinned key may be.
+    """
+    overrides, fields = _pinned_manifest_keys(pins)
+    for key in set(base) | set(fork) | set(upstream):
+        ours = fork.get(key, _ABSENT)
+        theirs = upstream.get(key, _ABSENT)
+        before = base.get(key, _ABSENT)
+        if ours == before or ours == theirs:
+            continue
+        allowed = overrides if key == "overrides" else fields.get(key)
+        blocks = [value if value is not _ABSENT else {} for value in (ours, theirs, before)]
+        if allowed is None or not all(isinstance(block, dict) for block in blocks):
+            return False
+        ours_block, theirs_block, before_block = blocks
+        for name in set(ours_block) | set(theirs_block) | set(before_block):
+            mine = ours_block.get(name, _ABSENT)
+            if mine == before_block.get(name, _ABSENT) or mine == theirs_block.get(name, _ABSENT):
+                continue
+            if name not in allowed:
+                return False
+    return True
+
+
+def _manifest_delta_is_pinned(expected: dict, actual: dict, pins: list[dict]) -> bool:
+    """True when a named manifest changes only the keys its pins name."""
+    allowed_overrides, allowed_fields = _pinned_manifest_keys(pins)
     if set(expected) != set(actual):
         return False
     for key, before in expected.items():
@@ -957,6 +1069,7 @@ def _changed_manifests_are_pin_only(
     actual_tree: str,
     pins: list[dict],
     changed: set[str],
+    take: _SyncTake | None = None,
 ) -> bool:
     by_manifest: dict[str, list[dict]] = {}
     for pin in pins:
@@ -966,7 +1079,7 @@ def _changed_manifests_are_pin_only(
     for path, manifest_pins in by_manifest.items():
         if path not in changed:
             continue
-        expected = _json_object(repo, expected_tree, path)
+        expected = _pin_baseline_object(repo, expected_tree, path, manifest_pins, take)
         actual = _json_object(repo, actual_tree, path)
         if expected is None or actual is None:
             return False
@@ -1256,6 +1369,7 @@ def _pin_replay_delta_allowed(
     actual_tree: str,
     first_parent: str,
     already_allowed: set[str] | None = None,
+    take: _SyncTake | None = None,
 ) -> bool:
     """A sync may rewrite pin-named locks and pin manifests, and nothing else."""
     spec_text = _tree_file_text(repo, first_parent, PIN_SPEC_PATH)
@@ -1297,6 +1411,10 @@ def _pin_replay_delta_allowed(
         return False
     if not _manifests_meet_pins(repo, actual_tree, pins):
         return False
+    if take is not None and _named_locks_taken_absent(repo, actual_tree, take, pins):
+        return _changed_manifests_are_pin_only(
+            repo, expected_tree, actual_tree, pins, remaining, take
+        )
     expected_versions = _merged_lock_versions(repo, expected_tree)
     actual_versions = _merged_lock_versions(repo, actual_tree)
     if expected_versions is None or actual_versions is None:
@@ -1305,7 +1423,7 @@ def _pin_replay_delta_allowed(
     if named_versions is None or not _locks_meet_pins(named_versions, pins):
         return False
     if not _changed_manifests_are_pin_only(
-        repo, expected_tree, actual_tree, pins, remaining
+        repo, expected_tree, actual_tree, pins, remaining, take
     ):
         return False
     expected_installs = _merged_lock_installs(repo, expected_tree)
@@ -4638,6 +4756,77 @@ def _entry_equal(
     return path in left and left.get(path) == right.get(path)
 
 
+def _hold_equals_parent(
+    published: dict[str, tuple[str, str, str]],
+    parent: dict[str, tuple[str, str, str]],
+    path: str,
+) -> bool:
+    """An auth hold matches the fork parent, including a file neither tree has.
+
+    A workflow that exists only on upstream has no fork blob. Keeping it
+    absent is the hold. Presence on one side and absence on the other is not.
+    """
+    return _same_or_both_absent(published, parent, path)
+
+
+def _absent_upstream_lock(
+    path: str,
+    published: dict[str, tuple[str, str, str]],
+    upstream: dict[str, tuple[str, str, str]],
+    fork: dict[str, tuple[str, str, str]],
+    base: dict[str, tuple[str, str, str]],
+) -> bool:
+    """True when the lock is gone and the fork lost nothing by it.
+
+    Upstream deleted a lock the merge base had, or no parent ever had one.
+    A lock only the fork carries is fork content: a tip without it dropped
+    that file, and upstream's lack of it is not a take.
+    """
+    if not _is_generated_lock(path) or path in published or path in upstream:
+        return False
+    return path in base or path not in fork
+
+
+def _locks_required(
+    published: dict[str, tuple[str, str, str]],
+    upstream: dict[str, tuple[str, str, str]],
+    fork: dict[str, tuple[str, str, str]],
+    base: dict[str, tuple[str, str, str]],
+    named: set[str],
+) -> list[str]:
+    """Named locks that must still meet the pin floors.
+
+    A lock upstream deleted and the published tip kept absent is not a pin
+    file. Every other named lock is, including a fork-only lock the tip
+    dropped, which then fails for want of versions.
+    """
+    return sorted(
+        path
+        for path in named
+        if not _absent_upstream_lock(path, published, upstream, fork, base)
+    )
+
+
+def _named_locks_taken_absent(
+    repo: Path,
+    actual_tree: str,
+    take: _SyncTake,
+    pins: list[dict[str, object]],
+) -> bool:
+    """True when every pin-named lock is absent and none of them was the fork's alone."""
+    named = _named_lock_paths(pins)
+    if not named:
+        return False
+    actual_entries = _tree_entries(repo, actual_tree)
+    upstream_entries = _tree_entries(repo, take.upstream_tree)
+    fork_entries = _tree_entries(repo, take.fork_tree)
+    base_entries = _tree_entries(repo, take.base_tree)
+    return all(
+        _absent_upstream_lock(path, actual_entries, upstream_entries, fork_entries, base_entries)
+        for path in named
+    )
+
+
 def _text_at(repo: Path, entries: dict[str, tuple[str, str, str]], path: str) -> str:
     return _blob_text(repo, entries.get(path)) or ""
 
@@ -4734,6 +4923,7 @@ def _structured_pin_flags(
     path: str,
     spec: dict[str, object],
     pins: list[dict[str, object]],
+    take: _SyncTake | None = None,
 ) -> tuple[bool, bool]:
     contract: dict[str, object] | None = None
     contracts = spec.get("structured_pin_contract")
@@ -4744,14 +4934,13 @@ def _structured_pin_flags(
                 break
     if contract is None:
         return False, False
-    expected_doc = _json_object(repo, expected_tree, path)
+    manifest_pins = _pins_for_manifest(pins, path)
+    expected_doc = _pin_baseline_object(repo, expected_tree, path, manifest_pins, take)
     actual_doc = _json_object(repo, actual_tree, path)
     pin_keys_only = (
         expected_doc is not None
         and actual_doc is not None
-        and _manifest_delta_is_pinned(
-            expected_doc, actual_doc, _pins_for_manifest(pins, path)
-        )
+        and _manifest_delta_is_pinned(expected_doc, actual_doc, manifest_pins)
     )
     return pin_keys_only, _contract_assigns_builder_pin(repo, actual_tree, contract, pins)
 
@@ -4775,6 +4964,21 @@ def _class_gate(
         contract_ok=contract_ok,
         executable_drop=executable_drop,
     )
+
+
+def _auth_hold_is_held(
+    spec: dict,
+    entries: list[LedgerEntry],
+    published: dict[str, tuple[str, str, str]],
+    fork: dict[str, tuple[str, str, str]],
+    path: str,
+) -> bool:
+    """True when a held path equals the fork parent under the active hold entry."""
+    auth = spec.get("auth_hold")
+    entry_id = ""
+    if isinstance(auth, dict) and isinstance(auth.get("ledger_entry"), str):
+        entry_id = auth["ledger_entry"]
+    return _hold_equals_parent(published, fork, path) and _entry_is_active(entries, entry_id)
 
 
 def _sync_delta_permitted(
@@ -4822,6 +5026,13 @@ def _sync_delta_permitted(
     actual_entries = _tree_entries(repo, actual_tree)
     first_entries = _tree_entries(repo, first_parent)
     upstream_entries = _tree_entries(repo, upstream_parent)
+    take = _SyncTake(
+        fork_tree=first_parent,
+        upstream_tree=upstream_parent,
+        base_tree=_git(repo, "merge-base", first_parent, upstream_parent),
+        conflict_paths=frozenset(conflict_paths),
+    )
+    base_entries = _tree_entries(repo, take.base_tree)
     changed = {
         path
         for path in expected_entries.keys() | actual_entries.keys()
@@ -4844,6 +5055,12 @@ def _sync_delta_permitted(
         if kind == "generated-specified" or (
             path in manifests and kind in {"unowned", "owned-source"}
         ):
+            # Upstream deleted this lock. Absence is the take, not a pin rewrite.
+            if _absent_upstream_lock(
+                path, actual_entries, upstream_entries, first_entries, base_entries
+            ):
+                pre_allowed.add(path)
+                continue
             # Pin manifests are not source fits. The pin gates already bound
             # that delta; the owned-source drop rule must not replace them.
             pin_paths.add(path)
@@ -4856,18 +5073,14 @@ def _sync_delta_permitted(
                 return False
             continue
         if kind == "auth-hold":
-            auth = spec.get("auth_hold")
-            entry_id = ""
-            if isinstance(auth, dict) and isinstance(auth.get("ledger_entry"), str):
-                entry_id = auth["ledger_entry"]
-            held = equals_fork and _entry_is_active(entries, entry_id)
+            held = _auth_hold_is_held(spec, entries, actual_entries, first_entries, path)
             if not _class_gate(path, kind, equals_fork=held):
                 return False
             pre_allowed.add(path)
             continue
         if kind == "structured-pin":
             pin_keys_only, contract_ok = _structured_pin_flags(
-                repo, expected_tree, actual_tree, path, spec, pins
+                repo, expected_tree, actual_tree, path, spec, pins, take
             )
             manifest_ok = _manifests_meet_pins(
                 repo, actual_tree, _pins_for_manifest(pins, path)
@@ -4934,6 +5147,7 @@ def _sync_delta_permitted(
         actual_tree,
         first_parent,
         already_allowed=pre_allowed,
+        take=take,
     )
     for path in pin_paths:
         if _classify_sync_path(path, spec, named, entries) != "generated-specified":
@@ -4996,9 +5210,10 @@ def _clean_class_holds(
     fork_tree: str,
     ledger_entries: list[LedgerEntry] | None,
 ) -> bool:
-    """A clean merge is exempt only when each class action holds.
+    """A merge whose tree differs from merge-tree must hold each class action.
 
-    A missing or unreadable spec fails closed for a path the class file would
+    Reached only for a differing tree: a merge equal to git's own merge-tree
+    result is a sync before any class rule is read. A missing or unreadable spec fails closed for a path the class file would
     name. A present spec rejects a splice of an unspecified generated file, a
     workflow blob that is not the fork blob, and build output that equals
     neither parent.
@@ -5045,11 +5260,8 @@ def _clean_class_holds(
     for path in unspecified:
         if not _same_or_both_absent(published, upstream_entries, path):
             return False
-    named_present = [
-        path
-        for path in named
-        if path in published or path in upstream_entries or path in fork_entries
-    ]
+    base_entries = _tree_entries(repo, _git(repo, "merge-base", first_parent, upstream_parent))
+    named_present = _locks_required(published, upstream_entries, fork_entries, base_entries, named)
     if not _manifests_meet_pins(repo, tree, pins):
         return False
     if named_present:
