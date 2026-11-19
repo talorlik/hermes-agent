@@ -10,6 +10,8 @@ description: "Use when delegating to Codex CLI or checking its auth"
 
 Use when delegating to Codex CLI or checking its auth.
 
+Want the full side-by-side? Read [Hermes Agent vs Codex](https://hermes-agent.nousresearch.com/compare/codex).
+
 ## Skill metadata
 
 | | |

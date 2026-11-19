@@ -54,10 +54,7 @@ Blunt instruments: `web.cache_ttl_minutes: 1` (min) or
 3. Load explicitly: `hermes -s name` (or the skill's own `/<name>` slash command)
 
 ### Gateway issues
-Check logs first:
-```bash
-grep -i "failed to send\|error" ~/.hermes/logs/gateway.log | tail -20
-```
+Check logs first: `read_file` the last page of `~/.hermes/logs/gateway.log` (offset from `total_lines`), or `search_files` it for `[Ff]ailed to send|[Ee]rror` and read the newest hits.
 
 Common gateway problems:
 - **Defunct kernel child**: state Z means the child already exited. `kill -9` does not reap it; only the parent `wait` or `poll` does. After SIGKILL, wait. On stdout EOF, poll. An attached count does not mean the process is still alive, so collect exited kernels even when attached.
