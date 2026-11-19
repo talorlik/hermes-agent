@@ -129,23 +129,15 @@ def _request_review_argv(tid: str) -> list[str]:
     return ["kanban", "request-review", tid, "--summary", "lt3 evidence"]
 
 
-# (argv builder, post-success status, stale-refusal stderr phrase,
-#  whether the verb succeeds today on a claimed running task with
-#  neither flag nor env attestation)
+# (argv builder, post-success status, stale-refusal stderr phrase)
 VERBS = [
-    pytest.param(_complete_argv, "done", "refusing to complete", True, id="complete"),
-    pytest.param(_block_argv, "blocked", "refusing to block", True, id="block"),
-    pytest.param(
-        _request_review_argv,
-        "review",
-        "cannot request review",
-        False,
-        id="request-review",
-    ),
+    pytest.param(_complete_argv, "done", "refusing to complete", id="complete"),
+    pytest.param(_block_argv, "blocked", "refusing to block", id="block"),
+    pytest.param(_request_review_argv, "review", "cannot request review", id="request-review"),
 ]
 
 
-@pytest.mark.parametrize("argv_for,ok_status,stale_phrase,no_env_ok", VERBS)
+@pytest.mark.parametrize("argv_for,ok_status,stale_phrase", VERBS)
 class TestExpectedRunIdFlag:
     def test_explicit_matching_run_id_succeeds(
         self,
@@ -153,7 +145,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
     ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -174,7 +165,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
     ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -195,7 +185,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
     ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -215,7 +204,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
         bad: str,
     ) -> None:
         home = tmp_path / "hermes"
@@ -233,7 +221,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
     ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -256,7 +243,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
     ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -280,7 +266,6 @@ class TestExpectedRunIdFlag:
         argv_for: Callable[[str], list[str]],
         ok_status: str,
         stale_phrase: str,
-        no_env_ok: bool,
     ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -293,26 +278,23 @@ class TestExpectedRunIdFlag:
         assert result.returncode == 0, result.stderr
         assert _show(home, tid)["task"]["status"] == ok_status
 
-    def test_omitted_flag_without_env_baseline_unchanged(
-        self,
-        tmp_path: Path,
-        argv_for: Callable[[str], list[str]],
-        ok_status: str,
-        stale_phrase: str,
-        no_env_ok: bool,
-    ) -> None:
-        home = tmp_path / "hermes"
-        home.mkdir()
-        tid, _run_id = _running_task(home)
-        result = _run_hermes(home, *argv_for(tid))
-        if no_env_ok:
-            assert result.returncode == 0, result.stderr
-            assert _show(home, tid)["task"]["status"] == ok_status
-        else:
-            # request-review keeps refusing an ownerless handoff of a
-            # claimed running task (pre-existing live-claim guard).
-            assert result.returncode != 0
-            assert stale_phrase in result.stderr
+
+@pytest.mark.parametrize(
+    "argv_for,ok_status",
+    [
+        pytest.param(_complete_argv, "done", id="complete"),
+        pytest.param(_block_argv, "blocked", id="block"),
+    ],
+)
+def test_omitted_flag_without_env_baseline_unchanged(
+    tmp_path: Path, argv_for: Callable[[str], list[str]], ok_status: str
+) -> None:
+    home = tmp_path / "hermes"
+    home.mkdir()
+    tid, _run_id = _running_task(home)
+    result = _run_hermes(home, *argv_for(tid))
+    assert result.returncode == 0, result.stderr
+    assert _show(home, tid)["task"]["status"] == ok_status
 
 
 class TestLegacyRunGuardCompatibility:

@@ -1,306 +1,295 @@
-"""Fork lifecycle contracts bound onto the current upstream Kanban database.
+"""Fork-only guarded Kanban lifecycle transitions (ledger entry G-KANBAN-LIFECYCLE).
 
-The integrate fitter drops a rewritten upstream function body. These contracts
-therefore live in a fork-only module and replace the published names after
-upstream's module has finished loading.
+Database half of the guarded ``hermes kanban`` verbs; the flags and handlers
+are in :mod:`hermes_cli.kanban_lifecycle_cli`. Nothing here replaces an
+upstream name, so every other caller of ``kanban_db`` (dispatcher, model
+tools, dashboard) runs upstream's mutators unchanged.
+
+Each guarded function returns a :class:`LifecycleReceipt` only after its
+write transaction has committed. Two shapes:
+
+* ``guarded_comment`` and ``guarded_claim`` compose upstream's ``add_comment``
+  and ``claim_task``; upstream changes to those reach them for free.
+* ``guarded_complete``, ``guarded_block``, ``guarded_request_review`` and
+  ``guarded_unblock`` must test the guard and write the reason comment inside
+  the transaction that changes the status. Upstream's mutators open that
+  transaction themselves and refuse to nest, so each of these four is
+  upstream's body with the guard, comment and receipt lines added (marked
+  ``# fork:``). When upstream changes ``complete_task``, ``block_task``,
+  ``request_review`` or ``unblock_task``, re-diff the matching function here.
 """
 
 from __future__ import annotations
 
-import json
+import contextlib
+import dataclasses
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
-_UPSTREAM_HELPERS = (
-    "Any",
-    "Comment",
-    "Event",
-    "Iterable",
-    "LiveClaimError",
-    "Optional",
-    "Path",
-    "Run",
-    "Task",
-    "VALID_BLOCK_KINDS",
-    "VALID_STATUSES",
-    "_REVIEW_APPROVED_NOTE",
-    "_append_event",
-    "_canonical_assignee",
-    "_claim_and_open_run",
-    "_claim_is_live",
-    "_claimer_id",
-    "_cleaned_artifact_paths",
-    "_cleanup_workspace",
-    "_clear_failure_counter",
-    "_completed_event_payload",
-    "_discard_staged_copies",
-    "_end_or_synthesize_run",
-    "_end_run",
-    "_fire_task_hook",
-    "_first_line",
-    "_flag_phantom_prose_refs",
-    "_gate_created_cards",
-    "_gate_empty_completion",
-    "_landing_status_after_parents",
-    "_merge_completion_prose_artifacts",
-    "_parents_satisfied",
-    "_prior_reviewer",
-    "_reclaim_dangling_run",
-    "_resolve_claim_ttl_seconds",
-    "_resume_status_from_events",
-    "_retry_status_for_run",
-    "_route_block",
-    "_row_get",
-    "_stage_completion_artifacts",
-    "_synthesize_ended_run",
-    "child_ids",
-    "get_task",
-    "latest_summary",
-    "list_comments",
-    "list_events",
-    "list_runs",
-    "parent_ids",
-    "recompute_ready",
-    "redact_review_value",
-    "sqlite3",
-    "time",
-    "write_txn",
+from hermes_cli.kanban_db import (
+    VALID_BLOCK_KINDS,
+    VALID_STATUSES,
+    Comment,
+    Event,
+    LiveClaimError,
+    Run,
+    Task,
+    _REVIEW_APPROVED_NOTE,
+    _append_event,
+    _canonical_assignee,
+    _claim_is_live,
+    _cleaned_artifact_paths,
+    _cleanup_workspace,
+    _clear_failure_counter,
+    _completed_event_payload,
+    _discard_staged_copies,
+    _end_or_synthesize_run,
+    _end_run,
+    _fire_task_hook,
+    _first_line,
+    _flag_phantom_prose_refs,
+    _gate_empty_completion,
+    _landing_status_after_parents,
+    _merge_completion_prose_artifacts,
+    _parents_satisfied,
+    _prior_reviewer,
+    _reclaim_dangling_run,
+    _resume_status_from_events,
+    _retry_status_for_run,
+    _route_block,
+    _row_get,
+    _stage_completion_artifacts,
+    _synthesize_ended_run,
+    add_comment,
+    child_ids,
+    claim_task,
+    get_task,
+    latest_summary,
+    list_comments,
+    list_events,
+    list_runs,
+    parent_ids,
+    recompute_ready,
+    redact_review_value,
 )
+from hermes_cli.kanban_db_connect import write_txn
+from hermes_cli.kanban_output import _SHOW_RUN_FIELDS, _obj_dict, _task_to_dict
 
+LIFECYCLE_RECEIPT_SCHEMA_VERSION = 1
+TASK_SNAPSHOT_SCHEMA_VERSION = 1
 
-def _install_upstream_helpers() -> None:
-    """Bind helper names from the partially initialized upstream module."""
-    from hermes_cli import kanban_db as _db
-
-    for _name in _UPSTREAM_HELPERS:
-        globals()[_name] = getattr(_db, _name)
-
-
-_install_upstream_helpers()
-
-
+# A dependency wait parks in ``todo``, never ``blocked``, so it can never match.
 VALID_UNBLOCK_EXPECTED_KINDS = VALID_BLOCK_KINDS - {"dependency"}
 
+# ``show --json`` is upstream's envelope plus fork additions, never a copy of
+# upstream's field lists: the task and run objects come from upstream's own
+# serializers, so a field upstream adds flows through without a change here.
+# The fork adds ``schema_version``, these three task fields, and the row ``id``
+# of each comment and event.
+_SNAPSHOT_TASK_ADDITIONS = ("block_kind", "block_recurrences", "current_run_id")
 
-def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
-    expected_status: Optional[str] = None, if_absent: bool = False,
-    receipt_capture: Optional[Any] = None,
-) -> int:
-    """Append a guarded comment, optionally replaying an existing canonical body."""
-    _install_upstream_helpers()
-    from hermes_cli.kanban_db_connect import (
-        LifecycleReceipt,
-        _clear_receipt_capture,
-        _stage_receipt,
-    )
 
-    _clear_receipt_capture(conn, receipt_capture)
+def _row_fields(row_type: type) -> tuple[str, ...]:
+    """A comment's or event's own fields: what upstream's ``show`` prints, plus ``id``.
+
+    ``task_id`` is left out as upstream leaves it out; the envelope names the task once.
+    """
+    return tuple(f.name for f in dataclasses.fields(row_type) if f.name != "task_id")
+
+
+@dataclass(frozen=True)
+class LifecycleReceipt:
+    """Versioned evidence for one committed lifecycle operation."""
+
+    operation: str
+    task_id: str
+    prior_status: Optional[str]
+    final_status: Optional[str]
+    newly_committed: bool
+    run_id: Optional[int] = None
+    event_id: Optional[int] = None
+    comment_id: Optional[int] = None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": LIFECYCLE_RECEIPT_SCHEMA_VERSION,
+            "operation": self.operation,
+            "task_id": self.task_id,
+            "prior_status": self.prior_status,
+            "final_status": self.final_status,
+            "run_id": self.run_id,
+            "event_id": self.event_id,
+            "comment_id": self.comment_id,
+            "newly_committed": self.newly_committed,
+            "idempotent_replay": not self.newly_committed,
+        }
+
+
+def _check_expected_status(expected_status: Optional[str]) -> None:
     if expected_status is not None and expected_status not in VALID_STATUSES:
         raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
-    if not body or not body.strip():
-        raise ValueError("comment body is required")
-    if not author or not author.strip():
-        raise ValueError("comment author is required")
-    now = int(time.time())
-    # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
-    # compose comment writes under one outer commit.
-    with write_txn(conn, allow_nested=True):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
+
+
+def _latest_event_id(conn: sqlite3.Connection, task_id: str, kind: str) -> Optional[int]:
+    """Row id of the task's newest ``kind`` event.
+
+    Called under the writer lock right after ``_append_event``, so it is the
+    event this transaction wrote, whatever else that helper inserts.
+    """
+    row = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = ?", (task_id, kind),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def _claimed_event_id(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> Optional[int]:
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'claimed' AND run_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task_id, run_id),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+@contextlib.contextmanager
+def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """Pin every read in the block to one point in time (joins an open transaction)."""
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.execute("ROLLBACK")  # read-only: nothing to keep
+
+
+def guarded_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str, *,
+    expected_status: Optional[str] = None, if_absent: bool = False,
+) -> LifecycleReceipt:
+    """Append a comment under a status guard; ``if_absent`` replays an identical one.
+
+    The guard, the duplicate lookup and upstream's ``add_comment`` (a savepoint
+    here) share one write transaction. A stale guard raises ``ValueError``.
+    """
+    _check_expected_status(expected_status)
+    with write_txn(conn):
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             raise ValueError(f"unknown task {task_id}")
-        if expected_status is not None and row["status"] != expected_status:
+        status = row["status"]
+        if expected_status is not None and status != expected_status:
             raise ValueError(
-                f"refusing to comment: expected status {expected_status!r}, task is {row['status']!r}"
+                f"refusing to comment: expected status {expected_status!r}, task is {status!r}"
             )
-        # The guard precedes dedup, and both run under the same writer lock.
-        existing = None
         if if_absent:
             existing = conn.execute(
-                "SELECT id FROM task_comments WHERE task_id = ? AND author = ? "
-                "AND body = ? ORDER BY id LIMIT 1",
-                (task_id, author.strip(), body.strip()),
+                "SELECT id FROM task_comments WHERE task_id = ? AND author = ? AND body = ? "
+                "ORDER BY id LIMIT 1", (task_id, author.strip(), body.strip()),
             ).fetchone()
-        event_id = None
-        if existing is not None:
-            comment_id = int(existing["id"])
-        else:
-            cur = conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
-            )
-            comment_id = int(cur.lastrowid or 0)
-            _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-            event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
-            event_id = int(event_row[0]) if event_row and event_row[0] else None
-        _stage_receipt(
-            conn, receipt_capture,
-            LifecycleReceipt(
-                operation="comment", task_id=task_id,
-                prior_status=row["status"], final_status=row["status"],
-                newly_committed=existing is None,
-                event_id=event_id, comment_id=comment_id,
-            ),
+            if existing is not None:
+                return LifecycleReceipt(
+                    operation="comment", task_id=task_id, prior_status=status, final_status=status,
+                    newly_committed=False, comment_id=int(existing["id"]),
+                )
+        comment_id = add_comment(conn, task_id, author, body)
+        return LifecycleReceipt(
+            operation="comment", task_id=task_id, prior_status=status, final_status=status,
+            newly_committed=True, event_id=_latest_event_id(conn, task_id, "commented"),
+            comment_id=comment_id,
         )
-        return comment_id
 
 
-def claim_task(
-    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None, idempotent_replay: bool = False,
-    receipt_capture: Optional[Any] = None,
-) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+def _claim_replay(
+    conn: sqlite3.Connection, task_id: str, claimer: str,
+) -> Optional[tuple[Optional[Task], Optional[LifecycleReceipt]]]:
+    """Decide a repeated ``claim --claimer`` on a task that is already running.
 
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status). Replay requires an
-    explicit claimer and the same unexpired, authoritative current run.
+    ``None``: the task is not running, so the caller attempts a fresh claim.
+    ``(None, None)``: it is running but not provably under ``claimer``'s
+    unexpired run. ``(task, receipt)``: ``claimer`` owns the current run; the
+    receipt names the original run and ``claimed`` event.
     """
-    _install_upstream_helpers()
-    from hermes_cli.kanban_db_connect import (
-        LifecycleReceipt,
-        _clear_receipt_capture,
-        _stage_receipt,
+    with _read_snapshot(conn):
+        current = get_task(conn, task_id)
+        if current is None or current.status != "running":
+            return None
+        # A matching task lease alone is insufficient: the run row must agree.
+        run = conn.execute(
+            "SELECT id FROM task_runs WHERE id = ? AND task_id = ? "
+            "AND status = 'running' AND ended_at IS NULL AND outcome IS NULL "
+            "AND claim_lock = ? AND claim_expires = ? AND claim_expires >= ?",
+            (current.current_run_id, task_id, claimer, current.claim_expires, int(time.time())),
+        ).fetchone()
+        event_id = _claimed_event_id(conn, task_id, current.current_run_id)
+        if current.claim_lock != claimer or run is None or event_id is None:
+            return None, None
+        return current, LifecycleReceipt(
+            operation="claim", task_id=task_id, prior_status="running", final_status="running",
+            newly_committed=False, run_id=current.current_run_id, event_id=event_id,
+        )
+
+
+def guarded_claim(
+    conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[tuple[Task, LifecycleReceipt]]:
+    """Claim through upstream's ``claim_task``; a named ``claimer`` may replay its own claim.
+
+    ``None`` when the claim is refused.
+    """
+    if claimer is not None:
+        replay = _claim_replay(conn, task_id, claimer)
+        if replay is not None:
+            task, receipt = replay
+            return None if task is None or receipt is None else (task, receipt)
+    claimed = claim_task(conn, task_id, ttl_seconds=ttl_seconds, claimer=claimer)
+    if claimed is None:
+        return None
+    return claimed, LifecycleReceipt(
+        operation="claim", task_id=task_id, prior_status="ready", final_status="running",
+        newly_committed=True, run_id=claimed.current_run_id,
+        event_id=_claimed_event_id(conn, task_id, claimed.current_run_id),
     )
 
-    _clear_receipt_capture(conn, receipt_capture)
-    if idempotent_replay and not claimer:
-        raise ValueError("idempotent_replay requires an explicit claimer")
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
-        if idempotent_replay:
-            current = get_task(conn, task_id)
-            if current is not None and current.status == "running":
-                # Validate both sides of the run pointer while holding the
-                # writer lock; a matching task lease alone is insufficient.
-                run = conn.execute(
-                    "SELECT id FROM task_runs WHERE id = ? AND task_id = ? "
-                    "AND status = 'running' AND ended_at IS NULL AND outcome IS NULL "
-                    "AND claim_lock = ? AND claim_expires = ? AND claim_expires >= ?",
-                    (current.current_run_id, task_id, lock, current.claim_expires,
-                     int(time.time())),
-                ).fetchone()
-                if current.claim_lock != lock or run is None:
-                    return None
-                event = conn.execute(
-                    "SELECT id FROM task_events WHERE task_id = ? "
-                    "AND kind = 'claimed' AND run_id = ? ORDER BY id DESC LIMIT 1",
-                    (task_id, current.current_run_id),
-                ).fetchone()
-                if event is None:
-                    return None
-                _stage_receipt(
-                    conn, receipt_capture,
-                    LifecycleReceipt(
-                        operation="claim", task_id=task_id,
-                        prior_status="running", final_status="running",
-                        newly_committed=False, run_id=current.current_run_id,
-                        event_id=event["id"],
-                    ),
-                )
-                return current
-        # Single enforcement point: never ready -> running with an undone
-        # parent, whichever writer set 'ready'. Demote to 'todo';
-        # recompute_ready re-promotes when the parents finish.
-        if not _parents_satisfied(conn, task_id):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'", (task_id,),
-            )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
-            return None
-        # Close a leaked prior run so the CAS below doesn't strand it.
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
-        )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
-        if run_id is None:
-            return None
-        claimed = get_task(conn, task_id)
-        event = conn.execute(
-            "SELECT id FROM task_events WHERE task_id = ? "
-            "AND kind = 'claimed' AND run_id = ? ORDER BY id DESC LIMIT 1",
-            (task_id, run_id),
-        ).fetchone()
-        _stage_receipt(
-            conn, receipt_capture,
-            LifecycleReceipt(
-                operation="claim", task_id=task_id,
-                prior_status="ready", final_status="running",
-                newly_committed=True, run_id=run_id,
-                event_id=event["id"] if event else None,
-            ),
-        )
-    _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
-    return claimed
+
+def _observation_is_stale(
+    conn: sqlite3.Connection, task_id: str, expected_status: Optional[str],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Cheap pre-check so a stale caller is refused before any audit side effect."""
+    if expected_status is None and expected_run_id is None:
+        return False
+    observed = get_task(conn, task_id)
+    if observed is None:
+        return True
+    if expected_status is not None and observed.status != expected_status:
+        return True
+    return expected_run_id is not None and observed.current_run_id != int(expected_run_id)
 
 
-def complete_task(
+def guarded_complete(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    expected_status: Optional[str] = None,
-    fire_lifecycle_hook: bool = True, force: bool = False,
-    receipt_capture: Optional[Any] = None,
-) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    expected_run_id: Optional[int] = None, expected_status: Optional[str] = None,
+    force: bool = False,
+) -> Optional[LifecycleReceipt]:
+    """Upstream ``complete_task`` plus an ``expected_status`` compare-and-swap.
 
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
-    proof of ownership (``expected_run_id``) or ``force=True`` (explicit
-    operator override) — otherwise :class:`LiveClaimError`, the same fence
-    :func:`request_review` applies. With no active run the handoff fields survive via
-    :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
-    ``metadata`` land on the closing run for :func:`build_worker_context`.
-    ``created_cards`` are verified first — a phantom id raises
-    :class:`HallucinatedCardsError` after an auditable event; afterwards the
-    prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
-    Completions from non-review statuses need evidence: a stripped ``result``
-    or ``summary``, or a stripped result already stored on the card. Empty or
-    whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
-
-    ``expected_status`` is a compare-and-swap guard. A typo raises. A stale
-    observation returns False before card-audit or acceptance side effects,
-    and is checked again inside the write transaction. ``receipt_capture``
-    publishes the committed completion; a mismatch publishes nothing.
+    ``None`` on any refusal; raises what ``complete_task`` raises.
     """
-    _install_upstream_helpers()
-    from hermes_cli.kanban_db_connect import (
-        LifecycleReceipt,
-        _clear_receipt_capture,
-        _stage_receipt,
-    )
-
-    _clear_receipt_capture(conn, receipt_capture)
-    if expected_status is not None and expected_status not in VALID_STATUSES:
-        raise ValueError(
-            f"expected_status must be one of {sorted(VALID_STATUSES)}"
-        )
-    if expected_status is not None or expected_run_id is not None:
-        observed = get_task(conn, task_id)
-        if observed is None:
-            return False
-        if expected_status is not None and observed.status != expected_status:
-            return False
-        if (
-            expected_run_id is not None
-            and observed.current_run_id != int(expected_run_id)
-        ):
-            return False
+    _check_expected_status(expected_status)  # fork:
+    if _observation_is_stale(conn, task_id, expected_status, expected_run_id):  # fork:
+        return None
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return None
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    verified_cards: list[str] = []  # the CLI passes no created_cards
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -308,20 +297,18 @@ def complete_task(
     handoff_summary = summary if summary is not None else result
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
-        return False
+        return None
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
-            return False
-        if expected_status is not None:
-            fresh = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,),
-            ).fetchone()
+            return None
+        if expected_status is not None:  # fork: decided under the writer lock, before any write
+            fresh = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if fresh is None or fresh["status"] != expected_status:
-                return False
+                return None
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
+            return None
         trow = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -349,11 +336,8 @@ def complete_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
-        if expected_status is not None:
-            sql += " AND status = ?"
-            params = (*params, expected_status)
         if conn.execute(sql, params).rowcount != 1:
-            return False
+            return None
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -377,20 +361,10 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
-        event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
-        event_id = int(event_row[0]) if event_row and event_row[0] else None
-        _stage_receipt(
-            conn,
-            receipt_capture,
-            LifecycleReceipt(
-                operation="complete",
-                task_id=task_id,
-                prior_status=prior_status,
-                final_status="done",
-                newly_committed=True,
-                run_id=run_id,
-                event_id=event_id,
-            ),
+        receipt = LifecycleReceipt(  # fork:
+            operation="complete", task_id=task_id, prior_status=prior_status, final_status="done",
+            newly_committed=True, run_id=run_id,
+            event_id=_latest_event_id(conn, task_id, "completed"),
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
@@ -398,61 +372,33 @@ def complete_task(
     recompute_ready(conn)  # separate txn so children see ``done``
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
-    if fire_lifecycle_hook:
-        _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
-    return True
+    _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
+    return receipt
 
 
-def block_task(
+def guarded_block(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
-    expected_status: Optional[str] = None,
-    reason_comment_author: Optional[str] = None,
-    with_reason: bool = False,
-    receipt_capture: Optional[Any] = None,
-):
-    """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition. When ``with_reason`` is set, the return is ``(ok, why)``.
-    ``expected_status`` is a compare-and-swap guard. ``receipt_capture``
-    publishes the committed block for ``kanban block --json``.
+    expected_status: Optional[str] = None, reason_comment_author: Optional[str] = None,
+) -> tuple[Optional[LifecycleReceipt], Optional[str]]:
+    """Upstream ``block_task`` plus an ``expected_status`` compare-and-swap.
 
-    An already-``blocked`` card that the failure breaker parked UNTYPED
-    (``block_kind IS NULL``, no live run) is classified in place when *kind*
-    is supplied: ``block_kind``/``block_recurrences`` are set and a ``blocked``
-    audit event is appended, while status, failure evidence and the terminal
-    runs stay exactly as the breaker left them. A typed block, a card with a
-    live run, or a kind-less call on a blocked card are still refused.
+    With ``reason_comment_author`` the ``BLOCKED: reason`` comment is written
+    in the block's own transaction. Returns ``(receipt, None)`` or
+    ``(None, why)``.
     """
-    _install_upstream_helpers()
-    from hermes_cli.kanban_db_connect import (
-        LifecycleReceipt,
-        _clear_receipt_capture,
-        _stage_receipt,
-    )
-
-    def _ret(ok: bool, why: Optional[str] = None):
-        return (ok, why) if with_reason else ok
-
-    _clear_receipt_capture(conn, receipt_capture)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    if expected_status is not None and expected_status not in VALID_STATUSES:
-        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
+    _check_expected_status(expected_status)  # fork:
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
-            return _ret(False, "task not found")
+            return None, "task not found"
+        # fork: decided under the writer lock, so the UPDATE below needs no extra clause
         if expected_status is not None and cur_row["status"] != expected_status:
-            return _ret(
-                False,
-                f"expected status {expected_status!r}, task is {cur_row['status']!r}",
-            )
+            return None, f"expected status {expected_status!r}, task is {cur_row['status']!r}"
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -462,7 +408,7 @@ def block_task(
         # card -- its run is over -- so it is refused like any stale worker.
         if cur_row["status"] == "blocked":
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
-                return _ret(False, "blocked card cannot be reclassified")
+                return None, "blocked card cannot be reclassified"
             classified = conn.execute(
                 "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
@@ -470,20 +416,14 @@ def block_task(
                 (kind, task_id),
             ).rowcount
             if classified != 1:
-                return _ret(False, "blocked card changed concurrently")
-            event_id = _append_event(conn, task_id, "blocked", {
+                return None, "blocked card changed concurrently"
+            _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
-            _stage_receipt(
-                conn, receipt_capture,
-                LifecycleReceipt(
-                    operation="block", task_id=task_id,
-                    prior_status="blocked", final_status="blocked",
-                    newly_committed=True, run_id=None, event_id=event_id,
-                    comment_id=None,
-                ),
-            )
-            return _ret(True)
+            return LifecycleReceipt(  # fork:
+                operation="block", task_id=task_id, prior_status="blocked", final_status="blocked",
+                newly_committed=True, event_id=_latest_event_id(conn, task_id, "blocked"),
+            ), None
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
@@ -515,82 +455,43 @@ def block_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
-        if expected_status is not None:
-            sql += " AND status = ?"
-            params = (*params, expected_status)
         if conn.execute(sql, params).rowcount != 1:
-            return _ret(False, "task changed concurrently")
+            return None, "task changed concurrently"
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
-        event_id = _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        event_id = _latest_event_id(conn, task_id, event_kind)  # fork:
         comment_id = None
-        if reason and reason_comment_author:
+        if reason and reason_comment_author:  # fork:
             comment_id = add_comment(conn, task_id, reason_comment_author, f"BLOCKED: {reason}")
-        _stage_receipt(
-            conn, receipt_capture,
-            LifecycleReceipt(
-                operation="block", task_id=task_id,
-                prior_status=cur_row["status"], final_status=new_status,
-                newly_committed=True, run_id=run_id, event_id=event_id,
-                comment_id=comment_id,
-            ),
+        receipt = LifecycleReceipt(  # fork:
+            operation="block", task_id=task_id, prior_status=cur_row["status"],
+            final_status=new_status, newly_committed=True, run_id=run_id, event_id=event_id,
+            comment_id=comment_id,
         )
         blocked_task = get_task(conn, task_id)
-        if kind == "dependency":
-            # Historical ordering: the dependency lane fires inside the txn.
-            _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return _ret(True)
     _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-    return _ret(True)
+    return receipt, None
 
 
-def request_review(
+def guarded_request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
-    expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
-    expected_status: Optional[str] = None,
-    receipt_capture: Optional[Any] = None,
-):
-    """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
+    expected_run_id: Optional[int] = None, expected_status: Optional[str] = None,
+    force: bool = False,
+) -> tuple[Optional[LifecycleReceipt], Optional[str]]:
+    """Upstream ``request_review`` plus an ``expected_status`` compare-and-swap.
 
-    Implementer and reviewer are recorded on the event so requested changes
-    route back to the right profile; ``reviewer`` reassigns the task, and on
-    re-review defaults to the latest ``changes_requested`` provenance. A live
-    claim is only cleared with proof of ownership (``expected_run_id``) or
-    ``force=True``. Returns ``bool``, or ``(ok, reason)`` with ``with_reason``.
-
-    ``metadata["artifacts"]`` names the handoff's deliverable
-    files; a review handoff is the last implementer transition, and the
-    *reviewer's* completion is what cleans the managed scratch workspace up, so
-    the files are staged into the task's durable attachments dir here and the
-    staged paths ride the ``review_requested`` payload for the notifier to
-    upload. A declared artifact that cannot be preserved raises
-    :class:`ArtifactPreservationError`, rolling the whole transition back: the
-    task stays ``running`` and retryable, with no attachments and no event.
+    Returns ``(receipt, None)`` or ``(None, why)``.
     """
-    _install_upstream_helpers()
-
-    from hermes_cli.kanban_db_connect import (
-        LifecycleReceipt,
-        ReceiptFinalizationError,
-        TransactionOutcomeUnknownError,
-        _clear_receipt_capture,
-        _stage_receipt,
-    )
-
-    def _ret(ok: bool, reason: Optional[str] = None):
-        return (ok, reason) if with_reason else ok
-
-    _clear_receipt_capture(conn, receipt_capture)
-    if expected_status is not None and expected_status not in VALID_STATUSES:
-        raise ValueError(f"expected_status must be one of {sorted(VALID_STATUSES)}")
-    if expected_status is not None:
+    _check_expected_status(expected_status)  # fork:
+    if expected_status is not None:  # fork: refuse before artifacts are merged
         observed = get_task(conn, task_id)
         if observed is None:
-            return _ret(False, "task not found")
+            return None, "task not found"
         if observed.status != expected_status:
-            return _ret(False, f"expected status {expected_status!r}, task is {observed.status!r}")
+            return None, f"expected status {expected_status!r}, task is {observed.status!r}"
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
     # Declared (metadata["artifacts"]) and prose-referenced files
@@ -604,31 +505,29 @@ def request_review(
     try:
         with write_txn(conn):
             if not _parents_satisfied(conn, task_id):
-                return _ret(False, "parent dependencies are not satisfied")
+                return None, "parent dependencies are not satisfied"
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
-                return _ret(False, "task not found")
-            if expected_status is not None and trow["status"] != expected_status:
-                return _ret(
-                    False, f"expected status {expected_status!r}, task is {trow['status']!r}",
-                )
+                return None, "task not found"
+            if expected_status is not None and trow["status"] != expected_status:  # fork:
+                return None, f"expected status {expected_status!r}, task is {trow['status']!r}"
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
             if expected_run_id is None and not force and _claim_is_live(trow):
-                return _ret(
-                    False, "task is running under a live claim; pass expected_run_id "
+                return (
+                    None, "task is running under a live claim; pass expected_run_id "
                     "(worker ownership) or force=True (explicit operator "
                     "override) instead of clearing the live run's claim",
                 )
             if reviewer is None:
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:
-                    return _ret(
-                        False, "re-review has no durable reviewer provenance (the "
+                    return (
+                        None, "re-review has no durable reviewer provenance (the "
                         "latest changes_requested event is missing or "
                         "malformed); pass reviewer= explicitly",
                     )
@@ -670,9 +569,7 @@ def request_review(
                 params,
             )
             if cur.rowcount != 1:
-                return _ret(
-                    False, "task is not in running/ready (or expected_run_id did not match the current run)",
-                )
+                return None, "task is not in running/ready (or expected_run_id did not match the current run)"
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
                     conn, task_id, metadata, now, uploaded_by="kanban_request_review",
@@ -691,58 +588,30 @@ def request_review(
             if staged:
                 payload["artifacts"] = staged
             _append_event(conn, task_id, "review_requested", payload, run_id=run_id)
-            event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
-            event_id = int(event_row[0]) if event_row and event_row[0] else None
-            _stage_receipt(
-                conn, receipt_capture,
-                LifecycleReceipt(
-                    operation="request_review", task_id=task_id,
-                    prior_status=trow["status"], final_status="review",
-                    newly_committed=True, run_id=run_id, event_id=event_id,
-                ),
+            receipt = LifecycleReceipt(  # fork:
+                operation="request_review", task_id=task_id, prior_status=trow["status"],
+                final_status="review", newly_committed=True, run_id=run_id,
+                event_id=_latest_event_id(conn, task_id, "review_requested"),
             )
-    except (ReceiptFinalizationError, TransactionOutcomeUnknownError):
-        # A committed or uncertain transaction can reference these copies;
-        # deleting them would destroy the durable review evidence.
-        raise
     except Exception:
         if staged_copies:
             _discard_staged_copies(staged_copies, staged_copies[0].parent)
         raise
-    return _ret(True)
+    return receipt, None
 
 
-def unblock_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    expected_block_kind: Optional[str] = None,
-    reason: Optional[str] = None,
-    reason_comment_author: Optional[str] = None,
-    receipt_capture: Optional[Any] = None,
-) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase, unless a typed-kind guard mismatches.
+def guarded_unblock(
+    conn: sqlite3.Connection, task_id: str, *, expected_block_kind: Optional[str] = None,
+    reason: Optional[str] = None, reason_comment_author: Optional[str] = None,
+) -> Optional[LifecycleReceipt]:
+    """Upstream ``unblock_task`` plus an ``expected_block_kind`` compare-and-swap.
 
-    An ``expected_block_kind`` demands a blocked task of that exact kind and
-    refuses before any mutation. Guarded reason comments, the event, and the
-    receipt share the status-change transaction. ``block_kind`` survives so a
-    same-kind re-block still counts as a loop.
+    With ``reason_comment_author`` the ``UNBLOCK: reason`` comment is written
+    in the unblock's own transaction. ``None`` on any refusal.
     """
-    _install_upstream_helpers()
-    from hermes_cli.kanban_db_connect import (
-        LifecycleReceipt,
-        _clear_receipt_capture,
-        _stage_receipt,
-    )
-
-    _clear_receipt_capture(conn, receipt_capture)
-    if (
-        expected_block_kind is not None
-        and expected_block_kind not in VALID_UNBLOCK_EXPECTED_KINDS
-    ):
+    if expected_block_kind is not None and expected_block_kind not in VALID_UNBLOCK_EXPECTED_KINDS:
         raise ValueError(
-            "expected_block_kind must be one of "
-            f"{sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
+            f"expected_block_kind must be one of {sorted(VALID_UNBLOCK_EXPECTED_KINDS)}"
         )
     if reason is not None:
         reason = redact_review_value(reason)
@@ -751,15 +620,14 @@ def unblock_task(
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status, block_kind FROM tasks WHERE id = ?",
-            (task_id,),
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if expected_block_kind is not None and (
+        if expected_block_kind is not None and (  # fork:
             current is None
             or current["status"] != "blocked"
             or current["block_kind"] != expected_block_kind
         ):
-            return False
+            return None
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current is not None and current["status"] == "blocked"
@@ -784,44 +652,26 @@ def unblock_task(
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
-            return False
+            return None
         comment_id = None
-        if reason and reason_comment_author:
-            comment_id = add_comment(
-                conn, task_id, reason_comment_author, f"UNBLOCK: {reason}",
-            )
+        if reason and reason_comment_author:  # fork:
+            comment_id = add_comment(conn, task_id, reason_comment_author, f"UNBLOCK: {reason}")
         payload: Optional[dict] = (
             {"status": new_status, "resume_status": resume_status}
             if new_status != "ready" or resume_status != "ready"
             else None
         )
-        if reason:
-            payload = dict(payload or {})
-            payload["reason"] = reason
+        if reason:  # fork: the guarded unblock records why on its own event
+            payload = {**(payload or {}), "reason": reason}
         _append_event(conn, task_id, "unblocked", payload)
-        event_row = conn.execute("SELECT last_insert_rowid()").fetchone()
-        event_id = int(event_row[0]) if event_row and event_row[0] else None
-        _stage_receipt(
-            conn,
-            receipt_capture,
-            LifecycleReceipt(
-                operation="unblock",
-                task_id=task_id,
-                prior_status=current["status"] if current is not None else None,
-                final_status=new_status,
-                newly_committed=True,
-                event_id=event_id,
-                comment_id=comment_id,
-            ),
+        return LifecycleReceipt(  # fork:
+            operation="unblock", task_id=task_id, prior_status=current["status"],
+            final_status=new_status, newly_committed=True,
+            event_id=_latest_event_id(conn, task_id, "unblocked"), comment_id=comment_id,
         )
-        return True
-
-
-TASK_SNAPSHOT_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -838,93 +688,30 @@ class KanbanTaskSnapshot:
     schema_version: int = TASK_SNAPSHOT_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the legacy show envelope plus versioned lifecycle fields."""
-        task = self.task
-        task_payload = {
-            "id": task.id,
-            "title": task.title,
-            "body": task.body,
-            "assignee": task.assignee,
-            "status": task.status,
-            "priority": task.priority,
-            "tenant": task.tenant,
-            "workspace_kind": task.workspace_kind,
-            "workspace_path": task.workspace_path,
-            "branch_name": task.branch_name,
-            "project_id": task.project_id,
-            "created_by": task.created_by,
-            "created_at": task.created_at,
-            "started_at": task.started_at,
-            "completed_at": task.completed_at,
-            "result": task.result,
-            "skills": list(task.skills) if task.skills else [],
-            "max_retries": task.max_retries,
-            "model_override": task.model_override,
-            "provider_override": task.provider_override,
-            "session_id": task.session_id,
-            "workflow_template_id": task.workflow_template_id,
-            "current_step_key": task.current_step_key,
-            "completion_contract": task.completion_contract,
-            "last_failure_error": task.last_failure_error,
-            "block_kind": task.block_kind,
-            "block_recurrences": task.block_recurrences,
-            "current_run_id": task.current_run_id,
-        }
+        """Upstream's ``show --json`` envelope plus the fork's additions."""
+        task = _task_to_dict(self.task)
+        task.update(_obj_dict(self.task, _SNAPSHOT_TASK_ADDITIONS))
+        comment_fields, event_fields = _row_fields(Comment), _row_fields(Event)
         return {
             "schema_version": self.schema_version,
-            "task": task_payload,
+            "task": task,
             "latest_summary": self.latest_summary,
             "parents": list(self.parents),
             "children": list(self.children),
-            "comments": [
-                {
-                    "id": comment.id,
-                    "author": comment.author,
-                    "body": comment.body,
-                    "created_at": comment.created_at,
-                }
-                for comment in self.comments
-            ],
-            "events": [
-                {
-                    "id": event.id,
-                    "kind": event.kind,
-                    "payload": event.payload,
-                    "created_at": event.created_at,
-                    "run_id": event.run_id,
-                }
-                for event in self.events
-            ],
-            "runs": [
-                {
-                    "id": run.id,
-                    "profile": run.profile,
-                    "step_key": run.step_key,
-                    "status": run.status,
-                    "outcome": run.outcome,
-                    "summary": run.summary,
-                    "error": run.error,
-                    "metadata": run.metadata,
-                    "worker_pid": run.worker_pid,
-                    "started_at": run.started_at,
-                    "ended_at": run.ended_at,
-                }
-                for run in self.runs
-            ],
+            "comments": [_obj_dict(c, comment_fields) for c in self.comments],
+            "events": [_obj_dict(e, event_fields) for e in self.events],
+            "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in self.runs],
         }
 
 
 def build_task_snapshot(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    run_state_type: Optional[str] = None,
-    run_state_name: Optional[str] = None,
+    conn: sqlite3.Connection, task_id: str, *, run_filter: Optional[dict[str, str]] = None,
 ) -> Optional[KanbanTaskSnapshot]:
-    """Capture one task and all show collections under one read snapshot."""
-    _install_upstream_helpers()
-    from hermes_cli.kanban_db_connect import read_txn
-    with read_txn(conn):
+    """Capture one task and every ``show`` collection under one read transaction.
+
+    ``run_filter`` is the ``state_type``/``state_name`` pair ``list_runs`` takes.
+    """
+    with _read_snapshot(conn):
         task = get_task(conn, task_id)
         if task is None:
             return None
@@ -934,11 +721,6 @@ def build_task_snapshot(
             children=child_ids(conn, task_id),
             comments=list_comments(conn, task_id),
             events=list_events(conn, task_id),
-            runs=list_runs(
-                conn,
-                task_id,
-                state_type=run_state_type,
-                state_name=run_state_name,
-            ),
+            runs=list_runs(conn, task_id, **(run_filter or {})),
             latest_summary=latest_summary(conn, task_id),
         )

@@ -4229,24 +4229,3 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
-
-
-def _bind_kanban_lifecycle_overlay() -> None:
-    import hermes_cli.kanban_lifecycle_overlay as _overlay
-    _names = (
-        "add_comment",
-        "block_task",
-        "claim_task",
-        "complete_task",
-        "request_review",
-        "unblock_task",
-        "build_task_snapshot",
-        "KanbanTaskSnapshot",
-        "VALID_UNBLOCK_EXPECTED_KINDS",
-        "TASK_SNAPSHOT_SCHEMA_VERSION",
-    )  # published overlay names
-    for _name in _names:
-        globals()[_name] = getattr(_overlay, _name)
-
-
-_bind_kanban_lifecycle_overlay()

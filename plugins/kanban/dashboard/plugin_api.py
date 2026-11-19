@@ -10,14 +10,11 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import json
 import logging
-import math
 import re
 import sqlite3
-import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -617,7 +614,6 @@ def _apply_status(conn, task_id: str, s: str, p, unknown_detail: str) -> bool:
 
 def _set_priority(conn, task_id: str, priority: int, board: Optional[str]) -> None:
     kanban_db.edit_task(conn, task_id, priority=int(priority), board=board)
-    # Mutation-boundary observer (post-commit): this direct-SQL write bypasses every kanban_db mutator.
 
 
 def _apply_model_override(conn, task_id: str, p) -> bool:

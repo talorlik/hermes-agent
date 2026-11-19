@@ -228,6 +228,7 @@ def _cold_import_report(tmp_path: Path) -> dict:
         capture_output=True,
         text=True,
         timeout=600,
+        check=False,
     )
     assert proc.returncode == 0, (
         f"cold import of tools.kanban_tools from {WORKTREE_ROOT} failed (exit {proc.returncode})\n"
