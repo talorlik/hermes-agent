@@ -166,7 +166,7 @@ def test_source_fit_rejects_an_absent_executable_fork_line(tmp_path: Path) -> No
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     (repo / "shared.py").write_text("VALUE = 'upstream'\ndef run():\n", encoding="utf-8")
@@ -205,7 +205,7 @@ def test_comment_only_absence_still_fits_the_upstream_line_rule(tmp_path: Path) 
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     (repo / "shared.py").write_text(
@@ -718,7 +718,7 @@ def test_clean_splice_of_unspecified_lock_is_not_exempt(tmp_path: Path) -> None:
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 0, merge.stderr
     sync_merge = _git(repo, "rev-parse", "HEAD")
@@ -744,7 +744,7 @@ def test_clean_splice_without_spec_is_not_exempt(tmp_path: Path) -> None:
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 0, merge.stderr
     sync_merge = _git(repo, "rev-parse", "HEAD")
@@ -1729,7 +1729,7 @@ def test_shipped_builder_pin_followed_by_a_function_is_exempt(tmp_path: Path) ->
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 0, merge.stderr
     sync_merge = _git(repo, "rev-parse", "HEAD")
@@ -1783,7 +1783,7 @@ def test_clean_owned_source_without_spec_is_not_exempt(tmp_path: Path) -> None:
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 0, merge.stderr
     sync_merge = _git(repo, "rev-parse", "HEAD")
@@ -1837,7 +1837,7 @@ def test_clean_owned_addition_without_spec_is_not_exempt(tmp_path: Path) -> None
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 0, merge.stderr
     sync_merge = _git(repo, "rev-parse", "HEAD")

@@ -192,7 +192,7 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             ["git", "--no-replace-objects", "-C", str(repo), *args],
             capture_output=True,
-            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"}, check=False,
         )
     except OSError as exc:
         raise CheckerError(f"git {joined} could not be executed: {exc}") from exc
@@ -1994,15 +1994,13 @@ def _lhs_done_before_of(text: str, index: int, of_start: int) -> bool:
                 lhs_complete = True
                 expect_binding = False
                 binding_pattern = False
-        elif char == ";" and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
-            return False
-        elif (
-            char == "="
-            and depth_paren == 0
-            and depth_bracket == 0
-            and depth_brace == 0
-            and not text.startswith(("==", "=>"), index)
-            and (index == 0 or text[index - 1] not in "!<>=")
+        elif depth_paren == 0 and depth_bracket == 0 and depth_brace == 0 and (
+            char == ";"
+            or (
+                char == "="
+                and not text.startswith(("==", "=>"), index)
+                and (index == 0 or text[index - 1] not in "!<>=")
+            )
         ):
             return False
         elif (
@@ -6307,7 +6305,6 @@ def _validate_history_revision_transitions(
     boundary_revision = boundary_revision_state.value
     boundary_history = boundary_fields.get("History-Reconciliations")
     activated = boundary_history is not None
-    seen_entry = boundary_fingerprint is not None
     previous_present = boundary_fingerprint is not None
     revision_floor = boundary_revision
     last_history = boundary_history
@@ -6342,7 +6339,6 @@ def _validate_history_revision_transitions(
         revision = revision_state.value
 
         if not activated and history is None:
-            seen_entry = True
             previous_present = True
             if revision is not None:
                 revision_floor = (
@@ -6413,7 +6409,6 @@ def _validate_history_revision_transitions(
                     f"G-FORK-LEDGER ownership for every changed path: {sha}"
                 )
 
-        seen_entry = True
         previous_present = True
         last_history = history
         if revision is not None:

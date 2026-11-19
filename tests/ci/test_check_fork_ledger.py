@@ -147,7 +147,7 @@ def _fork_ref_with_worktree_ledger(repo: Path) -> str:
         ["git", "ls-files", "--error-unmatch", "docs/FORK_CHANGES.md"],
         cwd=repo,
         env=_GIT_ENV,
-        capture_output=True,
+        capture_output=True, check=False,
     )
     if indexed.returncode not in {0, 1}:
         raise RuntimeError("could not inspect fixture ledger index state")
@@ -155,7 +155,7 @@ def _fork_ref_with_worktree_ledger(repo: Path) -> str:
         tracked = subprocess.run(
             ["git", "diff", "--quiet", "fork-main", "--", "docs/FORK_CHANGES.md"],
             cwd=repo,
-            env=_GIT_ENV,
+            env=_GIT_ENV, check=False,
         )
         if tracked.returncode == 0:
             return "fork-main"
@@ -229,7 +229,7 @@ def _run_checker(
         cwd=cwd or repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     payload = json.loads(proc.stdout) if proc.stdout.strip() else {}
     return proc.returncode, payload
@@ -1019,7 +1019,7 @@ def _run_checker_raw(
         cwd=repo,
         env=env or _GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
 
 
@@ -1122,7 +1122,7 @@ def test_pre_resolved_conflict_sync_merge_is_exempt(tmp_path):
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1171,7 +1171,7 @@ def test_fitted_conflict_sync_merge_is_exempt(tmp_path):
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     (repo / "shared.py").write_text("VALUE = 'upstream'\nEXTRA = 'fork'\n")
@@ -1208,7 +1208,7 @@ def test_pre_resolved_conflict_rejects_mode_change_in_merge(tmp_path):
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1240,7 +1240,7 @@ def test_pre_resolved_directory_rename_keeps_first_parent_path(tmp_path):
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "rm", "--force", "website/docs/fork-only.md")
@@ -1365,7 +1365,7 @@ def _conflict_drop_repo(tmp_path: Path, name: str) -> dict[str, str]:
         cwd=repo,
         env=_GIT_ENV,
         capture_output=True,
-        text=True,
+        text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1529,7 +1529,7 @@ def test_upstream_line_deletion_counts_repeated_lines(tmp_path):
     _git(repo, "checkout", "fork-main")
     merge = subprocess.run(
         ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1582,7 +1582,7 @@ def test_upstream_line_deletion_counts_a_crlf_difference(tmp_path):
     _git(repo, "checkout", "fork-main")
     merge = subprocess.run(
         ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1620,7 +1620,7 @@ def test_upstream_line_deletion_counts_a_missing_final_newline(tmp_path):
     _git(repo, "checkout", "fork-main")
     merge = subprocess.run(
         ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1658,7 +1658,7 @@ def test_upstream_line_deletion_counts_blank_lines(tmp_path):
     _git(repo, "checkout", "fork-main")
     merge = subprocess.run(
         ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
@@ -1695,7 +1695,7 @@ def test_upstream_line_deletion_rejects_a_repeated_blob_id(tmp_path):
     _git(repo, "checkout", "fork-main")
     merge = subprocess.run(
         ["git", "merge", "--no-ff", "upstream-main", "-m", "sync upstream"],
-        cwd=repo, env=_GIT_ENV, capture_output=True, text=True,
+        cwd=repo, env=_GIT_ENV, capture_output=True, text=True, check=False,
     )
     assert merge.returncode == 1
     _git(repo, "checkout", "--ours", "--", "shared.py")
