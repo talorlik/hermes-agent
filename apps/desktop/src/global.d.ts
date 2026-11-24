@@ -8,6 +8,7 @@ import type { HudModifierApi } from '../electron/hud-modifier-types'
 import type { MachineProfile } from '../electron/machine-profile'
 import type { HermesNotification } from '../electron/notification-types'
 import type { KeepAwakeMode } from '../electron/power-save'
+import type { PresenceSnapshot } from '../electron/presence'
 import type { UpdateHoldWire } from '../electron/update-hold-types'
 import type { UpdateRunReport } from '../electron/updater/update-metrics'
 import type { WindowSizeMode } from '../electron/window-size-types'
@@ -305,6 +306,9 @@ declare global {
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
       notify: (payload: HermesNotification) => Promise<boolean>
+      /** Whether main can show an OS notification at all (`hermes:notify` answers false when not). Missing
+       *  on an older preload and in a browser. */
+      notifySupported?: () => Promise<boolean>
       /** Launch -> ready ms for the first caller per app launch, null afterwards. Absent on older shells. */
       claimStartupLatency?: () => Promise<null | number>
       requestMicrophoneAccess: () => Promise<boolean>
@@ -744,6 +748,11 @@ declare global {
       onPowerResume?: (callback: () => void) => () => void
       getOnBattery?: () => Promise<boolean>
       onBatteryChanged?: (callback: (onBattery: boolean) => void) => () => void
+      /** Main's OS idle clock (`electron/presence.ts`); missing on an older preload. */
+      presence?: {
+        get: () => Promise<PresenceSnapshot>
+        onChange: (callback: (snapshot: PresenceSnapshot) => void) => () => void
+      }
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
       getBootstrapState: () => Promise<DesktopBootstrapState>
       /** Resolve This device without starting an install. Missing on an older preload. */

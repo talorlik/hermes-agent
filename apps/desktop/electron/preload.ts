@@ -363,6 +363,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // rejection the renderer expects — see electron/api-expected-404.ts.
   api: request => ipcRenderer.invoke('hermes:api', request).then(unwrapExpectedNotFound),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
+  notifySupported: () => ipcRenderer.invoke('hermes:notify:supported'),
   claimStartupLatency: () => ipcRenderer.invoke('hermes:startup-latency:claim'),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readWindowBelow: () => ipcRenderer.invoke('hermes:window:readBelow'),
@@ -679,6 +680,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:power-battery', listener)
 
     return () => ipcRenderer.removeListener('hermes:power-battery', listener)
+  },
+  // Whether the user is at this computer, by the OS idle clock where one is trustworthy.
+  presence: {
+    get: () => ipcRenderer.invoke('hermes:presence:get'),
+    onChange: callback => {
+      const listener = (_event, snapshot) => callback(snapshot)
+      ipcRenderer.on('hermes:presence', listener)
+
+      return () => ipcRenderer.removeListener('hermes:presence', listener)
+    }
   },
   onBootProgress: callback => {
     const listener = (_event, payload) => callback(payload)

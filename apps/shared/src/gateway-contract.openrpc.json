@@ -331,6 +331,24 @@
       }
     },
     {
+      "name": "client.activity",
+      "summary": "Whether the user is at this client, sent only when ``client.capabilities`` answered ``client_activity: true``; each report replaces the connection's last one, is kept in memory per connection and session, and grants nothing.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ClientActivityParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EmptyResult"
+        }
+      }
+    },
+    {
       "name": "client.capabilities",
       "summary": "What the calling client handles, sent once per connection (after gateway.ready); returns the server\u2192client request methods this backend may send.",
       "params": [
@@ -8433,7 +8451,7 @@
       },
       "CanonicalClientIdentity": {
         "additionalProperties": false,
-        "description": "A client naming itself: ``name`` matches ``[a-z0-9][a-z0-9._-]{0,63}``, ``version`` is 1-64\nprintable ASCII without spaces. Attribution only (owners advertising ``session-client-v1``).",
+        "description": "A client naming itself: ``name`` matches ``[a-z0-9][a-z0-9._-]{0,63}``, ``version`` is 1-64\nprintable ASCII without spaces, ``kind`` is 1-32 characters (``desktop``, ``webapp``, ``tui`` and\n``mobile`` are known; another is kept off the label, not refused). Attribution only: on\n``session.create`` (owners advertising ``session-client-v1``) and in the per-connection hello\n(``client.capabilities`` ``client``).",
         "properties": {
           "name": {
             "title": "Name",
@@ -8450,6 +8468,18 @@
             ],
             "default": null,
             "title": "Version"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kind"
           }
         },
         "required": [
@@ -8460,7 +8490,7 @@
       },
       "CanonicalClientLabel": {
         "additionalProperties": false,
-        "description": "The client a session's creator declared itself as (``session.create`` ``client``).",
+        "description": "The client a session's creator declared itself as (``session.create`` ``client``); ``kind`` only\nwhen it named one this owner knows.",
         "properties": {
           "name": {
             "title": "Name",
@@ -8477,6 +8507,18 @@
             ],
             "default": null,
             "title": "Version"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kind"
           }
         },
         "required": [
@@ -12622,6 +12664,51 @@
         "title": "CliExecResult",
         "type": "object"
       },
+      "ClientActivityParams": {
+        "additionalProperties": false,
+        "properties": {
+          "sessions": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Sessions",
+            "type": "array"
+          },
+          "idle_seconds": {
+            "minimum": 0,
+            "title": "Idle Seconds",
+            "type": "number"
+          },
+          "basis": {
+            "enum": [
+              "system",
+              "page"
+            ],
+            "title": "Basis",
+            "type": "string"
+          },
+          "can_alert": {
+            "default": true,
+            "title": "Can Alert",
+            "type": "boolean"
+          },
+          "away": {
+            "default": false,
+            "title": "Away",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sessions",
+          "idle_seconds",
+          "basis"
+        ],
+        "title": "ClientActivityParams",
+        "type": "object"
+      },
       "ClientCapabilitiesParams": {
         "additionalProperties": false,
         "properties": {
@@ -12634,6 +12721,17 @@
             "default": false,
             "title": "Desktop Local",
             "type": "boolean"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CanonicalClientIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "title": "ClientCapabilitiesParams",
@@ -12657,6 +12755,11 @@
           "canonical_clarify_batch": {
             "default": false,
             "title": "Canonical Clarify Batch",
+            "type": "boolean"
+          },
+          "client_activity": {
+            "default": false,
+            "title": "Client Activity",
             "type": "boolean"
           }
         },
@@ -18824,6 +18927,12 @@
           "session_id"
         ],
         "title": "EmptyRequestParams",
+        "type": "object"
+      },
+      "EmptyResult": {
+        "additionalProperties": false,
+        "properties": {},
+        "title": "EmptyResult",
         "type": "object"
       },
       "ErrorPayload": {

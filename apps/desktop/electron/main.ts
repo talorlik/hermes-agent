@@ -443,6 +443,7 @@ import {
 import { createPortalSession, resolvePortalBaseUrl } from './portal-session'
 import { readPreUpdateBackupEnabled } from './pre-update-backup-config'
 import { registerPreparedSubmissions } from './prepared-submissions'
+import { attachPresenceSource, sendToEveryWindow } from './presence'
 import { capturePreviewContents } from './preview-capture'
 import { onPreviewWatchOwnerDestroyed, sendPreviewFileChangedToOwner } from './preview-file-watch'
 import { hasClosePreviewFlag, previewGuestInputAction } from './preview-guest-escape'
@@ -6192,14 +6193,7 @@ function broadcastBatteryState(next: boolean) {
   }
 
   onBatteryPower = next
-
-  for (const win of BrowserWindow.getAllWindows()) {
-    const { webContents } = win
-
-    if (webContents && !webContents.isDestroyed()) {
-      webContents.send('hermes:power-battery', next)
-    }
-  }
+  sendToEveryWindow(BrowserWindow.getAllWindows(), 'hermes:power-battery', next)
 }
 
 function registerPowerResumeListeners() {
@@ -6231,6 +6225,12 @@ function registerPowerResumeListeners() {
   } catch {
     // powerMonitor is unavailable before app 'ready' on some platforms; the
     // caller registers after 'ready', so this should not normally throw.
+  }
+
+  try {
+    attachPresenceSource({ app, ipc: ipcMain, monitor: powerMonitor, windows: BrowserWindow.getAllWindows() })
+  } catch (error) {
+    rememberLog(`[presence] attach failed, power listeners kept: ${error instanceof Error ? error.message : error}`)
   }
 }
 
